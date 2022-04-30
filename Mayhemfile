@@ -1,0 +1,7 @@
+project: rnshah9/mayhem-redpanda
+target: rpk-redpanda-check
+image: ghcr.io/rnshah9/mayhem-redpanda
+tests: null # avoid uploading tests/
+
+cmds:
+  - cmd: ./rpk redpanda check --config @@
