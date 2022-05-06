@@ -1,7 +1,6 @@
 project: rnshah9/mayhem-redpanda
 target: rpk-redpanda-check
-image: ghcr.io/rnshah9/mayhem-redpanda
-tests: null # avoid uploading tests/
+tests: null # tests/ is not a corpus
 
 cmds:
   - cmd: ./rpk redpanda check --config @@
