@@ -16,7 +16,6 @@ WORKDIR /redpanda
 
 WORKDIR /redpanda/src/go/rpk
 RUN ./build.sh
-WORKDIR /redpanda/src/go/rpk/linux-amd64
 
 FROM fedora:34 
 
