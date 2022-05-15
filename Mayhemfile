@@ -1,6 +1,6 @@
 project: rnshah9/mayhem-redpanda
-target: rpk-redpanda-check
-tests: null # tests/ is not a corpus
+target: rpk
+tests: null
 
 cmds:
-  - cmd: ./rpk redpanda check --config @@
+  - cmd: /rpk redpanda check --config @@
