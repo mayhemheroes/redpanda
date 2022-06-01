@@ -1,6 +1,5 @@
-project: rnshah9/mayhem-redpanda
+project: redpanda
 target: rpk
-tests: null
 
 cmds:
   - cmd: /rpk redpanda check --config @@
