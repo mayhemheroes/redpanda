@@ -18,9 +18,16 @@ func uname() (string, error) {
 		return "", err
 	}
 	str := ""
-	str += string(int8ToString(uname.Machine)) + " "
-	str += string(int8ToString(uname.Release)) + " "
-	str += string(int8ToString(uname.Version))
+	str += int8ToString(uname.Machine) + " "
+	str += int8ToString(uname.Release) + " "
+	str += int8ToString(uname.Version)
 	return str, nil
+}
 
+func int8ToString(ints [65]int8) string {
+	var bs [65]byte
+	for i, in := range ints {
+		bs[i] = byte(in)
+	}
+	return string(bs[:])
 }

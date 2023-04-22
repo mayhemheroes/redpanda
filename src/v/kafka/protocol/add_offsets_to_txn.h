@@ -24,25 +24,16 @@
 
 namespace kafka {
 
-struct add_offsets_to_txn_response;
-
-struct add_offsets_to_txn_api final {
-    using response_type = add_offsets_to_txn_response;
-
-    static constexpr const char* name = "add offsets to txn";
-    static constexpr api_key key = api_key(25);
-};
-
 struct add_offsets_to_txn_request final {
     using api_type = add_offsets_to_txn_api;
 
     add_offsets_to_txn_request_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
 };
@@ -57,7 +48,7 @@ struct add_offsets_to_txn_response final {
 
     add_offsets_to_txn_response_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 

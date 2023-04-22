@@ -6,10 +6,12 @@
 // As of the Change Date specified in that file, in accordance with
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
-#include "security/acl.h"
 #define BOOST_TEST_MODULE example
+#include "kafka/protocol/schemata/sasl_authenticate_request.h"
+#include "kafka/protocol/schemata/sasl_authenticate_response.h"
 #include "kafka/server/handlers/details/security.h"
 #include "random/generators.h"
+#include "security/acl.h"
 #include "security/authorizer.h"
 #include "utils/base64.h"
 
@@ -125,6 +127,17 @@ BOOST_AUTO_TEST_CASE(to_acl_permission) {
       details::to_acl_permission(3), security::acl_permission::allow);
     BOOST_REQUIRE_THROW(
       details::to_acl_permission(4), details::acl_conversion_error);
+}
+
+BOOST_AUTO_TEST_CASE(redact_sensitive_messages) {
+    BOOST_REQUIRE_EQUAL(
+      "{auth_bytes=****}", fmt::to_string(sasl_authenticate_request_data{}));
+
+    BOOST_REQUIRE_EQUAL(
+      "{error_code={ error_code: none [0] } error_message={nullopt} "
+      "auth_bytes=**** "
+      "session_lifetime_ms=0}",
+      fmt::to_string(sasl_authenticate_response_data{}));
 }
 
 } // namespace kafka

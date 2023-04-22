@@ -19,7 +19,7 @@
 
 namespace net {
 
-conn_quota::units::~units() {
+conn_quota::units::~units() noexcept {
     if (_quotas) {
         (*_quotas).get().put(_addr);
     }
@@ -126,6 +126,8 @@ void conn_quota::put(ss::net::inet_address addr) {
     if (_cfg.max_connections_per_ip()) {
         do_put(addr);
     }
+
+    vlog(rpc::rpclog.trace, "leaving put({})", addr);
 }
 
 /**

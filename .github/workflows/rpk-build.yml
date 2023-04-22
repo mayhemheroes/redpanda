@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-name: Go
+name: rpk
 on:
   push:
     tags:
@@ -20,142 +20,85 @@ on:
       - dev
 
 jobs:
-  build:
-    name: Test and Build
+  test:
+    name: Run tests
     strategy:
       matrix:
-        os: [linux, darwin]
+        os: [linux, darwin, windows]
         arch: [amd64, arm64]
     runs-on: ubuntu-latest
     steps:
 
-    - name: Check out code
-      uses: actions/checkout@v2
+      - name: Check out code
+        uses: actions/checkout@v3
 
-    - name: Set up Go
-      uses: actions/setup-go@v2
-      with:
-        go-version: 1.17.8
-      id: go
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: 1.19.2
 
-    - name: Set up Node
-      uses: actions/setup-node@v2-beta
-      with:
-        node-version: '12.16.1'
+      - name: Run tests
+        working-directory: src/go/rpk/
+        run: go test -v ./...
 
-    - name: Test
-      working-directory: src/go/rpk/
-      run: go test -v ./...
-
-    - name: Build
-      working-directory: src/go/rpk/
-      run: |
-        pkg='vectorized/pkg/cli/cmd/version'
-        tag=$(echo ${{ github.ref }} | sed 's;refs/tags/;;g')
-
-        GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} ./build.sh $tag ${{ github.sha }}
-
-    - name: Package
-      working-directory: src/go/rpk/
-      run: |
-        zip -j rpk-${{ matrix.os }}-${{ matrix.arch }}.zip ./${{ matrix.os }}-${{ matrix.arch }}/rpk
-
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v2
-      if: startsWith(github.ref, 'refs/tags/v')
-      with:
-        name: rpk-archives
-        path: |
-          src/go/rpk/rpk-*.zip
-
-  sign-darwin:
-    name: Sign and notarize the darwin release_name
-    needs: build
+  release:
+    name: Release using goreleaser
     if: startsWith(github.ref, 'refs/tags/v')
-    strategy:
-      matrix:
-        arch: [amd64, arm64]
-    runs-on: macos-10.15
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
-
-      - name: Download zip
-        uses: actions/download-artifact@v2
+        uses: actions/checkout@v3
         with:
-          name: rpk-archives
-          path: zip/
+          fetch-depth: 0
 
-      - name: Unzip darwin build
-        working-directory: zip/
+      - name: Install quill
         run: |
-          unzip rpk-darwin-${{ matrix.arch }}.zip
-          rm rpk-darwin-${{ matrix.arch }}.zip
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          curl -sSfL https://raw.githubusercontent.com/anchore/quill/main/install.sh | sh -s -- -b "$HOME/.local/bin" v0.2.0
 
-      - name: Import Code-Signing Certificates
-        uses: Apple-Actions/import-codesign-certs@v1
+      - name: Set up Go
+        uses: actions/setup-go@v3
         with:
-          p12-file-base64: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_P12_BASE64 }}
-          p12-password: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_PASSWORD }}
+          go-version: 1.19.2
 
-      - name: Install gon for code signing and app notarization
+      - name: Create empty release notes
         run: |
-          curl -LO https://github.com/mitchellh/gon/releases/download/v0.2.3/gon_macos.zip
-          unzip gon_macos.zip
-          rm gon_macos.zip
+         echo "" > /tmp/empty_notes
 
-      - name: Sign the mac binaries with Gon
-        working-directory: zip/
+      - name: Invoke goreleaser
+        uses: goreleaser/goreleaser-action@v4
         env:
-          AC_USERNAME: ${{ secrets.AC_USERNAME }}
-          AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
-        run: |
-          ../gon -log-level=info ../src/go/rpk/gon_${{ matrix.arch }}.json
-
-      - name: Upload signed Package
-        uses: actions/upload-artifact@v2
+          QUILL_SIGN_P12: ${{ secrets.QUILL_SIGN_P12_BASE64 }}
+          QUILL_SIGN_PASSWORD: ${{ secrets.QUILL_SIGN_PASSWORD }}
+          QUILL_NOTARY_KEY_ID: ${{ secrets.QUILL_NOTARY_KEY_ID }}
+          QUILL_NOTARY_KEY: ${{ secrets.QUILL_NOTARY_KEY_BASE64 }}
+          QUILL_NOTARY_ISSUER: ${{ secrets.QUILL_NOTARY_ISSUER }}
+          GITHUB_TOKEN: ${{ secrets.VBOT_GITHUB_API_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
         with:
-          name: rpk-archives
-          path: zip/rpk-darwin-${{ matrix.arch }}.zip
+          distribution: goreleaser
+          version: ${{ env.GITHUB_REF_NAME }}
+          workdir: src/go/rpk/
+          args: release --clean --release-notes /tmp/empty_notes
 
-  create-release:
-    name: Create release
-    needs: [build, sign-darwin]
-    if: startsWith(github.ref, 'refs/tags/v')
+      - name: Archive quill output
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: quill-logs
+          path: src/go/rpk/dist/quill-*.log
+
+  notify-release-failure:
+    name: Notify of release failures
     runs-on: ubuntu-latest
+    if: failure()
+    needs: [release]
     steps:
-    - name: Create rpk release
-      id: create_rpk_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: ${{ github.ref }}
-        draft: true
-        prerelease: false
-    outputs:
-      upload_url: ${{ steps.create_rpk_release.outputs.upload_url }}
-
-  publish-release-artifacts:
-    name: Publish release
-    needs: create-release
-    if: startsWith(github.ref, 'refs/tags/v')
-    strategy:
-      matrix:
-        arch: [amd64, arm64]
-        os: [linux, darwin]
-    runs-on: ubuntu-latest
-    steps:
-    - name: Download compressed rpk artifacts
-      uses: actions/download-artifact@v2
-
-    - name: Upload rpk artifacts to release
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ needs.create-release.outputs.upload_url }}
-        asset_path: rpk-archives/rpk-${{ matrix.os }}-${{ matrix.arch }}.zip
-        asset_name: rpk-${{ matrix.os }}-${{ matrix.arch }}.zip
-        asset_content_type: application/zip
+      - name: Notify release failure
+        uses: slackapi/slack-github-action@v1.21.0
+        with:
+          channel-id: ${{ secrets.INTERNAL_RELEASES_SLACK_CHANNEL }}
+          slack-message: "ERROR: release of `rpk` binaries for `${{ github.ref_name }}` failed in ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.VBOTBUILDOVICH_SLACK_BOT_TOKEN }}

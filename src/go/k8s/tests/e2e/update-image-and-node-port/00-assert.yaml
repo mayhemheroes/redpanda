@@ -3,23 +3,14 @@ kind: StatefulSet
 metadata:
   name: update-image-cluster-and-node-port
 status:
-  readyReplicas: 2
+  readyReplicas: 3
 
 ---
 
 apiVersion: kuttl.dev/v1beta1
 kind: TestAssert
 collectors:
-  - type: pod
-    pod: update-image-cluster-and-node-port-0
-
----
-
-apiVersion: kuttl.dev/v1beta1
-kind: TestAssert
-collectors:
-  - type: pod
-    pod: update-image-cluster-and-node-port-1
+  - command: ../../../hack/get-redpanda-info.sh
 
 ---
 
@@ -44,18 +35,16 @@ spec:
 
 ---
 
-apiVersion: kuttl.dev/v1beta1
-kind: TestAssert
-collectors:
-- type: pod
-  selector: app.kubernetes.io/name=redpanda
-  tail: -1
-
----
-
 apiVersion: redpanda.vectorized.io/v1alpha1
 kind: Cluster
 metadata:
   name: update-image-cluster-and-node-port
 status:
-  version: "v21.11.1"
+  version: "v22.1.11"
+  readyReplicas: 3
+  replicas: 3
+  upgrading: false
+  restarting: false
+  conditions:
+  - type: ClusterConfigured
+    status: "True"

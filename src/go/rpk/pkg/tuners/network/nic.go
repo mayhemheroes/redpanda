@@ -7,6 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+//go:build !windows
+
 package network
 
 import (
@@ -19,17 +21,16 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/ethtool"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/irq"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/utils"
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
+	"go.uber.org/zap"
 )
 
-var (
-	driverMaxRssQueues = map[string]int{
-		"ixgbe":   16,
-		"ixgbevf": 4,
-		"i40e":    64,
-		"i40evf":  16}
-)
+var driverMaxRssQueues = map[string]int{
+	"ixgbe":   16,
+	"ixgbevf": 4,
+	"i40e":    64,
+	"i40evf":  16,
+}
 
 type NTupleStatus int
 
@@ -82,14 +83,14 @@ func (n *nic) Name() string {
 }
 
 func (n *nic) IsBondIface() bool {
-	log.Debugf("Checking if '%s' is bond interface", n.name)
+	zap.L().Sugar().Debugf("Checking if '%s' is bond interface", n.name)
 	if exists, _ := afero.Exists(n.fs, "/sys/class/net/bond_masters"); !exists {
 		return false
 	}
 	lines, _ := utils.ReadFileLines(n.fs, "/sys/class/net/bond_masters")
 	for _, line := range lines {
 		if strings.Contains(line, n.name) {
-			log.Debugf("'%s' is bond interface", n.name)
+			zap.L().Sugar().Debugf("'%s' is bond interface", n.name)
 			return true
 		}
 	}
@@ -97,10 +98,10 @@ func (n *nic) IsBondIface() bool {
 }
 
 func (n *nic) Slaves() ([]Nic, error) {
-	var slaves = []Nic{}
+	slaves := []Nic{}
 	if n.IsBondIface() {
 		var slaveNames []string
-		log.Debugf("Reading slaves of '%s'", n.name)
+		zap.L().Sugar().Debugf("Reading slaves of '%s'", n.name)
 		lines, err := utils.ReadFileLines(n.fs,
 			fmt.Sprintf("/sys/class/net/%s/bond/slaves", n.name))
 		if err != nil {
@@ -118,13 +119,13 @@ func (n *nic) Slaves() ([]Nic, error) {
 }
 
 func (n *nic) IsHwInterface() bool {
-	log.Debugf("Checking if '%s' is HW interface", n.name)
+	zap.L().Sugar().Debugf("Checking if '%s' is HW interface", n.name)
 	exists, _ := afero.Exists(n.fs, fmt.Sprintf("/sys/class/net/%s/device", n.name))
 	return exists
 }
 
 func (n *nic) GetIRQs() ([]int, error) {
-	log.Debugf("Getting NIC '%s' IRQs", n.name)
+	zap.L().Sugar().Debugf("Getting NIC '%s' IRQs", n.name)
 	IRQs, err := n.irqDeviceInfo.GetIRQs(fmt.Sprintf("/sys/class/net/%s/device", n.name),
 		n.name)
 	if err != nil {
@@ -173,19 +174,18 @@ func (n *nic) GetMaxRxQueueCount() (int, error) {
 	// ixgbevf: VF NICs support up to 4 RSS queues.
 	// i40e:    PF NICs support up to 64 RSS queues.
 	// i40evf:  VF NICs support up to 16 RSS queues.
-	log.Debugf("Getting max RSS queues count for '%s'", n.name)
+	zap.L().Sugar().Debugf("Getting max RSS queues count for '%s'", n.name)
 
 	driverName, err := n.ethtool.DriverName(n.name)
 	if err != nil {
 		return 0, err
 	}
-	log.Debugf("NIC '%s' uses '%s' driver", n.name, driverName)
+	zap.L().Sugar().Debugf("NIC '%s' uses '%s' driver", n.name, driverName)
 	if maxQueues, present := driverMaxRssQueues[driverName]; present {
 		return maxQueues, nil
 	}
 
 	return MaxInt, nil
-
 }
 
 func (n *nic) GetRxQueueCount() (int, error) {
@@ -194,7 +194,7 @@ func (n *nic) GetRxQueueCount() (int, error) {
 		return 0, utils.ChainedError(err, "Unable to get the RPS number")
 	}
 	rxQueuesCount := len(rpsCpus)
-	log.Debugf("Getting number of Rx queues for '%s'", n.name)
+	zap.L().Sugar().Debugf("Getting number of Rx queues for '%s'", n.name)
 	if rxQueuesCount == 0 {
 		IRQs, err := n.GetIRQs()
 		if err != nil {

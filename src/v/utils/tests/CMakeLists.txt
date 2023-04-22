@@ -12,8 +12,12 @@ rp_test(
     retry_chain_node_test.cc
     input_stream_fanout_test.cc
     waiter_queue_test.cc
+    object_pool_test.cc
     delta_for_test.cc
-  LIBRARIES v::seastar_testing_main v::utils v::bytes
+    token_bucket_test.cc
+    uuid_test.cc
+    seastar_histogram_test.cc
+  LIBRARIES v::seastar_testing_main v::utils v::bytes absl::flat_hash_set
   ARGS "-- -c 1"
   LABELS utils
 )
@@ -40,7 +44,11 @@ rp_test(
     moving_average_test.cc
     human_test.cc
     fragmented_vector_test.cc
+    tracking_allocator_tests.cc
+    bottomless_token_bucket_test.cc
+    filtered_lower_bound_test.cc
+    utf8_control_chars.cc
   DEFINITIONS BOOST_TEST_DYN_LINK
-  LIBRARIES Boost::unit_test_framework v::utils
+  LIBRARIES Boost::unit_test_framework v::utils absl::flat_hash_map
   LABELS utils
 )

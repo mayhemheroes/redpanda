@@ -18,7 +18,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 list(APPEND BASE_LD_FLAGS_LIST
   -L${REDPANDA_DEPS_INSTALL_DIR}/lib
   -L${REDPANDA_DEPS_INSTALL_DIR}/lib64
-  )
+  -fuse-ld=lld)
 set(PKG_CONFIG_PATH_LIST
   ${REDPANDA_DEPS_INSTALL_DIR}/lib64/pkgconfig
   ${REDPANDA_DEPS_INSTALL_DIR}/share/pkgconfig
@@ -75,6 +75,8 @@ set(CMAKE_MODULE_LINKER_FLAGS "${BASE_LD_FLAGS}")
 # this needs to be here so that CMAKE_<LANG>_COMPILER_LAUNCHER
 # is accessible in the configure_file call for the third-party dependencies
 include(ccache)
+include(distcc)
+include(icecc)
 
 # don't export() the contents to registry
 set(CMAKE_EXPORT_NO_PACKAGE_REGISTRY ON CACHE INTERNAL "" FORCE)
@@ -142,8 +144,9 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+find_package(Valgrind REQUIRED)
+
 # add code
 include(testing)
-include(set_option)
 include(v_library)
 add_subdirectory(src)

@@ -7,12 +7,16 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+//go:build !windows
+
 package tuners
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
+	"github.com/hashicorp/go-multierror"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cloud"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cloud/gcp"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
@@ -69,8 +73,14 @@ func NewConfigChecker(conf *config.Config) Checker {
 		Fatal,
 		true,
 		func() (interface{}, error) {
-			ok, _ := config.Check(conf)
-			return ok, nil
+			ok, errs := conf.Check()
+			var err error
+			if len(errs) > 0 {
+				s := multierror.ListFormatFunc(errs)
+				err = fmt.Errorf("config file checker error: %v", s)
+			}
+
+			return ok, err
 		})
 }
 
@@ -121,8 +131,8 @@ func NewMemoryChecker(fs afero.Fs) Checker {
 			if err != nil {
 				return 0, err
 			}
-			memPerCpu := availableMem / int(effCpus)
-			return memPerCpu, nil
+			memPerCPU := availableMem / int(effCpus)
+			return memPerCPU, nil
 		},
 	)
 }
@@ -160,12 +170,16 @@ func NewIOConfigFileExistanceChecker(fs afero.Fs, filePath string) Checker {
 }
 
 func NewBallastFileChecker(fs afero.Fs, conf *config.Config) Checker {
+	path := config.DefaultBallastFilePath
+	if conf.Rpk.Tuners.BallastFilePath != "" {
+		path = conf.Rpk.Tuners.BallastFilePath
+	}
 	return NewFileExistanceChecker(
 		fs,
 		IoConfigFileChecker,
 		"Ballast file present",
 		Warning,
-		conf.Rpk.BallastFilePath,
+		path,
 	)
 }
 
@@ -197,33 +211,17 @@ func RedpandaCheckers(
 	irqDeviceInfo := irq.NewDeviceInfo(fs, irqProcFile)
 	blockDevices := disk.NewBlockDevices(fs, irqDeviceInfo, irqProcFile, proc, timeout)
 	deviceFeatures := disk.NewDeviceFeatures(fs, blockDevices)
-	schedulerChecker := NewDirectorySchedulerChecker(
-		fs,
-		config.Redpanda.Directory,
-		deviceFeatures,
-		blockDevices,
-	)
-	nomergesChecker := NewDirectoryNomergesChecker(
-		fs,
-		config.Redpanda.Directory,
-		deviceFeatures,
-		blockDevices,
-	)
+	schedulerChecker := NewDirectorySchedulerChecker(config.Redpanda.Directory, deviceFeatures, blockDevices)
+	nomergesChecker := NewDirectoryNomergesChecker(config.Redpanda.Directory, deviceFeatures, blockDevices)
 	balanceService := irq.NewBalanceService(fs, proc, executor, timeout)
-	cpuMasks := irq.NewCpuMasks(fs, hwloc.NewHwLocCmd(proc, timeout), executor)
-	dirIRQAffinityChecker := NewDirectoryIRQAffinityChecker(
-		fs, config.Redpanda.Directory, "all", irq.Default, blockDevices, cpuMasks)
-	dirIRQAffinityStaticChecker := NewDirectoryIRQsAffinityStaticChecker(
-		fs,
-		config.Redpanda.Directory,
-		blockDevices,
-		balanceService,
-	)
-	if len(config.Redpanda.KafkaApi) == 0 {
+	cpuMasks := irq.NewCPUMasks(fs, hwloc.NewHwLocCmd(proc, timeout), executor)
+	dirIRQAffinityChecker := NewDirectoryIRQAffinityChecker(config.Redpanda.Directory, "all", irq.Default, blockDevices, cpuMasks)
+	dirIRQAffinityStaticChecker := NewDirectoryIRQsAffinityStaticChecker(config.Redpanda.Directory, blockDevices, balanceService)
+	if len(config.Redpanda.KafkaAPI) == 0 {
 		return nil, errors.New("'redpanda.kafka_api' is empty")
 	}
 	interfaces, err := net.GetInterfacesByIps(
-		config.Redpanda.KafkaApi[0].Address,
+		config.Redpanda.KafkaAPI[0].Address,
 		config.Redpanda.RPCServer.Address,
 	)
 	if err != nil {
@@ -266,10 +264,7 @@ func RedpandaCheckers(
 	//       GCP when using local SSD's
 	gcpVendor := gcp.GcpVendor{}
 	if err == nil && v.Name() == gcpVendor.Name() {
-		checkers[WriteCachePolicyChecker] = []Checker{NewDirectoryWriteCacheChecker(fs,
-			config.Redpanda.Directory,
-			deviceFeatures,
-			blockDevices)}
+		checkers[WriteCachePolicyChecker] = []Checker{NewDirectoryWriteCacheChecker(config.Redpanda.Directory, deviceFeatures, blockDevices)}
 	}
 
 	return checkers, nil

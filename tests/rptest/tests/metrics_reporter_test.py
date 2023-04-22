@@ -15,6 +15,7 @@ from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST
 from ducktape.utils.util import wait_until
 
 from rptest.clients.types import TopicSpec
+from rptest.services.admin import Admin
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.services.http_server import HttpServer
 
@@ -27,13 +28,15 @@ class MetricsReporterTest(RedpandaTest):
             test_context=test_ctx,
             num_brokers=num_brokers,
             extra_rp_conf={
-                "health_monitor_tick_interval": 1000,
+                "health_monitor_max_metadata_age": 1000,
                 # report every two seconds
                 "metrics_reporter_tick_interval": 2000,
                 "metrics_reporter_report_interval": 1000,
                 "enable_metrics_reporter": True,
                 "metrics_reporter_url": f"{self.http.url}/metrics",
+                "retention_bytes": 20000,
             })
+        self.redpanda.set_environment({"REDPANDA_ENVIRONMENT": "test"})
 
     def setUp(self):
         # Start HTTP server before redpanda
@@ -77,13 +80,24 @@ class MetricsReporterTest(RedpandaTest):
         def assert_fields_are_the_same(metadata, field):
             assert all(m[field] == metadata[0][field] for m in metadata)
 
+        admin = Admin(self.redpanda)
+        features = admin.get_features()
+
         # cluster uuid and create timestamp should stay the same across requests
         assert_fields_are_the_same(metadata, 'cluster_uuid')
         assert_fields_are_the_same(metadata, 'cluster_created_ts')
+        # Configuration should be the same across requests
+        assert_fields_are_the_same(metadata, 'has_kafka_gssapi')
+        # cluster config should be the same
+        assert_fields_are_the_same(metadata, 'config')
         # get the last report
         last = metadata.pop()
         assert last['topic_count'] == total_topics
         assert last['partition_count'] == total_partitions
+        assert last['has_kafka_gssapi'] is False
+        assert last['active_logical_version'] == features['cluster_version']
+        assert last['original_logical_version'] == features[
+            'original_cluster_version']
         nodes_meta = last['nodes']
 
         assert len(last['nodes']) == len(self.redpanda.nodes)
@@ -91,6 +105,7 @@ class MetricsReporterTest(RedpandaTest):
         assert all('node_id' in n for n in nodes_meta)
         assert all('cpu_count' in n for n in nodes_meta)
         assert all('version' in n for n in nodes_meta)
+        assert all('logical_version' in n for n in nodes_meta)
         assert all('uptime_ms' in n for n in nodes_meta)
         assert all('is_alive' in n for n in nodes_meta)
         assert all('disks' in n for n in nodes_meta)
@@ -110,6 +125,14 @@ class MetricsReporterTest(RedpandaTest):
                    backoff_sec=1)
         assert_fields_are_the_same(metadata, 'cluster_uuid')
         assert_fields_are_the_same(metadata, 'cluster_created_ts')
+
+        # Check config values
+        assert last["config"]["retention_bytes"] == "[value]"
+        assert last["config"]["enable_metrics_reporter"] == True
+        assert last["config"]["auto_create_topics_enabled"] == False
+        assert "metrics_reporter_tick_interval" not in last["config"]
+        assert last["config"]["log_message_timestamp_type"] == "CreateTime"
+        assert last["redpanda_environment"] == "test"
 
 
 class MultiNodeMetricsReporterTest(MetricsReporterTest):

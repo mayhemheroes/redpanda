@@ -12,13 +12,10 @@
 
 #include "reflection/adl.h"
 #include "seastarx.h"
-#include "vlog.h"
+#include "serde/envelope.h"
+#include "vassert.h"
 
 #include <seastar/core/sstring.hh>
-
-#include <exception>
-#include <string_view>
-
 namespace v8_engine {
 
 class data_policy_exeption final : public std::exception {
@@ -35,28 +32,28 @@ private:
 // Datapolicy property for v8_engine. In first version it contains only
 // function_name and script_name, in the future it will contain ACLs, geo,
 // e.t.c.
-class data_policy {
-public:
+struct data_policy
+  : public serde::
+      envelope<data_policy, serde::version<0>, serde::compat_version<0>> {
     static constexpr int8_t version{1};
 
+    data_policy() = default;
     data_policy(ss::sstring fn, ss::sstring sn) noexcept
-      : _function_name(std::move(fn))
-      , _script_name(std::move(sn)) {}
+      : fn_name(std::move(fn))
+      , sct_name(std::move(sn)) {}
 
-    const ss::sstring& function_name() const { return _function_name; }
-    const ss::sstring& script_name() const { return _script_name; }
+    const ss::sstring& function_name() const { return fn_name; }
+    const ss::sstring& script_name() const { return sct_name; }
 
     friend bool operator==(const data_policy&, const data_policy&) = default;
+    auto serde_fields() { return std::tie(fn_name, sct_name); }
 
-private:
-    ss::sstring _function_name;
-    ss::sstring _script_name;
+    ss::sstring fn_name;
+    ss::sstring sct_name;
 
     friend std::ostream&
     operator<<(std::ostream& os, const data_policy& datapolicy);
 };
-
-std::ostream& operator<<(std::ostream& os, const data_policy& datapolicy);
 
 } // namespace v8_engine
 
@@ -64,8 +61,34 @@ namespace reflection {
 
 template<>
 struct adl<v8_engine::data_policy> {
-    void to(iobuf& out, v8_engine::data_policy&& dp);
-    v8_engine::data_policy from(iobuf_parser& in);
+    void to(iobuf& out, v8_engine::data_policy&& dp) {
+        reflection::serialize(
+          out, dp.version, dp.function_name(), dp.script_name());
+    }
+    v8_engine::data_policy from(iobuf_parser& in) {
+        auto version = reflection::adl<int8_t>{}.from(in);
+        vassert(
+          version == v8_engine::data_policy::version,
+          "Unexpected data_policy version");
+        auto function_name = reflection::adl<ss::sstring>{}.from(in);
+        auto script_name = reflection::adl<ss::sstring>{}.from(in);
+        return v8_engine::data_policy(
+          std::move(function_name), std::move(script_name));
+    }
 };
 
 } // namespace reflection
+
+namespace v8_engine {
+
+inline std::ostream&
+operator<<(std::ostream& os, const data_policy& datapolicy) {
+    fmt::print(
+      os,
+      "function_name: {} script_name: {}",
+      datapolicy.function_name(),
+      datapolicy.script_name());
+    return os;
+}
+
+} // namespace v8_engine

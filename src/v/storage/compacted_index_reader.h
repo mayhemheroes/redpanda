@@ -13,6 +13,7 @@
 
 #include "model/timeout_clock.h"
 #include "storage/compacted_index.h"
+#include "storage/fs_utils.h"
 
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/file.hh>
@@ -20,23 +21,20 @@
 #include <memory>
 namespace storage {
 
-// clang-format off
-CONCEPT(
 template<typename Consumer>
-concept CompactedIndexEntryConsumer = requires(Consumer c, compacted_index::entry&& b) {
+concept CompactedIndexEntryConsumer
+  = requires(Consumer c, compacted_index::entry&& b) {
     { c(std::move(b)) } -> std::same_as<ss::future<ss::stop_iteration>>;
     c.end_of_stream();
 };
-)
-// clang-format on
 
 /// use this like a shared-pointer and pass around a copy
 class compacted_index_reader {
 public:
     class impl {
     public:
-        explicit impl(ss::sstring filename) noexcept
-          : _name(std::move(filename)) {}
+        explicit impl(segment_full_path path) noexcept
+          : _path(std::move(path)) {}
         virtual ~impl() noexcept = default;
         impl(impl&&) noexcept = default;
         impl& operator=(impl&&) noexcept = default;
@@ -53,7 +51,8 @@ public:
 
         virtual void print(std::ostream&) const = 0;
 
-        const ss::sstring& filename() const { return _name; }
+        const ss::sstring filename() const { return path(); }
+        const segment_full_path& path() const { return _path; }
 
         virtual bool is_end_of_stream() const = 0;
 
@@ -102,7 +101,7 @@ public:
               .then([&consumer] { return consumer.end_of_stream(); });
         }
 
-        ss::sstring _name;
+        segment_full_path _path;
         ss::circular_buffer<compacted_index::entry> _slice;
     };
 
@@ -121,12 +120,19 @@ public:
 
     void reset() { _impl->reset(); }
 
-    const ss::sstring& filename() const { return _impl->filename(); }
+    const ss::sstring filename() const { return _impl->filename(); }
+    const segment_full_path& path() const { return _impl->path(); }
 
     template<typename Consumer>
-    CONCEPT(requires CompactedIndexEntryConsumer<Consumer>)
+    requires CompactedIndexEntryConsumer<Consumer>
     auto consume(Consumer consumer, model::timeout_clock::time_point timeout) {
         return _impl->consume(std::move(consumer), timeout);
+    }
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const compacted_index_reader& r) {
+        r.print(o);
+        return o;
     }
 
 private:
@@ -134,7 +140,10 @@ private:
 };
 
 compacted_index_reader make_file_backed_compacted_reader(
-  ss::sstring filename, ss::file, ss::io_priority_class, size_t step_chunk);
+  segment_full_path filename,
+  ss::file,
+  ss::io_priority_class,
+  size_t step_chunk);
 
 inline ss::future<ss::circular_buffer<compacted_index::entry>>
 compaction_index_reader_to_memory(compacted_index_reader rdr) {
@@ -154,9 +163,5 @@ compaction_index_reader_to_memory(compacted_index_reader rdr) {
         return rdr.consume(consumer{}, model::no_timeout).finally([rdr] {});
     });
 }
-inline std::ostream&
-operator<<(std::ostream& o, const compacted_index_reader& r) {
-    r.print(o);
-    return o;
-}
+
 } // namespace storage

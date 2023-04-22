@@ -17,14 +17,14 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/executors"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/executors/commands"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/hwloc"
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
+	"go.uber.org/zap"
 )
 
-type CpuMasks interface {
-	BaseCpuMask(cpuMask string) (string, error)
-	CpuMaskForComputations(mode Mode, cpuMask string) (string, error)
-	CpuMaskForIRQs(mode Mode, cpuMask string) (string, error)
+type CPUMasks interface {
+	BaseCPUMask(cpuMask string) (string, error)
+	CPUMaskForComputations(mode Mode, cpuMask string) (string, error)
+	CPUMaskForIRQs(mode Mode, cpuMask string) (string, error)
 	SetMask(path string, mask string) error
 	ReadMask(path string) (string, error)
 	ReadIRQMask(IRQ int) (string, error)
@@ -38,9 +38,9 @@ type CpuMasks interface {
 	IsSupported() bool
 }
 
-func NewCpuMasks(
+func NewCPUMasks(
 	fs afero.Fs, hwloc hwloc.HwLoc, executor executors.Executor,
-) CpuMasks {
+) CPUMasks {
 	return &cpuMasks{
 		fs:       fs,
 		hwloc:    hwloc,
@@ -54,7 +54,7 @@ type cpuMasks struct {
 	executor executors.Executor
 }
 
-func (masks *cpuMasks) BaseCpuMask(cpuMask string) (string, error) {
+func (masks *cpuMasks) BaseCPUMask(cpuMask string) (string, error) {
 	if cpuMask == "all" {
 		return masks.hwloc.All()
 	}
@@ -66,11 +66,11 @@ func (masks *cpuMasks) IsSupported() bool {
 	return masks.hwloc.IsSupported()
 }
 
-func (masks *cpuMasks) CpuMaskForComputations(
+func (masks *cpuMasks) CPUMaskForComputations(
 	mode Mode, cpuMask string,
 ) (string, error) {
-	log.Debugf("Computing CPU mask for '%s' mode and input CPU mask '%s'", mode, cpuMask)
-	var computationsMask = ""
+	zap.L().Sugar().Debugf("Computing CPU mask for '%s' mode and input CPU mask '%s'", mode, cpuMask)
+	computationsMask := ""
 	var err error
 	if mode == Sq {
 		// all but CPU0
@@ -86,22 +86,22 @@ func (masks *cpuMasks) CpuMaskForComputations(
 	}
 
 	if masks.hwloc.CheckIfMaskIsEmpty(computationsMask) {
-		err = fmt.Errorf("Bad configuration mode '%s' and cpu-mask value '%s':"+
+		err = fmt.Errorf("bad configuration mode '%s' and cpu-mask value '%s':"+
 			" this results in a zero-mask for 'computations'", mode, cpuMask)
 	}
-	log.Debugf("Computations CPU mask '%s'", computationsMask)
+	zap.L().Sugar().Debugf("Computations CPU mask '%s'", computationsMask)
 	return computationsMask, err
 }
 
-func (masks *cpuMasks) CpuMaskForIRQs(
+func (masks *cpuMasks) CPUMaskForIRQs(
 	mode Mode, cpuMask string,
 ) (string, error) {
-	log.Debugf("Computing IRQ CPU mask for '%s' mode and input CPU mask '%s'",
+	zap.L().Sugar().Debugf("Computing IRQ CPU mask for '%s' mode and input CPU mask '%s'",
 		mode, cpuMask)
 	var err error
 	var maskForIRQs string
 	if mode != Mq {
-		maskForComputations, err := masks.CpuMaskForComputations(mode, cpuMask)
+		maskForComputations, err := masks.CPUMaskForComputations(mode, cpuMask)
 		if err != nil {
 			return "", err
 		}
@@ -116,7 +116,7 @@ func (masks *cpuMasks) CpuMaskForIRQs(
 		return "", fmt.Errorf("bad configuration mode '%s' and cpu-mask value '%s':"+
 			" this results in a zero-mask for IRQs", mode, cpuMask)
 	}
-	log.Debugf("IRQs CPU mask '%s'", maskForIRQs)
+	zap.L().Sugar().Debugf("IRQs CPU mask '%s'", maskForIRQs)
 	return maskForIRQs, err
 }
 
@@ -124,14 +124,14 @@ func (masks *cpuMasks) SetMask(path string, mask string) error {
 	if _, err := masks.fs.Stat(path); err != nil {
 		return fmt.Errorf("SMP affinity file '%s' not exist", path)
 	}
-	var formattedMask = strings.Replace(mask, "0x", "", -1)
+	formattedMask := strings.Replace(mask, "0x", "", -1)
 	for strings.Contains(formattedMask, ",,") {
 		formattedMask = strings.Replace(formattedMask, ",,", ",0,", -1)
 	}
 
-	log.Debugf("Setting mask '%s' in '%s'", formattedMask, path)
+	zap.L().Sugar().Debugf("Setting mask '%s' in '%s'", formattedMask, path)
 	err := masks.executor.Execute(
-		commands.NewWriteFileModeCmd(masks.fs, path, formattedMask, 0555))
+		commands.NewWriteFileModeCmd(masks.fs, path, formattedMask, 0o555))
 	if err != nil {
 		return err
 	}
@@ -157,7 +157,7 @@ func (masks *cpuMasks) GetIRQsDistributionMasks(
 }
 
 func (masks *cpuMasks) DistributeIRQs(irqsDistribution map[int]string) {
-	log.Debugf("Distributing IRQs '%v' ", irqsDistribution)
+	zap.L().Sugar().Debugf("Distributing IRQs '%v' ", irqsDistribution)
 	errMsg := "An IRQ's affinity couldn't be set. This might be because the" +
 		" IRQ isn't IO-APIC compatible, or because the IRQ is managed" +
 		" by the kernel, and can be safely ignored."
@@ -170,8 +170,8 @@ func (masks *cpuMasks) DistributeIRQs(irqsDistribution map[int]string) {
 		// doesn't mean its affinity can't be set. Therefore the errors
 		// are logged but otherwise ignored.
 		if err != nil {
-			log.Debug(err)
-			log.Debug(errMsg)
+			zap.L().Sugar().Debug(err)
+			zap.L().Sugar().Debug(errMsg)
 		}
 	}
 }

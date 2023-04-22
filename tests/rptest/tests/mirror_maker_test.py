@@ -14,6 +14,7 @@ from ducktape.mark import parametrize
 from rptest.clients.default import DefaultClient
 from rptest.clients.types import TopicSpec
 from rptest.clients.rpk import RpkTool, RpkException
+from rptest.services.kgo_verifier_services import KgoVerifierConsumerGroupConsumer, KgoVerifierProducer
 from rptest.services.rpk_consumer import RpkConsumer
 from rptest.services.rpk_producer import RpkProducer
 from rptest.services.kafka import KafkaServiceAdapter
@@ -29,12 +30,12 @@ from kafkatest.services.zookeeper import ZookeeperService
 from kafkatest.version import V_3_0_0
 
 
-class TestMirrorMakerService(EndToEndTest):
+class MirrorMakerService(EndToEndTest):
     kafka_source = "kafka"
     redpanda_source = "redpanda"
 
     def __init__(self, test_context):
-        super(TestMirrorMakerService, self).__init__(test_context)
+        super(MirrorMakerService, self).__init__(test_context)
 
         self.topic = TopicSpec(replication_factor=3)
         # create single zookeeper node for Kafka
@@ -82,6 +83,8 @@ class TestMirrorMakerService(EndToEndTest):
         self.redpanda.start()
 
         self.source_client = DefaultClient(self.source_broker)
+
+        self.topic.partition_count = 1000 if self.redpanda.dedicated_nodes else 10
         self.source_client.create_topic(self.topic)
 
     def start_workload(self):
@@ -113,9 +116,14 @@ class TestMirrorMakerService(EndToEndTest):
             "Producer failed to produce %d messages in a reasonable amount of time."
             % n_messages)
 
+
+class TestMirrorMakerService(MirrorMakerService):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
     @cluster(num_nodes=10)
-    @parametrize(source_type=kafka_source)
-    @parametrize(source_type=redpanda_source)
+    @parametrize(source_type=MirrorMakerService.kafka_source)
+    @parametrize(source_type=MirrorMakerService.redpanda_source)
     def test_simple_end_to_end(self, source_type):
         # start brokers
         self.start_brokers(source_type=source_type)
@@ -144,54 +152,67 @@ class TestMirrorMakerService(EndToEndTest):
             self.logger.debug(f'source topic: {t}, target topic: {desc}')
             assert len(desc.partitions) == t.partition_count
 
-    @cluster(num_nodes=9)
-    @parametrize(source_type=kafka_source)
-    @parametrize(source_type=redpanda_source)
+    @cluster(num_nodes=10)
+    @parametrize(source_type=MirrorMakerService.kafka_source)
+    @parametrize(source_type=MirrorMakerService.redpanda_source)
     def test_consumer_group_mirroring(self, source_type):
         # start redpanda
         self.start_brokers(source_type=source_type)
-        consumer_group = "test-group-1"
         # start mirror maker
-        self.mirror_maker = MirrorMaker2(self.test_context,
-                                         num_nodes=1,
-                                         source_cluster=self.source_broker,
-                                         target_cluster=self.redpanda,
-                                         consumer_group_pattern=consumer_group,
-                                         log_level="TRACE")
+        self.mirror_maker = MirrorMaker2(
+            self.test_context,
+            num_nodes=1,
+            source_cluster=self.source_broker,
+            target_cluster=self.redpanda,
+            consumer_group_pattern="kgo-verifier.*")
         self.mirror_maker.start()
 
-        msg_cnt = 100
-        # produce some messages to source redpanda
-        producer = RpkProducer(self.test_context,
-                               self.source_broker,
-                               self.topic.name,
-                               512,
-                               msg_cnt,
-                               acks=-1)
+        msg_size = 512
+        msg_cnt = 1000000 if self.redpanda.dedicated_nodes else 10000
 
+        producer = KgoVerifierProducer(self.test_context, self.source_broker,
+                                       self.topic.name, msg_size, msg_cnt)
         producer.start()
         producer.wait()
-        producer.free()
 
-        # consume some messages from source redpanda
-        consumer = RpkConsumer(self.test_context,
-                               self.source_broker,
-                               self.topic.name,
-                               ignore_errors=False,
-                               retries=3,
-                               group=consumer_group,
-                               num_msgs=20)
-
+        consumer = KgoVerifierConsumerGroupConsumer(self.test_context,
+                                                    self.source_broker,
+                                                    self.topic.name,
+                                                    msg_size,
+                                                    readers=4)
         consumer.start()
-        consumer.wait()
-        consumer.stop()
-        source_messages = consumer.messages
-        self.logger.info(f"source message count: {len(source_messages)}")
-        consumer.free()
+        wait_until(
+            lambda: consumer.consumer_status.validator.valid_reads >= msg_cnt,
+            timeout_sec=180,
+            backoff_sec=1)
+
+        self.logger.info(
+            f"source message count: {producer.produce_status.acked}")
 
         src_rpk = RpkTool(self.source_broker)
+
+        groups = src_rpk.group_list()
+        consumer_group = ""
+        for g in groups:
+            if g.startswith("kgo-verifier"):
+                consumer_group = g
+
+        def group_state_is_valid():
+            partitions = src_rpk.group_describe(consumer_group).partitions
+
+            return all([
+                p.current_offset is not None and p.current_offset > 0
+                for p in partitions
+            ])
+
+        wait_until(group_state_is_valid, 30)
+
         source_group = src_rpk.group_describe(consumer_group)
+        consumer.stop()
+        consumer.wait()
+        self.logger.info(f"source topics: {list(src_rpk.list_topics())}")
         target_rpk = RpkTool(self.redpanda)
+        self.logger.info(f"target topics: {list(target_rpk.list_topics())}")
 
         def target_group_equal():
             try:
@@ -203,9 +224,11 @@ class TestMirrorMakerService(EndToEndTest):
 
             self.logger.info(
                 f"source {source_group}, target_group: {target_group}")
-            return target_group.partitions == source_group.partitions and target_group.name == source_group.name
+            return sorted(target_group.partitions) == sorted(source_group.partitions) and \
+                target_group.name == source_group.name
 
         # wait for consumer group sync
-        wait_until(target_group_equal, 60, backoff_sec=5)
+        timeout = 600 if self.redpanda.dedicated_nodes else 60
+        wait_until(target_group_equal, timeout_sec=timeout, backoff_sec=5)
 
         self.mirror_maker.stop()

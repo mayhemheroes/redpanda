@@ -41,6 +41,11 @@ void offset_translator::process(const model::record_batch& batch) {
 
     _bytes_processed += batch.size_bytes();
 
+    // Update resource manager for the extra dirty bytes, it may hint us
+    // to checkpoint early in response.
+    _checkpoint_hint |= _storage_api.resources().offset_translator_take_bytes(
+      batch.size_bytes(), _bytes_processed_units);
+
     if (
       std::find(
         _filtered_types.begin(), _filtered_types.end(), batch.header().type)
@@ -166,7 +171,7 @@ ss::future<> offset_translator::sync_with_log(
 
     // Trim the offset2delta map to log dirty_offset (discrepancy can
     // happen if the offsets map was persisted, but the log wasn't flushed).
-    if (_state->truncate(details::next_offset(log_offsets.dirty_offset))) {
+    if (_state->truncate(model::next_offset(log_offsets.dirty_offset))) {
         ++_map_version;
     }
 
@@ -176,7 +181,15 @@ ss::future<> offset_translator::sync_with_log(
     }
 
     // read the log to insert the remaining entries into map
-    model::offset start_offset = details::next_offset(_highest_known_offset);
+    model::offset start_offset = model::next_offset(_highest_known_offset);
+
+    vlog(
+      _logger.debug,
+      "starting sync with log, state: {}, reading offsets {}-{}",
+      _state,
+      _highest_known_offset,
+      log_offsets.dirty_offset);
+
     auto reader_cfg = storage::log_reader_config(
       start_offset, log_offsets.dirty_offset, ss::default_priority_class(), as);
     auto reader = co_await log.make_reader(reader_cfg);
@@ -224,7 +237,7 @@ ss::future<> offset_translator::truncate(model::offset offset) {
         ++_map_version;
     }
 
-    model::offset prev = details::prev_offset(offset);
+    model::offset prev = model::prev_offset(offset);
     _highest_known_offset = std::min(prev, _highest_known_offset);
 
     vlog(_logger.info, "truncate at offset: {}, new state: {}", offset, _state);
@@ -252,7 +265,7 @@ ss::future<> offset_translator::prefix_truncate(model::offset offset) {
     ++_map_version;
 
     vlog(
-      _logger.info,
+      _logger.debug,
       "prefix_truncate at offset: {}, new state: {}",
       offset,
       _state);
@@ -313,29 +326,33 @@ bytes offset_translator::highest_known_offset_key() const {
     return kvstore_highest_known_offset_key(_group);
 }
 
-ss::future<> offset_translator::maybe_checkpoint() {
+ss::future<> offset_translator::maybe_checkpoint(size_t checkpoint_threshold) {
     if (_filtered_types.empty()) {
         co_return;
     }
 
-    constexpr size_t checkpoint_threshold = 64_MiB;
+    auto maybe_locked = _checkpoint_lock.try_get_units();
+    if (!maybe_locked) {
+        // A checkpoint attempt is in progress, it doesn't make much sense to
+        // do another one.
+        co_return;
+    }
 
-    co_await _checkpoint_lock.with([this]() -> ss::future<> {
-        if (
-          _bytes_processed
-          < _bytes_processed_at_checkpoint + checkpoint_threshold) {
-            co_return;
-        }
+    if (
+      _bytes_processed < _bytes_processed_at_checkpoint + checkpoint_threshold
+      && !_checkpoint_hint) {
+        co_return;
+    }
 
-        vlog(
-          _logger.trace,
-          "threshold reached, performing checkpoint; state: {}, "
-          "highest_known_offset: {}",
-          _state,
-          _highest_known_offset);
+    vlog(
+      _logger.trace,
+      "threshold reached, performing checkpoint; state: {}, "
+      "highest_known_offset: {} (hint={})",
+      _state,
+      _highest_known_offset,
+      _checkpoint_hint);
 
-        co_await do_checkpoint();
-    });
+    co_await do_checkpoint();
 }
 
 ss::future<> offset_translator::do_checkpoint() {
@@ -368,6 +385,9 @@ ss::future<> offset_translator::do_checkpoint() {
       highest_known_offset_key(),
       std::move(hko_buf));
     _bytes_processed_at_checkpoint = bytes_processed;
+    _bytes_processed_units.return_all();
+
+    _checkpoint_hint = false;
 }
 
 ss::future<> offset_translator::move_persistent_state(

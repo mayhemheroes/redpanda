@@ -1,4 +1,3 @@
-
 # Redpanda
 [![Documentation](https://img.shields.io/badge/documentation-black)](https://redpanda.com/documentation)
 [![Slack](https://img.shields.io/badge/slack-purple)](https://redpanda.com/slack)
@@ -9,14 +8,7 @@
 [<p align="center"><img src="docs/PANDA_sitting.jpg" alt="redpanda sitting" width="400"/></p>](https://redpanda.com/redpanda)
 <img src="https://static.scarf.sh/a.png?x-pxid=3c187215-e862-4b67-8057-45aa9a779055" />
 
-Redpanda is a streaming platform for mission critical workloads. Kafka® compatible, 
-No Zookeeper®, no JVM, and no code changes required. Use all your favorite open source tooling - 10x faster.
-
-We are building a real-time streaming engine for modern applications - from the 
-enterprise to the solo dev prototyping a react application on her laptop. 
-We go beyond the Kafka protocol, into the future of streaming with inline WASM 
-transforms and geo-replicated hierarchical storage. A new platform that scales with 
-you from the smallest projects to petabytes of data distributed across the globe.
+Redpanda is a streaming data platform for developers. Kafka® API-compatible. ZooKeeper® free. JVM free. We built it from the ground up to eliminate complexity common to Apache Kafka, improve performance by up to 10x, and make the storage architecture safer, more resilient. The simpler devex lets you can focus on your code (instead of fighting Kafka) and develop new use cases that were never before possible. The business benefits from a significantly lower total cost and faster time to market. A new platform that scales with you from the smallest projects to petabytes of data distributed across the globe!
 
 # Community
 
@@ -48,7 +40,7 @@ brew install redpanda-data/tap/redpanda && rpk container start
 
 ```
 curl -1sLf \
-  'https://packages.vectorized.io/nzc4ZYQK3WRGd9sy/redpanda/cfg/setup/bash.deb.sh' \
+  'https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/cfg/setup/bash.deb.sh' \
   | sudo -E bash
   
 sudo apt-get install redpanda
@@ -58,11 +50,31 @@ sudo apt-get install redpanda
 
 ```
 curl -1sLf \
-  'https://packages.vectorized.io/nzc4ZYQK3WRGd9sy/redpanda/cfg/setup/bash.rpm.sh' \
+  'https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/cfg/setup/bash.rpm.sh' \
   | sudo -E bash
   
 sudo yum install redpanda
 ```
+
+### On Other Linux
+
+To install from a `.tar.gz` archive, download the file and extract it into `/opt/redpanda`.
+
+For amd64:
+
+```
+curl -LO \
+  https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/raw/names/redpanda-amd64/versions/22.3.3/redpanda-22.3.3-amd64.tar.gz
+```
+
+For arm64:
+
+```
+curl -LO \
+  https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/raw/names/redpanda-arm64/versions/22.3.3/redpanda-22.3.3-arm64.tar.gz
+```
+
+Replace `22.3.3` with the appropriate version you are trying to download.
 
 ## GitHub Actions
 
@@ -92,38 +104,35 @@ sudo ./install-dependencies.sh && CC=clang CXX=clang++ ./build.sh
 
 For quicker dev setup, we provide a [docker image](tools/docker/README.md) with the toolchain installed.
 
-# Beta builds
+# Release candidate builds
 
-For those of us who like to live on the edge!
+We create a release candidate (RC) build when we get close to a new release and publish these to make new features available for testing. 
+RC builds are not recommended for production use.
 
-We can cut a release at any point from the `/dev` branch if you want to test a particular feature.
-Simply let us know you would like to test a feature from dev and we're happy to cut a beta release.
+## RC releases on Debian/Ubuntu
 
-
-## Beta releases on Debian/Ubuntu
-
-```
+```bash
 curl -1sLf \
-  'https://packages.vectorized.io/HxYRCzL4xbbaEtPi/redpanda-beta/setup.deb.sh' \
+  'https://dl.redpanda.com/E4xN1tVe3Xy60GTx/redpanda-unstable/setup.deb.sh' \
   | sudo -E bash
-  
+
 sudo apt-get install redpanda
 ```
 
-## Beta releases on Fedora/RedHat/Amazon Linux
+## RC releases on Fedora/RedHat/Amazon Linux
 
-```
+```bash
 curl -1sLf \
-  'https://packages.vectorized.io/HxYRCzL4xbbaEtPi/redpanda-beta/setup.rpm.sh' \
+  'https://dl.redpanda.com/E4xN1tVe3Xy60GTx/redpanda-unstable/setup.rpm.sh' \
   | sudo -E bash
-  
+
 sudo yum install redpanda
 ```
 
-## Beta releases on Docker
+## RC releases on Docker
 
-This is an example with the `v21.3.5-beta3` version prior to the 21.3.5 release.
+This is an example with the `v23.1.1-rc1` version prior to the 23.1.1 release.
 
-```
-docker.vectorized.io/vectorized/redpanda:v21.3.5-beta3
+```bash
+docker pull docker.redpanda.com/redpandadata/redpanda-unstable:v23.1.1-rc1
 ```

@@ -29,9 +29,13 @@
 /dbuild
 bin
 _e2e_artifacts/
+_e2e_unstable_artifacts/
 _helm_e2e_artifacts/
 /src/go/k8s/testbin/*
 /src/go/k8s/cm-verifier
+/src/go/k8s/*.tar.gz
+/src/go/k8s/*-exit-code
+/src/go/k8s/kubeconfig
 
 # Test binary, build with `go test -c`
 *.test
@@ -192,6 +196,7 @@ venv.bak/
 tags
 .ccls-cache
 .clangd
+*.sublime-*
 
 # Configuration
 *.bk
@@ -234,6 +239,7 @@ vbuild/
 /vtools
 /Taskfile.yml
 /.dockerignore
+/.task/
 
 # helm chart dependencies
 *.tgz
@@ -242,3 +248,6 @@ vbuild/
 .classpath
 .factorypath
 .settings/
+
+#asdf tool version file
+.tool-versions

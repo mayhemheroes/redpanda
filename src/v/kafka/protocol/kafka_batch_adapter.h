@@ -12,6 +12,7 @@
 #pragma once
 
 #include "bytes/iobuf_parser.h"
+#include "kafka/protocol/types.h"
 #include "kafka/types.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
@@ -94,18 +95,18 @@ struct produce_request_record_data {
         adapter.batch = std::move(batch);
     }
 
+    friend std::ostream&
+    operator<<(std::ostream& os, const produce_request_record_data& data) {
+        // NOTE: this stream is intentially devoid of user data.
+        fmt::print(
+          os,
+          "batch {} v2_format {} valid_crc {}",
+          data.adapter.batch ? data.adapter.batch->size_bytes() : -1,
+          data.adapter.v2_format,
+          data.adapter.valid_crc);
+        return os;
+    }
     kafka_batch_adapter adapter;
 };
-
-inline std::ostream&
-operator<<(std::ostream& os, const produce_request_record_data& data) {
-    fmt::print(
-      os,
-      "batch {} v2_format {} valid_crc {}",
-      data.adapter.batch ? data.adapter.batch->size_bytes() : -1,
-      data.adapter.v2_format,
-      data.adapter.valid_crc);
-    return os;
-}
 
 } // namespace kafka

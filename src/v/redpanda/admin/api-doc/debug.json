@@ -39,6 +39,256 @@
                     "parameters": []
                 }
             ]
+        },
+        {
+            "path": "/v1/debug/self_test/start",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Start self test",
+                    "nickname": "self_test_start",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [],
+                    "responses": {
+                        "200": {
+                            "description": "OK",
+                            "schema": "json"
+                        },
+                        "503": {
+                            "description": "Test failed to start",
+                            "schema":{
+                                "type": "json"
+                            }
+                        }
+                    }
+
+                }
+            ]
+        },
+        {
+            "path": "/v1/debug/self_test/stop",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "stop self test",
+                    "nickname": "self_test_stop",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/debug/self_test/status",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Query self test",
+                    "nickname": "self_test_status",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+
+            ]
+        },
+        {
+            "path": "/v1/debug/peer_status/{id}",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get peer status",
+                    "type": "peer_status",
+                    "nickname": "get_peer_status",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "type": "long"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/debug/is_node_isolated",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get is node isolated",
+                    "type": "boolean",
+                    "nickname": "is_node_isolated",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/debug/controller_status",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get last_applied_offset and commited_index for controller log",
+                    "type": "controller_status",
+                    "nickname": "get_controller_status",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/debug/cloud_storage_usage",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get the sum of the cloud storage log for all partitions in the cluster",
+                    "type": "long",
+                    "nickname": "get_cloud_storage_usage",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "retries_allowed",
+                            "in": "query",
+                            "required": false,
+                            "type": "long"
+                        },
+                        {
+                            "name": "batch_size",
+                            "in": "query",
+                            "required": false,
+                            "type": "long"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/debug/blocked_reactor_notify_ms",
+            "operations": [
+                {
+                    "method": "PUT",
+                    "summary": "Temporarily reduce the threshold over which the reactor is considered blocked if no progress is made. The original threshold value will be restored after 'expire' seconds (default: 5 min)",
+                    "nickname": "blocked_reactor_notify_ms",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "timeout",
+                            "in": "query",
+                            "required": true,
+                            "allowMultiple": false,
+                            "type": "long"
+                        },
+                        {
+                            "name": "expires",
+                            "in": "query",
+                            "required": false,
+                            "allowMultiple": false,
+                            "type": "long"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/debug/refresh_disk_health_info",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Force a refresh of node health information",
+                    "type": "void",
+                    "nickname": "refresh_disk_health_info",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/debug/restart_service",
+            "operations": [
+                {
+                    "method": "PUT",
+                    "summary": "Restart a redpanda service",
+                    "type": "void",
+                    "nickname": "restart_service",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                        "name": "service",
+                        "in": "query",
+                        "required": true,
+                        "type": "string"
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Restart success"
+                        },
+                        "400": {
+                            "description": "Service name is required"
+                        },
+                        "404": {
+                            "description": "Service not found"
+                        },
+                        "500": {
+                            "description": "Internal Server error"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "path": "/v1/debug/partition/{namespace}/{topic}/{partition}",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get partition state for current node",
+                    "type": "partition_state",
+                    "nickname": "get_partition_state",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
         }
     ],
     "models": {
@@ -77,6 +327,351 @@
                 "partition_revision": {
                     "type": "long",
                     "description": "partition revision"
+                }
+            }
+        },
+        "peer_status": {
+            "id": "peer_status",
+            "description": "Peer status",
+            "properties": {
+                "since_last_status": {
+                    "type": "long",
+                    "description": "Milliseconds since last update from peer"
+                }
+            }
+        },
+        "controller_status": {
+            "id": "controller_status",
+            "description": "Controller status",
+            "properties": {
+                "start_offset": {
+                    "type": "long",
+                    "description": "start offset for controller log"
+                },
+                "last_applied_offset": {
+                    "type": "long",
+                    "description": "Last applied offset for controller stm"
+                },
+                "commited_index": {
+                    "type": "long",
+                    "description": "Commited index for controller consensus"
+                }
+            }
+        },
+        "self_test_result": {
+            "id": "self_test_result",
+            "description": "Result set from a single self_test run",
+            "properties": {
+                "p50": {
+                    "type": "long",
+                    "description": "50th percentile latencies"
+                },
+                "p90": {
+                    "type": "long",
+                    "description": "90th percentile latencies"
+                },
+                "p99": {
+                    "type": "long",
+                    "description": "99th percentile latencies"
+                },
+                "p999": {
+                    "type": "long",
+                    "description": "999th percentile latencies"
+                },
+                "max_latency": {
+                    "type": "long",
+                    "description": "Maximum recorded latency measurement"
+                },
+                "rps": {
+                    "type": "long",
+                    "description": "Number of requests per second"
+                },
+                "bps": {
+                    "type": "long",
+                    "description": "Bytes operated on per second"
+                },
+                "timeouts": {
+                    "type": "long",
+                    "description": "Number of io timeouts observed during run"
+                },
+                "test_id": {
+                    "type": "string",
+                    "description": "Global test uuid identifier"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Name of the test run"
+                },
+                "info": {
+                    "type": "string",
+                    "description": "Additional test labels, metadata and/or information"
+                },
+                "test_type": {
+                    "type": "string",
+                    "description": "Type of self test, one of either disk/network"
+                },
+                "duration": {
+                    "type": "long",
+                    "description": "Length of time the test took to complete"
+                },
+                "warning": {
+                    "type": "string",
+                    "description": "Warning that arose during test execution"
+                },
+                "error": {
+                    "type": "string",
+                    "description": "Stringified exception if any occurred during test execution"
+                }
+            }
+        },
+        "self_test_node_report": {
+            "id": "self_test_node_report",
+            "description": "Current state of self test on a given broker",
+            "properties": {
+                "node_id": {
+                    "type": "long",
+                    "description": "node_id of the broker reporting"
+                },
+                "status": {
+                    "type": "string",
+                    "description": "One of either idle / running / unreachable"
+                },
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "self_test_result"
+                    },
+                    "description": "Recordings of test runs from a single node"
+                }
+            }
+        },
+        "raft_follower_state": {
+            "id": "raft_follower_state",
+            "description": "Information about raft state for ntp for follower",
+            "properties": {
+                "id": {
+                    "type": "int",
+                    "description": "Node id"
+                },
+                "last_flushed_log_index": {
+                    "type": "long",
+                    "description": "Last flushed log index"
+                },
+                "last_dirty_log_index": {
+                    "type": "long",
+                    "description": "Last dirty log index"
+                },
+                "match_index": {
+                    "type": "long",
+                    "description": "Match index"
+                },
+                "next_index": {
+                    "type": "long",
+                    "description": "Next index"
+                },
+                "last_sent_offset": {
+                    "type": "long",
+                    "description": "Last sent offset"
+                },
+                "heartbeats_failed": {
+                    "type": "long",
+                    "description": "Heartbeats failed"
+                },
+                "is_learner": {
+                    "type": "boolean",
+                    "description": "Is node learner"
+                },
+                "ms_since_last_heartbeat": {
+                    "type": "long",
+                    "description": "Mlliseconds since last heartbeat"
+                },
+                "last_sent_seq": {
+                    "type": "long",
+                    "description": "Last sent seq"
+                },
+                "last_received_seq": {
+                    "type": "long",
+                    "description": "Last received seq"
+                },
+                "last_successful_received_seq": {
+                    "type": "long",
+                    "description": "Last successful received seq"
+                },
+                "suppress_heartbeats": {
+                    "type": "boolean",
+                    "description": "Suppress heartbeats"
+                },
+                "is_recovering": {
+                    "type": "boolean",
+                    "description": "Is node recovering"
+                }
+            }
+        },
+        "raft_replica_state": {
+            "id": "raft_replica_state",
+            "description": "Raft level state for a single replica of a partition",
+            "properties": {
+                "node_id": {
+                    "type": "int",
+                    "description": "node_id of the broker hosting partition"
+                },
+                "term": {
+                    "type": "long",
+                    "description": "Current raft term"
+                },
+                "offset_translator_state": {
+                    "type" : "string",
+                    "description": "State of the offset translator"
+                },
+                "group_configuration": {
+                    "type" : "string",
+                    "description": "Local raft replica configuration"
+                },
+                "confirmed_term": {
+                    "type": "long",
+                    "description": "Confirmed term as seen by consensus"
+                },
+                "flushed_offset": {
+                    "type": "long",
+                    "description": "Current flushed offset"
+                },
+                "commit_index": {
+                    "type": "long",
+                    "description": "Current commit index"
+                },
+                "majority_replicated_index": {
+                    "type": "long",
+                    "description": "Majority replicated index"
+                },
+                "visibility_upper_bound_index": {
+                    "type": "long",
+                    "description": "Visibility upper bound index"
+                },
+                "last_quorum_replicated_index": {
+                    "type": "long",
+                    "description": "Last quorum replicated index"
+                },
+                "last_snapshot_term": {
+                    "type": "long",
+                    "description": "Last snapshot term"
+                },
+                "received_snapshot_bytes": {
+                    "type": "long",
+                    "description": "Size in bytes of snapshot recieved"
+                },
+                "last_snapshot_index": {
+                    "type": "long",
+                    "description": "Last snapshot index"
+                },
+                "received_snapshot_index": {
+                    "type": "long",
+                    "description": "Received snapshot index"
+                },
+                "has_pending_flushes": {
+                    "type": "boolean",
+                    "descrption": "True if there are any pending flushes"
+                },
+                "is_leader": {
+                    "type": "boolean",
+                    "description": "True if voted a leader and term confirmed"
+                },
+                "is_elected_leader": {
+                    "type": "boolean",
+                    "description": "True of voted a leader"
+                },
+                "followers" : {
+                    "type": "array",
+                    "items": {
+                        "type" : "raft_follower_state"
+                    },
+                    "description": "Follower metadata for this leader."
+                }
+            }
+        },
+        "partition_replica_state": {
+            "id": "partition_replica_state",
+            "description": "Partition state of a replica",
+            "properties": {
+                "start_offset": {
+                    "type": "long",
+                    "description": "Start offset"
+                },
+                "committed_offset": {
+                    "type": "long",
+                    "description": "Commmited offset"
+                },
+                "last_stable_offset": {
+                    "type": "long",
+                    "description": "Last stable offset"
+                },
+                "high_watermark": {
+                    "type": "long",
+                    "description": "High watermark"
+                },
+                "dirty_offset": {
+                    "type": "long",
+                    "description": "Dirty offset"
+                },
+                "latest_configuration_offset": {
+                    "type": "long",
+                    "description": "Get latest configuration offset"
+                },
+                "revision_id": {
+                    "type": "long",
+                    "description": "Revision id"
+                },
+                "log_size_bytes": {
+                    "type": "long",
+                    "description": "Log size bytes"
+                },
+                "non_log_disk_size_bytes": {
+                    "type": "long",
+                    "description": "Non log disk size bytes"
+                },
+                "is_read_replica_mode_enabled": {
+                    "type": "boolean",
+                    "description": "Is read replica mode enabled"
+                },
+                "read_replica_bucket": {
+                    "type": "string",
+                    "description": "Read replica bucket"
+                },
+                "is_remote_fetch_enabled": {
+                    "type": "boolean",
+                    "description": "Is remote fetch enabled"
+                },
+                "is_cloud_data_available": {
+                    "type": "boolean",
+                    "description": "Is cloud data available"
+                },
+                "start_cloud_offset": {
+                    "type": "long",
+                    "description": "Start cloud offset"
+                },
+                "next_cloud_offset": {
+                    "type": "long",
+                    "description": "Next cloud offset"
+                },
+                "raft_state": {
+                    "type" : "raft_replica_state",
+                    "description": "Underlying raft replica state of the partition instance"
+                }
+            }
+        },
+        "partition_state": {
+            "id": "partition_state",
+            "description": "Partition states of all the instances of this partition",
+            "properties": {
+                "ntp": {
+                    "type": "string",
+                    "description": "Partition that is queried"
+                },
+                "replicas": {
+                    "type": "array",
+                    "items": {
+                        "type": "partition_replica_state"
+                    },
+                    "description": "All replicas of this partition"
                 }
             }
         }

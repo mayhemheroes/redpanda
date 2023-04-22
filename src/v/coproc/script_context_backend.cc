@@ -199,7 +199,7 @@ static ss::future<> write_materialized_partition(
           model::topic_namespace source(input->ntp().ns, input->ntp().tp.topic);
           model::topic_namespace new_materialized(ntp.ns, ntp.tp.topic);
           return maybe_make_materialized_log(
-                   source, new_materialized, input->is_leader(), args)
+                   source, new_materialized, input->is_elected_leader(), args)
             .then([args, ntp] { return get_partition(args.pm.local(), ntp); })
             .then([ntp, reader = std::move(reader)](
                     ss::lw_shared_ptr<partition> p) mutable {
@@ -339,29 +339,32 @@ write_materialized(output_write_inputs replies, output_write_args args) {
     grouping_t grs = group_replies(std::move(replies));
     bool err{false};
     co_await ss::parallel_for_each(
-      grs, [_args{args}, &err](grouping_t::value_type& vt) -> ss::future<> {
-          auto args{_args};
-          try {
-              co_await process_reply_group(
-                vt.first, std::move(vt.second), args);
-          } catch (const bad_reply_exception& ex) {
-              vlog(coproclog.error, "No source for reply: {}", ex);
-          } catch (const script_failed_exception& ex) {
-              throw ex;
-          } catch (const malformed_batch_exception& ex) {
-              throw engine_protocol_failure(args.id, ex.what());
-          } catch (const cluster::non_replicable_topic_creation_exception& ex) {
-              vlog(
-                coproclog.warn,
-                "Failed to create non_replicable topic: {}",
-                ex);
-          } catch (const coproc::exception& ex) {
-              /// For any type of failure the offset will not be touched,
-              /// the read phase will always read from the global min of all
-              /// offsets ever registered.
-              vlog(coproclog.info, "Error while processing reply: {}", ex);
-              err = true;
-          }
+      grs, [args, &err](grouping_t::value_type& vt) -> ss::future<> {
+          return process_reply_group(vt.first, std::move(vt.second), args)
+            .handle_exception([args, &err](const std::exception_ptr& e) {
+                try {
+                    std::rethrow_exception(e);
+                } catch (const bad_reply_exception& ex) {
+                    vlog(coproclog.error, "No source for reply: {}", ex);
+                } catch (const script_failed_exception& ex) {
+                    throw ex;
+                } catch (const malformed_batch_exception& ex) {
+                    throw engine_protocol_failure(args.id, ex.what());
+                } catch (
+                  const cluster::non_replicable_topic_creation_exception& ex) {
+                    vlog(
+                      coproclog.warn,
+                      "Failed to create non_replicable topic: {}",
+                      ex);
+                } catch (const coproc::exception& ex) {
+                    /// For any type of failure the offset will not be touched,
+                    /// the read phase will always read from the global min of
+                    /// all offsets ever registered.
+                    vlog(
+                      coproclog.info, "Error while processing reply: {}", ex);
+                    err = true;
+                }
+            });
       });
     if (err) {
         co_await ss::sleep(100ms);

@@ -13,6 +13,7 @@
 #include "bytes/iobuf.h"
 #include "bytes/iobuf_parser.h"
 #include "cloud_storage/types.h"
+#include "cloud_storage_clients/client_probe.h"
 #include "seastarx.h"
 #include "test_utils/async.h"
 
@@ -32,38 +33,45 @@ using namespace std::chrono_literals;
 
 inline ss::logger fixt_log("fixture"); // NOLINT
 
-static constexpr uint16_t httpd_port_number = 4430;
-static constexpr const char* httpd_host_name = "127.0.0.1";
+/// For http_imposter to run this binary with a unique port
+uint16_t unit_test_httpd_port_number() { return 4442; }
 
-s3::configuration s3_imposter_fixture::get_configuration() {
-    net::unresolved_address server_addr(httpd_host_name, httpd_port_number);
-    s3::configuration conf{
-      .uri = s3::access_point_uri(httpd_host_name),
-      .access_key = s3::public_key_str("acess-key"),
-      .secret_key = s3::private_key_str("secret-key"),
-      .region = s3::aws_region_name("us-east-1"),
-    };
+cloud_storage_clients::s3_configuration
+s3_imposter_fixture::get_configuration() {
+    net::unresolved_address server_addr(httpd_host_name, httpd_port_number());
+    cloud_storage_clients::s3_configuration conf;
+    conf.uri = cloud_storage_clients::access_point_uri(httpd_host_name);
+    conf.access_key = cloud_roles::public_key_str("acess-key");
+    conf.secret_key = cloud_roles::private_key_str("secret-key");
+    conf.region = cloud_roles::aws_region_name("us-east-1");
     conf.server_addr = server_addr;
-    conf._probe = ss::make_shared<s3::client_probe>(
-      net::metrics_disabled::yes, "us-east-1", httpd_host_name);
+    conf._probe = ss::make_shared<cloud_storage_clients::client_probe>(
+      net::metrics_disabled::yes,
+      net::public_metrics_disabled::yes,
+      cloud_roles::aws_region_name{"us-east-1"},
+      cloud_storage_clients::endpoint_url{httpd_host_name});
     return conf;
 }
 
 s3_imposter_fixture::s3_imposter_fixture() {
     _server = ss::make_shared<ss::httpd::http_server_control>();
     _server->start().get();
-    ss::ipv4_addr ip_addr = {httpd_host_name, httpd_port_number};
+    ss::ipv4_addr ip_addr = {httpd_host_name, httpd_port_number()};
     _server_addr = ss::socket_address(ip_addr);
 }
 
 s3_imposter_fixture::~s3_imposter_fixture() { _server->stop().get(); }
 
-const std::vector<ss::httpd::request>&
+uint16_t s3_imposter_fixture::httpd_port_number() {
+    return unit_test_httpd_port_number();
+}
+
+const std::vector<http_test_utils::request_info>&
 s3_imposter_fixture::get_requests() const {
     return _requests;
 }
 
-const std::multimap<ss::sstring, ss::httpd::request>&
+const std::multimap<ss::sstring, http_test_utils::request_info>&
 s3_imposter_fixture::get_targets() const {
     return _targets;
 }
@@ -82,6 +90,7 @@ void s3_imposter_fixture::set_routes(
   ss::httpd::routes& r,
   const std::vector<s3_imposter_fixture::expectation>& expectations) {
     using namespace ss::httpd;
+    using reply = ss::http::reply;
     struct content_handler {
         content_handler(
           const std::vector<expectation>& exp, s3_imposter_fixture& imp)
@@ -99,8 +108,9 @@ void s3_imposter_fixture::set_routes(
                             <Resource>resource</Resource>
                             <RequestId>requestid</RequestId>
                         </Error>)xml";
-            fixture._requests.push_back(request);
-            fixture._targets.insert(std::make_pair(request._url, request));
+            http_test_utils::request_info ri(request);
+            fixture._requests.push_back(ri);
+            fixture._targets.insert(std::make_pair(ri.url, ri));
             vlog(
               fixt_log.trace,
               "S3 imposter request {} - {} - {}",
@@ -120,12 +130,20 @@ void s3_imposter_fixture::set_routes(
                   .url = request._url, .body = request.content};
                 return "";
             } else if (request._method == "DELETE") {
+                // TODO (abhijat) - enable conditionally failing requests
+                // instead of this hardcoding
+                if (request._url == "/failme") {
+                    repl.set_status(reply::status_type::internal_server_error);
+                    return "";
+                }
+
                 auto it = expectations.find(request._url);
                 if (it == expectations.end() || !it->second.body.has_value()) {
                     vlog(fixt_log.trace, "Reply DELETE request with error");
                     repl.set_status(reply::status_type::not_found);
                     return error_payload;
                 }
+
                 repl.set_status(reply::status_type::no_content);
                 it->second.body = std::nullopt;
                 return "";
@@ -147,6 +165,11 @@ void s3_imposter_fixture::set_routes(
                   "S3 imposter response: {}",
                   repl.response_line());
                 return "";
+            } else if (
+              request._method == "POST"
+              && request.query_parameters.contains("delete")) {
+                // Delete objects
+                return R"xml(<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>)xml";
             }
             BOOST_FAIL("Unexpected request");
             return "";
@@ -159,4 +182,23 @@ void s3_imposter_fixture::set_routes(
       [hd](const_req req, reply& repl) { return hd->handle(req, repl); },
       "txt");
     r.add_default_handler(_handler.get());
+}
+
+enable_cloud_storage_fixture::enable_cloud_storage_fixture() {
+    ss::smp::invoke_on_all([]() {
+        auto& cfg = config::shard_local_cfg();
+        cfg.cloud_storage_enabled.set_value(true);
+        cfg.cloud_storage_api_endpoint.set_value(
+          std::optional<ss::sstring>{s3_imposter_fixture::httpd_host_name});
+        cfg.cloud_storage_api_endpoint_port.set_value(
+          static_cast<int16_t>(unit_test_httpd_port_number()));
+        cfg.cloud_storage_access_key.set_value(
+          std::optional<ss::sstring>{"access-key"});
+        cfg.cloud_storage_secret_key.set_value(
+          std::optional<ss::sstring>{"secret-key"});
+        cfg.cloud_storage_region.set_value(
+          std::optional<ss::sstring>{"us-east1"});
+        cfg.cloud_storage_bucket.set_value(
+          std::optional<ss::sstring>{"test-bucket"});
+    }).get();
 }

@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "model/record_batch_reader.h"
 #include "model/timeout_clock.h"
@@ -52,12 +53,16 @@ public:
         virtual ss::future<> truncate(truncate_config) = 0;
         virtual ss::future<> truncate_prefix(truncate_prefix_config) = 0;
 
+        // TODO should compact be merged in this?
+        // run housekeeping task, like rolling segments
+        virtual ss::future<> do_housekeeping() = 0;
+
         virtual ss::future<model::record_batch_reader>
           make_reader(log_reader_config) = 0;
         virtual log_appender make_appender(log_append_config) = 0;
 
         // final operation. Invalid filesystem state after
-        virtual ss::future<> close() = 0;
+        virtual ss::future<std::optional<ss::sstring>> close() = 0;
         // final operation. Invalid state after
         virtual ss::future<> remove() = 0;
 
@@ -70,6 +75,7 @@ public:
 
         virtual size_t segment_count() const = 0;
         virtual storage::offset_stats offsets() const = 0;
+        virtual model::timestamp start_timestamp() const = 0;
         virtual std::ostream& print(std::ostream& o) const = 0;
         virtual std::optional<model::term_id> get_term(model::offset) const = 0;
         virtual std::optional<model::offset>
@@ -77,12 +83,13 @@ public:
 
         virtual ss::future<model::offset>
         monitor_eviction(ss::abort_source&) = 0;
-        virtual void set_collectible_offset(model::offset) = 0;
         ss::lw_shared_ptr<storage::stm_manager> stm_manager() {
             return _stm_manager;
         }
 
         virtual size_t size_bytes() const = 0;
+        // Byte size of the log for all segments before offset 'o'
+        virtual size_t size_bytes_until_offset(model::offset o) const = 0;
         virtual ss::future<>
           update_configuration(ntp_config::default_overrides) = 0;
 
@@ -99,7 +106,7 @@ public:
 public:
     explicit log(ss::shared_ptr<impl> i)
       : _impl(std::move(i)) {}
-    ss::future<> close() { return _impl->close(); }
+    ss::future<std::optional<ss::sstring>> close() { return _impl->close(); }
     ss::future<> remove() { return _impl->remove(); }
     ss::future<> flush() { return _impl->flush(); }
 
@@ -147,6 +154,10 @@ public:
 
     size_t segment_count() const { return _impl->segment_count(); }
 
+    model::timestamp start_timestamp() const {
+        return _impl->start_timestamp();
+    }
+
     storage::offset_stats offsets() const { return _impl->offsets(); }
 
     std::optional<model::term_id> get_term(model::offset o) const {
@@ -165,6 +176,7 @@ public:
 
     ss::future<> compact(compaction_config cfg) { return _impl->compact(cfg); }
 
+    ss::future<> housekeeping() { return _impl->do_housekeeping(); }
     /**
      * \brief Returns a future that resolves when log eviction is scheduled
      *
@@ -180,13 +192,6 @@ public:
     ss::lw_shared_ptr<storage::stm_manager> stm_manager() {
         return _impl->stm_manager();
     }
-    /**
-     * Controlls the max offset that may be evicted by log retention policy
-     * This offset is non-decreasing.
-     */
-    void set_collectible_offset(model::offset o) {
-        return _impl->set_collectible_offset(o);
-    };
 
     ss::future<> update_configuration(ntp_config::default_overrides o) {
         return _impl->update_configuration(o);
@@ -198,22 +203,28 @@ public:
 
     size_t size_bytes() const { return _impl->size_bytes(); }
 
+    size_t size_bytes_until_offset(model::offset o) const {
+        return _impl->size_bytes_until_offset(o);
+    }
+
     impl* get_impl() const { return _impl.get(); }
 
 private:
     ss::shared_ptr<impl> _impl;
 
-    friend std::ostream& operator<<(std::ostream& o, const log& lg);
+    friend std::ostream& operator<<(std::ostream& o, const log& lg) {
+        return lg.print(o);
+    }
 };
-
-inline std::ostream& operator<<(std::ostream& o, const storage::log& lg) {
-    return lg.print(o);
-}
 
 class log_manager;
 class segment_set;
 class kvstore;
-log make_memory_backed_log(ntp_config);
-log make_disk_backed_log(ntp_config, log_manager&, segment_set, kvstore&);
+log make_disk_backed_log(
+  ntp_config,
+  log_manager&,
+  segment_set,
+  kvstore&,
+  ss::sharded<features::feature_table>& feature_table);
 
 } // namespace storage

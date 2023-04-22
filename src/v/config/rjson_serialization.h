@@ -62,6 +62,16 @@ void rjson_serialize(
 
 void rjson_serialize(
   json::Writer<json::StringBuffer>& w,
-  const model::violation_recovery_policy& v);
+  const model::cloud_credentials_source& v);
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w,
+  const model::partition_autobalancing_mode& v);
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, const model::cloud_storage_backend& v);
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, const model::leader_balancer_mode& v);
 
 } // namespace json

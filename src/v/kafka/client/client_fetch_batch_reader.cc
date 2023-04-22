@@ -17,7 +17,6 @@
 #include "kafka/protocol/kafka_batch_adapter.h"
 
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/std-coroutine.hh>
 
 namespace kafka::client {
 
@@ -48,7 +47,11 @@ public:
               "fetch_batch_reader: fetch offset: {}",
               _next_offset);
             auto res = co_await _client.fetch_partition(
-              _tp, _next_offset, 1_MiB, t - model::timeout_clock::now());
+              _tp,
+              _next_offset,
+              1_MiB,
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                t - model::timeout_clock::now()));
             vlog(kclog.debug, "fetch_batch_reader: fetch result: {}", res);
             vassert(
               res.begin() != res.end() && ++res.begin() == res.end(),

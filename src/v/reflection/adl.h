@@ -30,10 +30,12 @@ namespace reflection {
 template<typename T>
 struct adl {
     using type = std::remove_reference_t<std::decay_t<T>>;
-    static constexpr bool is_optional = is_std_optional_v<type>;
+    static constexpr bool is_optional = is_std_optional<type>;
     static constexpr bool is_sstring = std::is_same_v<type, ss::sstring>;
-    static constexpr bool is_vector = is_std_vector_v<type>;
-    static constexpr bool is_named_type = is_named_type_v<type>;
+    static constexpr bool is_vector = is_std_vector<type>;
+    static constexpr bool is_fragmented_vector
+      = reflection::is_fragmented_vector<type>;
+    static constexpr bool is_named_type = is_rp_named_type<type>;
     static constexpr bool is_iobuf = std::is_same_v<type, iobuf>;
     static constexpr bool is_standard_layout = std::is_standard_layout_v<type>;
     static constexpr bool is_not_floating_point
@@ -41,12 +43,12 @@ struct adl {
     static constexpr bool is_trivially_copyable
       = std::is_trivially_copyable_v<type>;
     static constexpr bool is_enum = std::is_enum_v<T>;
-    static constexpr bool is_ss_bool = is_ss_bool_v<T>;
+    static constexpr bool is_ss_bool = is_ss_bool_class<T>;
     static constexpr bool is_chrono_milliseconds
       = std::is_same_v<type, std::chrono::milliseconds>;
     static constexpr bool is_time_point
       = std::is_same_v<type, ss::lowres_system_clock::time_point>;
-    static constexpr bool is_circular_buffer = is_ss_circular_buffer_v<type>;
+    static constexpr bool is_circular_buffer = is_ss_circular_buffer<type>;
 
     static_assert(
       is_optional || is_sstring || is_vector || is_named_type || is_iobuf
@@ -87,6 +89,14 @@ struct adl {
                 ret.push_back(adl<value_type>{}.from(in));
             }
             return ret;
+        } else if constexpr (is_fragmented_vector) {
+            using value_type = typename type::value_type;
+            int32_t n = in.template consume_type<int32_t>();
+            fragmented_vector<value_type> ret;
+            while (n-- > 0) {
+                ret.push_back(adl<value_type>{}.from(in));
+            }
+            return ret;
         } else if constexpr (is_circular_buffer) {
             using value_type = typename type::value_type;
             int32_t n = in.template consume_type<int32_t>();
@@ -101,7 +111,11 @@ struct adl {
             using e_type = std::underlying_type_t<type>;
             return static_cast<type>(adl<e_type>{}.from(in));
         } else if constexpr (std::is_integral_v<type>) {
-            return ss::le_to_cpu(in.template consume_type<type>());
+            if constexpr (std::is_same_v<type, bool>) {
+                return type(adl<int8_t>{}.from(in));
+            } else {
+                return ss::le_to_cpu(in.template consume_type<type>());
+            }
         } else if constexpr (is_ss_bool) {
             return type(adl<int8_t>{}.from(in));
         } else if constexpr (is_chrono_milliseconds) {
@@ -142,8 +156,14 @@ struct adl {
             adl<int32_t>{}.to(out, int32_t(t.size()));
             out.append(t.data(), t.size());
             return;
-        } else if constexpr (is_vector) {
+        } else if constexpr (is_vector || is_fragmented_vector) {
             using value_type = typename type::value_type;
+            if (unlikely(t.size() > std::numeric_limits<int32_t>::max())) {
+                throw std::invalid_argument(fmt::format(
+                  "Vector size {} exceeded int32_max: {}",
+                  t.size(),
+                  std::numeric_limits<int32_t>::max()));
+            }
             adl<int32_t>{}.to(out, t.size());
             for (value_type& i : t) {
                 adl<value_type>{}.to(out, std::move(i));
@@ -164,8 +184,12 @@ struct adl {
             using e_type = std::underlying_type_t<type>;
             adl<e_type>{}.to(out, static_cast<e_type>(t));
         } else if constexpr (std::is_integral_v<type>) {
-            auto le_t = ss::cpu_to_le(t);
-            out.append(reinterpret_cast<const char*>(&le_t), sizeof(type));
+            if constexpr (std::is_same_v<type, bool>) {
+                adl<int8_t>{}.to(out, static_cast<int8_t>(bool(t)));
+            } else {
+                auto le_t = ss::cpu_to_le(t);
+                out.append(reinterpret_cast<const char*>(&le_t), sizeof(type));
+            }
             return;
         } else if constexpr (is_ss_bool) {
             adl<int8_t>{}.to(out, static_cast<int8_t>(bool(t)));

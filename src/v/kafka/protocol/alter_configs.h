@@ -23,52 +23,42 @@
 
 namespace kafka {
 
-struct alter_configs_response;
-
-class alter_configs_api final {
-public:
-    using response_type = alter_configs_response;
-
-    static constexpr const char* name = "alter_configs";
-    static constexpr api_key key = api_key(33);
-};
-
 struct alter_configs_request final {
     using api_type = alter_configs_api;
 
     alter_configs_request_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const alter_configs_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const alter_configs_request& r) {
+        return os << r.data;
+    }
+};
 
 struct alter_configs_response final {
     using api_type = alter_configs_api;
 
     alter_configs_response_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const alter_configs_response& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const alter_configs_response& r) {
+        return os << r.data;
+    }
+};
 
 } // namespace kafka

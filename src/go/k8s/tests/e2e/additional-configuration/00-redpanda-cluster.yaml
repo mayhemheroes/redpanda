@@ -2,10 +2,9 @@ apiVersion: redpanda.vectorized.io/v1alpha1
 kind: Cluster
 metadata:
   name: additional-configuration
-  namespace: default
 spec:
   image: "vectorized/redpanda"
-  version: "v21.11.2"
+  version: "v22.1.11"
   replicas: 1
   resources:
     requests:

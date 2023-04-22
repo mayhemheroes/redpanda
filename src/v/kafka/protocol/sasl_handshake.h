@@ -19,16 +19,6 @@
 
 namespace kafka {
 
-struct sasl_handshake_response;
-
-class sasl_handshake_api final {
-public:
-    using response_type = sasl_handshake_response;
-
-    static constexpr const char* name = "sasl handshake";
-    static constexpr api_key key = api_key(17);
-};
-
 struct sasl_handshake_request final {
     using api_type = sasl_handshake_api;
 
@@ -36,19 +26,19 @@ struct sasl_handshake_request final {
 
     sasl_handshake_request() = default;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const sasl_handshake_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const sasl_handshake_request& r) {
+        return os << r.data;
+    }
+};
 
 struct sasl_handshake_response final {
     using api_type = sasl_handshake_api;
@@ -63,18 +53,18 @@ struct sasl_handshake_response final {
         data.mechanisms = std::move(mechanisms);
     }
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const sasl_handshake_response& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const sasl_handshake_response& r) {
+        return os << r.data;
+    }
+};
 
 } // namespace kafka

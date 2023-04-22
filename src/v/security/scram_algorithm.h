@@ -11,6 +11,7 @@
 #pragma once
 #include "bytes/bytes.h"
 #include "hashing/secure.h"
+#include "net/types.h"
 #include "random/generators.h"
 #include "security/scram_credential.h"
 #include "ssx/sformat.h"
@@ -36,15 +37,10 @@
  */
 namespace security {
 
-class scram_exception final : public std::exception {
+class scram_exception final : public net::authentication_exception {
 public:
     explicit scram_exception(ss::sstring msg) noexcept
-      : _msg(std::move(msg)) {}
-
-    const char* what() const noexcept final { return _msg.c_str(); }
-
-private:
-    ss::sstring _msg;
+      : net::authentication_exception(std::move(msg)) {}
 };
 
 /**
@@ -190,11 +186,6 @@ private:
     bytes _signature;
 };
 
-std::ostream& operator<<(std::ostream&, const client_first_message&);
-std::ostream& operator<<(std::ostream&, const server_first_message&);
-std::ostream& operator<<(std::ostream&, const client_final_message&);
-std::ostream& operator<<(std::ostream&, const server_final_message&);
-
 template<
   typename MacType,
   typename HashType,
@@ -251,6 +242,20 @@ public:
           std::move(serverkey),
           std::move(storedkey),
           iterations);
+    }
+    static scram_credential make_credentials(
+      acl_principal principal, const ss::sstring& password, int iterations) {
+        bytes salt = random_generators::get_bytes(SaltSize);
+        bytes salted_password = salt_password(password, salt, iterations);
+        auto clientkey = client_key(salted_password);
+        auto storedkey = stored_key(clientkey);
+        auto serverkey = server_key(salted_password);
+        return scram_credential(
+          std::move(salt),
+          std::move(serverkey),
+          std::move(storedkey),
+          iterations,
+          std::move(principal));
     }
 
     static bytes client_proof(

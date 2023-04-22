@@ -11,8 +11,11 @@
 
 #pragma once
 
+#include "cluster/topic_table.h"
 #include "config/property.h"
+#include "features/feature_table.h"
 #include "model/fundamental.h"
+#include "model/metadata.h"
 #include "random/simple_time_jitter.h"
 #include "seastarx.h"
 #include "storage/batch_cache.h"
@@ -20,9 +23,11 @@
 #include "storage/log_housekeeping_meta.h"
 #include "storage/ntp_config.h"
 #include "storage/segment.h"
+#include "storage/storage_resources.h"
 #include "storage/types.h"
 #include "storage/version.h"
 #include "units.h"
+#include "utils/intrusive_list_helpers.h"
 #include "utils/mutex.h"
 
 #include <seastar/core/abort_source.hh>
@@ -44,47 +49,24 @@ namespace storage {
 
 // class log_config {
 struct log_config {
-    enum class storage_type { memory, disk };
-
     log_config(
-      storage_type type,
       ss::sstring directory,
       size_t segment_size,
       debug_sanitize_files should,
       ss::io_priority_class compaction_priority
-      = ss::default_priority_class()) noexcept
-      : stype(type)
-      , base_dir(std::move(directory))
-      , max_segment_size(config::mock_binding<size_t>(std::move(segment_size)))
-      , compacted_segment_size(config::mock_binding<size_t>(256_MiB))
-      , max_compacted_segment_size(config::mock_binding<size_t>(5_GiB))
-      , sanitize_fileops(should)
-      , compaction_priority(compaction_priority)
-      , retention_bytes(
-          config::mock_binding<std::optional<size_t>>(std::nullopt))
-      , compaction_interval(config::mock_binding<std::chrono::milliseconds>(
-          std::chrono::minutes(10)))
-      , delete_retention(
-          config::mock_binding<std::optional<std::chrono::milliseconds>>(
-            std::chrono::minutes(10080))) {}
-
+      = ss::default_priority_class()) noexcept;
     log_config(
-      storage_type type,
       ss::sstring directory,
       size_t segment_size,
       debug_sanitize_files should,
       ss::io_priority_class compaction_priority,
-      with_cache with) noexcept
-      : log_config(type, directory, segment_size, should, compaction_priority) {
-        cache = with;
-    }
-
+      with_cache with) noexcept;
     log_config(
-      storage_type type,
       ss::sstring directory,
       config::binding<size_t> segment_size,
       config::binding<size_t> compacted_segment_size,
       config::binding<size_t> max_compacted_segment_size,
+      jitter_percents segment_size_jitter,
       debug_sanitize_files should,
       ss::io_priority_class compaction_priority,
       config::binding<std::optional<size_t>> ret_bytes,
@@ -93,21 +75,7 @@ struct log_config {
       with_cache c,
       batch_cache::reclaim_options recopts,
       std::chrono::milliseconds rdrs_cache_eviction_timeout,
-      ss::scheduling_group compaction_sg) noexcept
-      : stype(type)
-      , base_dir(std::move(directory))
-      , max_segment_size(segment_size)
-      , compacted_segment_size(compacted_segment_size)
-      , max_compacted_segment_size(max_compacted_segment_size)
-      , sanitize_fileops(should)
-      , compaction_priority(compaction_priority)
-      , retention_bytes(ret_bytes)
-      , compaction_interval(compaction_ival)
-      , delete_retention(del_ret)
-      , cache(c)
-      , reclaim_opts(recopts)
-      , readers_cache_eviction_timeout(rdrs_cache_eviction_timeout)
-      , compaction_sg(compaction_sg) {}
+      ss::scheduling_group compaction_sg) noexcept;
 
     ~log_config() noexcept = default;
     // must be enabled so that we can do ss::sharded<>.start(config);
@@ -117,9 +85,11 @@ struct log_config {
     log_config(log_config&&) noexcept = default;
     log_config& operator=(log_config&&) noexcept = default;
 
-    storage_type stype;
     ss::sstring base_dir;
     config::binding<size_t> max_segment_size;
+
+    // Default 5% jitter on segment size thresholds
+    jitter_percents segment_size_jitter;
 
     // compacted segment size
     config::binding<size_t> compacted_segment_size;
@@ -180,7 +150,11 @@ struct log_config {
  */
 class log_manager {
 public:
-    explicit log_manager(log_config, kvstore& kvstore) noexcept;
+    explicit log_manager(
+      log_config,
+      kvstore& kvstore,
+      storage_resources&,
+      ss::sharded<features::feature_table>&) noexcept;
 
     ss::future<log> manage(ntp_config);
 
@@ -192,10 +166,20 @@ public:
      * NOTE: if removal of an ntp causes the parent topic directory to become
      * empty then it is also removed. Currently topic deletion is the only
      * action that drives partition removal, so this makes sense. This must be
-     * revisted when we start removing partitions for other reasons, like
+     * revisited when we start removing partitions for other reasons, like
      * rebalancing partitions across the cluster, etc...
      */
     ss::future<> remove(model::ntp);
+    /**
+     * This function walsk through entire directory structure in an async fiber
+     * to remove all orphan files in that directory. It checks if file is orphan
+     * with special orphan_filter
+     */
+    ss::future<> remove_orphan_files(
+      ss::sstring data_directory_path,
+      absl::flat_hash_set<model::ns> namespaces,
+      ss::noncopyable_function<bool(model::ntp, partition_path::metadata)>
+        orphan_filter);
 
     ss::future<> stop();
 
@@ -216,7 +200,7 @@ public:
     /// Returns the log for the specified ntp.
     std::optional<log> get(const model::ntp& ntp) {
         if (auto it = _logs.find(ntp); it != _logs.end()) {
-            return it->second.handle;
+            return it->second->handle;
         }
         return std::nullopt;
     }
@@ -226,10 +210,16 @@ public:
 
     int64_t compaction_backlog() const;
 
+    storage_resources& resources() { return _resources; }
+
 private:
-    using logs_type = absl::flat_hash_map<model::ntp, log_housekeeping_meta>;
+    using logs_type
+      = absl::flat_hash_map<model::ntp, std::unique_ptr<log_housekeeping_meta>>;
+    using compaction_list_type
+      = intrusive_list<log_housekeeping_meta, &log_housekeeping_meta::link>;
 
     ss::future<log> do_manage(ntp_config);
+    ss::future<> clean_close(storage::log&);
 
     /**
      * \brief delete old segments and trigger compacted segments
@@ -242,17 +232,23 @@ private:
 
     ss::future<> dispatch_topic_dir_deletion(ss::sstring dir);
     ss::future<> recover_log_state(const ntp_config&);
+    ss::future<> async_clear_logs();
+
+    ss::future<> housekeeping_scan(model::timestamp);
 
     log_config _config;
     kvstore& _kvstore;
+    storage_resources& _resources;
+    ss::sharded<features::feature_table>& _feature_table;
     simple_time_jitter<ss::lowres_clock> _jitter;
-    ss::timer<ss::lowres_clock> _compaction_timer;
+    ss::timer<ss::lowres_clock> _housekeeping_timer;
     logs_type _logs;
+    compaction_list_type _logs_list;
     batch_cache _batch_cache;
     ss::gate _open_gate;
     ss::abort_source _abort_source;
 
     friend std::ostream& operator<<(std::ostream&, const log_manager&);
 };
-std::ostream& operator<<(std::ostream& o, log_config::storage_type t);
+
 } // namespace storage

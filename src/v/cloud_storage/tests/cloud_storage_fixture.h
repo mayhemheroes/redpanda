@@ -8,11 +8,15 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
+#pragma once
+
 #include "cloud_storage/cache_service.h"
+#include "cloud_storage/remote.h"
 #include "cloud_storage/tests/common_def.h"
 #include "cloud_storage/tests/s3_imposter.h"
 #include "cloud_storage/types.h"
 #include "test_utils/fixture.h"
+#include "vlog.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/iostream.hh>
@@ -25,18 +29,44 @@
 using namespace std::chrono_literals;
 using namespace cloud_storage;
 
+static constexpr model::cloud_credentials_source config_file{
+  model::cloud_credentials_source::config_file};
+
 struct cloud_storage_fixture : s3_imposter_fixture {
     cloud_storage_fixture() {
         tmp_directory.create().get();
-        constexpr size_t cache_size = 1024 * 1024 * 1024;
-        const ss::lowres_clock::duration cache_duration = 1000s;
-        cache = ss::make_shared<cloud_storage::cache>(
-          tmp_directory.get_path(), cache_size, cache_duration);
-        cache->start().get();
+        cache
+          .start(
+            tmp_directory.get_path(),
+            config::mock_binding<uint64_t>(1024 * 1024 * 1024))
+          .get();
+
+        cache.invoke_on_all([](cloud_storage::cache& c) { return c.start(); })
+          .get();
+
+        auto conf = get_configuration();
+        pool
+          .start(
+            10, ss::sharded_parameter([this] { return get_configuration(); }))
+          .get();
+        api
+          .start(
+            std::ref(pool),
+            ss::sharded_parameter([this] { return get_configuration(); }),
+            ss::sharded_parameter([] { return config_file; }))
+          .get();
+        api
+          .invoke_on_all([](cloud_storage::remote& api) { return api.start(); })
+          .get();
     }
 
     ~cloud_storage_fixture() {
-        cache->stop().get();
+        if (!pool.local().shutdown_initiated()) {
+            pool.local().shutdown_connections();
+        }
+        api.stop().get();
+        pool.stop().get();
+        cache.stop().get();
         tmp_directory.remove().get();
     }
 
@@ -46,5 +76,7 @@ struct cloud_storage_fixture : s3_imposter_fixture {
     cloud_storage_fixture operator=(cloud_storage_fixture&&) = delete;
 
     ss::tmp_dir tmp_directory;
-    ss::shared_ptr<cloud_storage::cache> cache;
+    ss::sharded<cloud_storage::cache> cache;
+    ss::sharded<cloud_storage_clients::client_pool> pool;
+    ss::sharded<remote> api;
 };

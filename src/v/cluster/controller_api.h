@@ -9,18 +9,20 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "cluster/controller_backend.h"
 #include "cluster/fwd.h"
-#include "cluster/shard_table.h"
 #include "cluster/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timeout_clock.h"
 #include "outcome.h"
-#include "rpc/connection_cache.h"
+#include "rpc/fwd.h"
 #include "seastarx.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/sharded.hh>
+
+#include <absl/container/node_hash_map.h>
 
 #include <system_error>
 
@@ -36,6 +38,8 @@ public:
       ss::sharded<topic_table>&,
       ss::sharded<shard_table>&,
       ss::sharded<rpc::connection_cache>&,
+      ss::sharded<health_monitor_frontend>&,
+      ss::sharded<members_table>&,
       ss::sharded<ss::abort_source>&);
 
     ss::future<result<std::vector<ntp_reconciliation_state>>>
@@ -45,6 +49,8 @@ public:
       get_reconciliation_state(std::vector<model::ntp>);
 
     ss::future<ntp_reconciliation_state> get_reconciliation_state(model::ntp);
+
+    ss::future<result<bool>> all_reconciliations_done(std::vector<model::ntp>);
 
     /**
      * API to access both remote and local state
@@ -62,12 +68,23 @@ public:
     ss::future<std::error_code> wait_for_topic(
       model::topic_namespace_view, model::timeout_clock::time_point);
 
+    ss::future<result<std::vector<partition_reconfiguration_state>>>
+      get_partitions_reconfiguration_state(
+        std::vector<model::ntp>, model::timeout_clock::time_point);
+
+    ss::future<result<node_decommission_progress>>
+      get_node_decommission_progress(
+        model::node_id, model::timeout_clock::time_point);
+
+    std::optional<ss::shard_id> shard_for(const raft::group_id& group) const;
+    std::optional<ss::shard_id> shard_for(const model::ntp& ntp) const;
+
 private:
     ss::future<result<bool>> are_ntps_ready(
       absl::node_hash_map<model::node_id, std::vector<model::ntp>>,
       model::timeout_clock::time_point);
 
-    ss::future<std::vector<topic_table_delta>>
+    ss::future<std::vector<controller_backend::delta_metadata>>
       get_remote_core_deltas(model::ntp, ss::shard_id);
 
     model::node_id _self;
@@ -75,6 +92,8 @@ private:
     ss::sharded<topic_table>& _topics;
     ss::sharded<shard_table>& _shard_table;
     ss::sharded<rpc::connection_cache>& _connections;
+    ss::sharded<health_monitor_frontend>& _health_monitor;
+    ss::sharded<members_table>& _members;
     ss::sharded<ss::abort_source>& _as;
 };
 } // namespace cluster

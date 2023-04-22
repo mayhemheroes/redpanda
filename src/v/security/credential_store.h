@@ -11,7 +11,7 @@
 #pragma once
 #include "bytes/bytes.h"
 #include "security/scram_credential.h"
-#include "utils/concepts-enabled.h"
+#include "security/types.h"
 
 #include <absl/container/node_hash_map.h>
 
@@ -25,8 +25,6 @@ namespace security {
  * process that often spans multiple network round trips and should remain
  * consistent for the duration of that process.
  */
-using credential_user = named_type<ss::sstring, struct credential_user_type>;
-
 class credential_store {
 public:
     // when a second type is supported update `credential_store_test` to include
@@ -67,6 +65,8 @@ public:
 
     const_iterator begin() const { return _credentials.cbegin(); }
     const_iterator end() const { return _credentials.cend(); }
+
+    void clear() { _credentials.clear(); }
 
 private:
     container_type _credentials;

@@ -29,7 +29,39 @@
 #include <bits/stdint-intn.h>
 #include <boost/test/tools/old/interface.hpp>
 
+#include <vector>
+
 using namespace std::chrono_literals;
+
+namespace {
+
+// Fake command type used to test serde-only types.
+static constexpr int8_t fake_serde_only_cmd_type = 0;
+struct fake_serde_only_key
+  : serde::envelope<
+      fake_serde_only_key,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
+
+    ss::sstring str;
+};
+struct fake_serde_only_val
+  : serde::envelope<
+      fake_serde_only_val,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
+
+    ss::sstring str;
+};
+using fake_serde_only_cmd = cluster::controller_command<
+  fake_serde_only_key,
+  fake_serde_only_val,
+  fake_serde_only_cmd_type,
+  model::record_batch_type::ghost_batch>;
+
+} // anonymous namespace
 
 struct cmd_test_fixture {
     cluster::topic_configuration_assignment make_tp_configuration(
@@ -73,12 +105,31 @@ struct cmd_test_fixture {
         std::vector<cluster::partition_assignment> ret;
         ret.reserve(cfg.partition_count);
         for (int i = 0; i < cfg.partition_count; i++) {
-            ret.push_back(cluster::partition_assignment{
-              raft::group_id(0), model::partition_id(i), {}});
+            ret.emplace_back(
+              raft::group_id(0),
+              model::partition_id(i),
+              std::vector<model::broker_shard>{});
         }
         return {};
     }
 };
+
+FIXTURE_TEST(test_serde_only_cmd, cmd_test_fixture) {
+    fake_serde_only_key k;
+    fake_serde_only_val v;
+    k.str = "foo";
+    v.str = "bar";
+    fake_serde_only_cmd cmd(std::move(k), std::move(v));
+    auto batch = cluster::serde_serialize_cmd(cmd);
+    auto deser = cluster::deserialize(
+                   std::move(batch),
+                   cluster::make_commands_list<fake_serde_only_cmd>())
+                   .get0();
+    ss::visit(deser, [&cmd](fake_serde_only_cmd c) {
+        BOOST_REQUIRE_EQUAL(c.key.str, cmd.key.str);
+        BOOST_REQUIRE_EQUAL(c.value.str, cmd.value.str);
+    });
+}
 
 FIXTURE_TEST(test_create_topic_cmd_serialization, cmd_test_fixture) {
     auto cmd = make_create_topic_cmd("test_tp", 2, 3);

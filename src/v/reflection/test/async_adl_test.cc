@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "bytes/hash.h"
 #include "bytes/iobuf.h"
 #include "bytes/iobuf_parser.h"
 #include "model/adl_serde.h"
@@ -96,7 +97,6 @@ bool ser_deser_verify(T type) {
     // Serialize
     iobuf out;
     reflection::async_adl<T>{}.to(out, type).get();
-    const auto originals_hash = std::hash<iobuf>{}(out);
 
     // Deserialize
     iobuf_parser in(std::move(out));

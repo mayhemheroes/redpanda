@@ -19,30 +19,24 @@
 
 namespace kafka {
 
-class offset_for_leader_epoch_api final {
-public:
-    static constexpr const char* name = "offset_for_leader_epoch";
-    static constexpr api_key key = api_key(23);
-};
-
 struct offset_for_leader_epoch_request final {
     using api_type = offset_for_leader_epoch_api;
 
     offset_for_leader_epoch_request_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const offset_for_leader_epoch_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const offset_for_leader_epoch_request& r) {
+        return os << r.data;
+    }
+};
 
 struct offset_for_leader_epoch_response final {
     using api_type = offset_for_leader_epoch_api;
@@ -76,18 +70,18 @@ struct offset_for_leader_epoch_response final {
           p_id, ec, model::offset(-1), invalid_leader_epoch);
     }
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const offset_for_leader_epoch_response& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const offset_for_leader_epoch_response& r) {
+        return os << r.data;
+    }
+};
 
 } // namespace kafka

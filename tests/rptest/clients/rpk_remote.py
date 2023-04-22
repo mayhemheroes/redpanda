@@ -32,11 +32,13 @@ class RpkRemoteTool:
 
         return self._run_config(cmd, path=path, timeout=timeout)
 
-    def debug_bundle(self, working_dir):
+    def debug_bundle(self, output_file):
         # Run the bundle command.  It outputs into pwd, so switch to working dir first
-        return self._execute(
-            ["cd", working_dir, ";",
-             self._rpk_binary(), "debug", "bundle"])
+        return self._execute([
+            self._rpk_binary(), 'debug', 'bundle', "--output", output_file,
+            "--api-urls",
+            self._redpanda.admin_endpoints()
+        ])
 
     def cluster_config_force_reset(self, property_name):
         return self._execute([
@@ -47,6 +49,19 @@ class RpkRemoteTool:
     def cluster_config_lint(self):
         return self._execute([self._rpk_binary(), 'cluster', 'config', 'lint'])
 
+    def tune(self, tuner):
+        return self._execute([self._rpk_binary(), 'redpanda', 'tune', tuner])
+
+    def mode_set(self, mode):
+        return self._execute([self._rpk_binary(), 'redpanda', 'mode', mode])
+
+    def redpanda_start(self, log_file, additional_args="", env_vars=""):
+        return self._execute([
+            env_vars,
+            self._rpk_binary(), "redpanda", "start", "-v", additional_args,
+            ">>", log_file, "2>&1", "&"
+        ])
+
     def _run_config(self, cmd, path=None, timeout=30):
         cmd = [self._rpk_binary(), 'redpanda', 'config'] + cmd
 
@@ -56,6 +71,8 @@ class RpkRemoteTool:
         return self._execute(cmd, timeout=timeout)
 
     def _execute(self, cmd, timeout=30):
+        self._redpanda.logger.debug("Executing command: %s", cmd)
+
         return self._node.account.ssh_output(
             ' '.join(cmd),
             timeout_sec=timeout,
@@ -63,3 +80,28 @@ class RpkRemoteTool:
 
     def _rpk_binary(self):
         return self._redpanda.find_binary('rpk')
+
+    def read_timestamps(self, topic: str, partition: int, count: int,
+                        timeout_sec: int):
+        """
+        Read all the timestamps of messages in a partition, as milliseconds
+        since epoch.
+
+        :return: generator of 2-tuples like (offset:int, timestamp:int)
+        """
+        cmd = [
+            self._rpk_binary(), "--brokers",
+            self._redpanda.brokers(), "topic", "consume", topic, "-f",
+            "\"%o %d\\n\"", "--num",
+            str(count), "-p",
+            str(partition)
+        ]
+        for line in self._node.account.ssh_capture(' '.join(cmd),
+                                                   timeout_sec=timeout_sec):
+            try:
+                offset, ts = line.split()
+            except:
+                self._redpanda.logger.error(f"Bad line: '{line}'")
+                raise
+
+            yield (int(offset), int(ts))

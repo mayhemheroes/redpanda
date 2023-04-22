@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/os"
-	log "github.com/sirupsen/logrus"
+	"go.uber.org/zap"
 )
 
 const (
@@ -90,8 +90,10 @@ func (hwLocCmd *hwLocCmd) GetPhysIntersection(
 func (hwLocCmd *hwLocCmd) getNumberOf(
 	mask string, resource string,
 ) (uint, error) {
-	output, err := hwLocCmd.runCalc("--number-of", resource, "machine:0",
-		"--restrict", mask)
+	output, err := hwLocCmd.runCalc("--restrict", mask, "--number-of", resource, "machine:0")
+	if err != nil {
+		return 0, err
+	}
 	count, err := strconv.Atoi(output)
 	return uint(count), err
 }
@@ -107,15 +109,15 @@ func (*hwLocCmd) CheckIfMaskIsEmpty(mask string) bool {
 }
 
 func (*hwLocCmd) IsSupported() bool {
-	log.Debugf("Checking if '%s' & '%s' are present...", CalcBin, DistribBin)
+	zap.L().Sugar().Debugf("Checking if '%s' & '%s' are present...", CalcBin, DistribBin)
 	_, calcErr := exec.LookPath(CalcBin)
 	_, distribErr := exec.LookPath(DistribBin)
 	if calcErr != nil {
-		log.Debugf("Unable to find '%s'", CalcBin)
+		zap.L().Sugar().Debugf("Unable to find '%s'", CalcBin)
 		return false
 	}
 	if distribErr != nil {
-		log.Debugf("Unable to find '%s'", DistribBin)
+		zap.L().Sugar().Debugf("Unable to find '%s'", DistribBin)
 		return false
 	}
 	return true

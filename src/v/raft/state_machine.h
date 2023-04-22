@@ -69,7 +69,11 @@ public:
     virtual ss::future<> stop();
 
     // wait until at least offset is applied to state machine
-    ss::future<> wait(model::offset, model::timeout_clock::time_point);
+    ss::future<> wait(
+      model::offset,
+      model::timeout_clock::time_point,
+      std::optional<std::reference_wrapper<ss::abort_source>> as
+      = std::nullopt);
 
     /**
      * This must be implemented by the state machine. The state machine should
@@ -100,11 +104,15 @@ public:
      * details see paragraph 6.4 of Raft protocol dissertation.
      */
     ss::future<result<model::offset>>
-      instert_linerizable_barrier(model::timeout_clock::time_point);
+      insert_linearizable_barrier(model::timeout_clock::time_point);
 
 protected:
     void set_next(model::offset offset);
     virtual ss::future<> handle_eviction();
+
+    model::offset last_applied_offset() const {
+        return model::prev_offset(_next);
+    }
 
     consensus* _raft;
     ss::gate _gate;
@@ -114,11 +122,10 @@ private:
     public:
         explicit batch_applicator(state_machine*);
         ss::future<ss::stop_iteration> operator()(model::record_batch);
-        model::offset end_of_stream() const { return _last_applied; }
+        void end_of_stream() const {}
 
     private:
         state_machine* _machine;
-        model::offset _last_applied;
     };
 
     friend batch_applicator;

@@ -200,16 +200,9 @@ public:
     using milliseconds_uint16_t
       = std::chrono::duration<uint16_t, std::chrono::milliseconds::period>;
 
-    /// Create a head of the chain without backoff
-    retry_chain_node();
-    /// Creates a head with the provided deadline and
-    /// backoff granularity.
-    retry_chain_node(
-      ss::lowres_clock::time_point deadline,
-      ss::lowres_clock::duration initial_backoff);
-    retry_chain_node(
-      ss::lowres_clock::duration timeout,
-      ss::lowres_clock::duration initial_backoff);
+    // No default constructor: we always need an abort source.
+    retry_chain_node() = delete;
+
     /// Create a head of the chain without backoff but with abort_source
     explicit retry_chain_node(ss::abort_source& as);
     /// Creates a head with the provided abort_source, deadline, and
@@ -258,15 +251,26 @@ public:
     /// Generate formattend log prefix and add custom string into it:
     /// Example: [fiber42~3~1|2|100ms ns/topic/42]
     template<typename... Args>
-    ss::sstring operator()(const char* format_str, Args&&... args) const {
+    ss::sstring
+    operator()(fmt::format_string<Args...> format_str, Args&&... args) const {
         fmt::memory_buffer mbuf;
-        mbuf.push_back('[');
-        format(mbuf);
-        mbuf.push_back(' ');
-        fmt::format_to(mbuf, format_str, std::forward<Args>(args)...);
-        mbuf.push_back(']');
+        auto bii = std::back_insert_iterator(mbuf);
+        bii = '[';
+        format(bii);
+        bii = ' ';
+        fmt::format_to(bii, format_str, std::forward<Args>(args)...);
+        bii = ']';
         return ss::sstring(mbuf.data(), mbuf.size());
     }
+
+    /// Find abort source in the root of the tree
+    /// Always traverses the tree back to the root and returns the abort
+    /// source if it was set in the root c-tor.
+    ss::abort_source& root_abort_source();
+
+    /// Return true if both retry chains share the same
+    /// root.
+    bool same_root(const retry_chain_node& other) const;
 
     /// \brief Request retry
     ///
@@ -304,13 +308,16 @@ public:
     ss::lowres_clock::time_point get_deadline() const;
 
 private:
-    void format(fmt::memory_buffer& str) const;
+    void format(std::back_insert_iterator<fmt::memory_buffer>& bii) const;
 
     uint16_t add_child();
 
     void rem_child();
 
     uint16_t get_len() const;
+
+    /// Return root node of the retry chain
+    const retry_chain_node* get_root() const;
 
     /// Fetch parent of the node
     /// Method returns nullptr if root
@@ -321,11 +328,6 @@ private:
     /// Method returns nullptr if not root
     ss::abort_source* get_abort_source();
     const ss::abort_source* get_abort_source() const;
-
-    /// Find abort source in the root of the tree
-    /// Always traverses the tree back to the root and returns the abort
-    /// source if it was set in the root c-tor.
-    ss::abort_source* find_abort_source();
 
     /// This node's id
     uint16_t _id;
@@ -340,7 +342,7 @@ private:
     /// Deadline for retry attempts
     ss::lowres_clock::time_point _deadline;
     /// optional parent node or (if root) abort source for all fibers
-    std::variant<std::monostate, retry_chain_node*, ss::abort_source*> _parent;
+    std::variant<retry_chain_node*, ss::abort_source*> _parent;
 };
 
 /// Logger that adds context from retry_chain_node to the output
@@ -358,7 +360,9 @@ public:
       , _node(node)
       , _ctx(std::move(context)) {}
     template<typename... Args>
-    void log(ss::log_level lvl, const char* format, Args&&... args) const {
+    void
+    log(ss::log_level lvl, fmt::format_string<Args...> format, Args&&... args)
+      const {
         if (_log.is_enabled(lvl)) {
             auto lambda = [&](ss::logger& logger, ss::log_level lvl) {
                 auto msg = ssx::sformat(format, std::forward<Args>(args)...);
@@ -376,23 +380,23 @@ public:
         }
     }
     template<typename... Args>
-    void error(const char* format, Args&&... args) const {
+    void error(fmt::format_string<Args...> format, Args&&... args) const {
         log(ss::log_level::error, format, std::forward<Args>(args)...);
     }
     template<typename... Args>
-    void warn(const char* format, Args&&... args) const {
+    void warn(fmt::format_string<Args...> format, Args&&... args) const {
         log(ss::log_level::warn, format, std::forward<Args>(args)...);
     }
     template<typename... Args>
-    void info(const char* format, Args&&... args) const {
+    void info(fmt::format_string<Args...> format, Args&&... args) const {
         log(ss::log_level::info, format, std::forward<Args>(args)...);
     }
     template<typename... Args>
-    void debug(const char* format, Args&&... args) const {
+    void debug(fmt::format_string<Args...> format, Args&&... args) const {
         log(ss::log_level::debug, format, std::forward<Args>(args)...);
     }
     template<typename... Args>
-    void trace(const char* format, Args&&... args) const {
+    void trace(fmt::format_string<Args...> format, Args&&... args) const {
         log(ss::log_level::trace, format, std::forward<Args>(args)...);
     }
 

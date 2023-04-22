@@ -56,21 +56,38 @@ public:
       , _gated_mutex{} {}
 
     template<typename T, typename Ret = typename T::api_type::response_type>
-    CONCEPT(requires(KafkaApi<typename T::api_type>))
-    ss::future<Ret> dispatch(T r) {
+    requires(KafkaApi<typename T::api_type>) ss::future<Ret> dispatch(T r) {
         using api_t = typename T::api_type;
         return _gated_mutex
           .with([this, r{std::move(r)}]() mutable {
-              vlog(kclog.debug, "Dispatch: {} req: {}", api_t::name, r);
-              return _client.dispatch(std::move(r)).then([](Ret res) {
-                  vlog(kclog.debug, "Dispatch: {} res: {}", api_t::name, res);
-                  return std::move(res);
+              vlog(
+                kclog.debug,
+                "Dispatch to node {}: {} req: {}",
+                _node_id,
+                api_t::name,
+                r);
+              return _client.dispatch(std::move(r)).then([this](Ret res) {
+                  vlog(
+                    kclog.debug,
+                    "Dispatch from node {}: {} res: {}",
+                    _node_id,
+                    api_t::name,
+                    res);
+                  return res;
               });
           })
-          .handle_exception_type([this](const std::bad_optional_access&) {
-              // Short read
-              return ss::make_exception_future<Ret>(
-                broker_error(_node_id, error_code::broker_not_available));
+          .handle_exception_type(
+            [this](const kafka_request_disconnected_exception&) {
+                // Short read
+                return ss::make_exception_future<Ret>(
+                  broker_error(_node_id, error_code::broker_not_available));
+            })
+          .handle_exception_type([this](const std::system_error& e) {
+              if (net::is_reconnect_error(e)) {
+                  return ss::make_exception_future<Ret>(
+                    broker_error(_node_id, error_code::broker_not_available));
+              }
+              return ss::make_exception_future<Ret>(e);
           })
           .finally([b = shared_from_this()]() {});
     }

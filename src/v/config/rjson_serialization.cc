@@ -40,9 +40,8 @@ void rjson_serialize(
     w.EndObject();
 }
 
-void rjson_serialize(
+void rjson_serialize_impl(
   json::Writer<json::StringBuffer>& w, const config::tls_config& v) {
-    w.StartObject();
     w.Key("enabled");
     w.Bool(v.is_enabled());
 
@@ -61,7 +60,12 @@ void rjson_serialize(
         w.Key("truststore_file");
         w.String((*(v.get_truststore_file())).c_str());
     }
+}
 
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, const config::tls_config& v) {
+    w.StartObject();
+    rjson_serialize_impl(w, v);
     w.EndObject();
 }
 
@@ -94,24 +98,7 @@ void rjson_serialize(
 
     w.Key("name");
     w.String(v.name.c_str());
-    w.Key("enabled");
-    w.Bool(v.config.is_enabled());
-
-    w.Key("require_client_auth");
-    w.Bool(v.config.get_require_client_auth());
-
-    if (v.config.get_key_cert_files()) {
-        w.Key("key_file");
-        w.String(v.config.get_key_cert_files()->key_file.c_str());
-
-        w.Key("cert_file");
-        w.String(v.config.get_key_cert_files()->cert_file.c_str());
-    }
-
-    if (v.config.get_truststore_file()) {
-        w.Key("truststore_file");
-        w.String((*(v.config.get_truststore_file())).c_str());
-    }
+    rjson_serialize_impl(w, v.config);
 
     w.EndObject();
 }
@@ -153,7 +140,23 @@ void rjson_serialize(
 
 void rjson_serialize(
   json::Writer<json::StringBuffer>& w,
-  const model::violation_recovery_policy& v) {
+  const model::cloud_credentials_source& v) {
+    stringize(w, v);
+}
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w,
+  const model::partition_autobalancing_mode& v) {
+    stringize(w, v);
+}
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, const model::cloud_storage_backend& v) {
+    stringize(w, v);
+}
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, const model::leader_balancer_mode& v) {
     stringize(w, v);
 }
 

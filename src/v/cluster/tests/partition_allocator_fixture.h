@@ -11,56 +11,75 @@
 
 #pragma once
 
+#include "cluster/commands.h"
 #include "cluster/members_table.h"
 #include "cluster/scheduling/allocation_node.h"
 #include "cluster/scheduling/allocation_strategy.h"
 #include "cluster/scheduling/partition_allocator.h"
 #include "config/configuration.h"
 #include "model/fundamental.h"
+#include "model/metadata.h"
+#include "net/unresolved_address.h"
 #include "random/fast_prng.h"
 #include "random/generators.h"
 #include "units.h"
 
 struct partition_allocator_fixture {
+    static constexpr uint32_t partitions_per_shard = 1000;
+    static constexpr uint32_t partitions_reserve_shard0 = 2;
+
     partition_allocator_fixture()
       : allocator(
         std::ref(members),
         config::mock_binding<std::optional<size_t>>(std::nullopt),
         config::mock_binding<std::optional<int32_t>>(std::nullopt),
-        config::mock_binding<size_t>(32_MiB),
+        config::mock_binding<uint32_t>(uint32_t{partitions_per_shard}),
+        config::mock_binding<uint32_t>(uint32_t{partitions_reserve_shard0}),
         config::mock_binding<bool>(true)) {
         members.start().get0();
         ss::smp::invoke_on_all([] {
             config::shard_local_cfg()
-              .get("enable_auto_rebalance_on_node_add")
-              .set_value(true);
+              .get("partition_autobalancing_mode")
+              .set_value(model::partition_autobalancing_mode::node_add);
         }).get0();
     }
 
     ~partition_allocator_fixture() { members.stop().get0(); }
 
-    void register_node(int id, int core_count) {
-        allocator.register_node(std::make_unique<cluster::allocation_node>(
+    void register_node(
+      int id,
+      uint32_t core_count,
+      std::optional<model::rack_id> rack = std::nullopt) {
+        model::broker broker(
           model::node_id(id),
-          core_count,
-          absl::node_hash_map<ss::sstring, ss::sstring>{},
-          std::nullopt));
-    }
+          net::unresolved_address("localhost", 9092 + id),
+          net::unresolved_address("localhost", 33145 + id),
+          std::move(rack),
+          model::broker_properties{
+            .cores = core_count,
+            .available_memory_gb = 5 * core_count,
+            .available_disk_gb = 10 * core_count});
 
-    void register_node(int id, int core_count, model::rack_id rack) {
+        members.local().apply(
+          model::offset(0), cluster::add_node_cmd(0, broker));
+
         allocator.register_node(std::make_unique<cluster::allocation_node>(
-          model::node_id(id),
-          core_count,
-          absl::node_hash_map<ss::sstring, ss::sstring>{},
-          std::move(rack)));
+          broker.id(),
+          broker.properties().cores,
+          config::mock_binding<uint32_t>(uint32_t{partitions_per_shard}),
+          config::mock_binding<uint32_t>(uint32_t{partitions_reserve_shard0})));
     }
 
     void saturate_all_machines() {
-        auto units = allocator.allocate(
-          make_allocation_request(max_capacity(), 1));
+        auto units = allocator
+                       .allocate(make_allocation_request(max_capacity(), 1))
+                       .get();
 
-        for (auto& pas : units.value().get_assignments()) {
-            allocator.state().apply_update(pas.replicas, pas.group);
+        for (auto& pas : units.value()->get_assignments()) {
+            allocator.state().apply_update(
+              pas.replicas,
+              pas.group,
+              cluster::partition_allocation_domains::common);
         }
     }
 
@@ -94,7 +113,8 @@ struct partition_allocator_fixture {
 
     cluster::allocation_request
     make_allocation_request(int partitions, uint16_t replication_factor) {
-        cluster::allocation_request req;
+        cluster::allocation_request req(
+          cluster::partition_allocation_domains::common);
         req.partitions.reserve(partitions);
         for (int i = 0; i < partitions; ++i) {
             req.partitions.emplace_back(

@@ -12,13 +12,13 @@
 #pragma once
 #include "cluster/fwd.h"
 #include "cluster/health_monitor_types.h"
-#include "cluster/members_table.h"
 #include "cluster/node/local_monitor.h"
-#include "cluster/partition_manager.h"
+#include "features/feature_table.h"
 #include "model/metadata.h"
 #include "raft/consensus.h"
+#include "rpc/fwd.h"
+#include "ssx/semaphore.h"
 
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
 
@@ -53,19 +53,19 @@ public:
       ss::sharded<partition_manager>&,
       ss::sharded<raft::group_manager>&,
       ss::sharded<ss::abort_source>&,
-      ss::sharded<storage::node_api>&,
+      ss::sharded<node::local_monitor>&,
       ss::sharded<drain_manager>&,
-      ss::sharded<feature_table>&,
-      config::binding<size_t> storage_min_bytes_threshold,
-      config::binding<unsigned> storage_min_percent_threshold);
+      ss::sharded<features::feature_table>&,
+      ss::sharded<partition_leaders_table>&,
+      ss::sharded<topic_table>&);
 
     ss::future<> stop();
 
     ss::future<result<cluster_health_report>> get_cluster_health(
       cluster_report_filter, force_refresh, model::timeout_clock::time_point);
 
-    cluster_health_report
-    get_current_cluster_health_snapshot(const cluster_report_filter&);
+    ss::future<storage::disk_space_alert> get_cluster_disk_health(
+      force_refresh refresh, model::timeout_clock::time_point deadline);
 
     ss::future<result<node_health_report>>
       collect_current_node_health(node_report_filter);
@@ -76,6 +76,13 @@ public:
     ss::future<result<std::optional<cluster::drain_manager::drain_status>>>
       get_node_drain_status(model::node_id, model::timeout_clock::time_point);
 
+    ss::future<cluster_health_overview>
+      get_cluster_health_overview(model::timeout_clock::time_point);
+
+    bool does_raft0_have_leader();
+
+    ss::future<> maybe_refresh_cloud_health_stats();
+
 private:
     /**
      * Struct used to track pending refresh request, it gives ability
@@ -83,7 +90,7 @@ private:
     struct abortable_refresh_request
       : ss::enable_lw_shared_from_this<abortable_refresh_request> {
         abortable_refresh_request(
-          model::node_id, ss::gate::holder, ss::semaphore_units<>);
+          model::node_id, ss::gate::holder, ssx::semaphore_units);
 
         ss::future<std::error_code>
           abortable_await(ss::future<std::error_code>);
@@ -92,7 +99,7 @@ private:
         bool finished = false;
         model::node_id leader_id;
         ss::gate::holder holder;
-        ss::semaphore_units<> units;
+        ssx::semaphore_units units;
         ss::promise<std::error_code> done;
     };
 
@@ -110,8 +117,7 @@ private:
       = absl::node_hash_map<model::node_id, reply_status>;
 
     void tick();
-    ss::future<> tick_cluster_health();
-    ss::future<> collect_cluster_health();
+    ss::future<std::error_code> collect_cluster_health();
     ss::future<result<node_health_report>>
       collect_remote_node_health(model::node_id);
     ss::future<std::error_code> maybe_refresh_cluster_health(
@@ -133,7 +139,6 @@ private:
     result<node_health_report>
       process_node_reply(model::node_id, result<get_node_health_reply>);
 
-    std::chrono::milliseconds tick_interval();
     std::chrono::milliseconds max_metadata_age();
     void abort_current_refresh();
 
@@ -147,7 +152,9 @@ private:
     ss::sharded<raft::group_manager>& _raft_manager;
     ss::sharded<ss::abort_source>& _as;
     ss::sharded<drain_manager>& _drain_manager;
-    ss::sharded<feature_table>& _feature_table;
+    ss::sharded<features::feature_table>& _feature_table;
+    ss::sharded<partition_leaders_table>& _partition_leaders_table;
+    ss::sharded<topic_table>& _topic_table;
 
     ss::lowres_clock::time_point _last_refresh;
     ss::lw_shared_ptr<abortable_refresh_request> _refresh_request;
@@ -155,12 +162,14 @@ private:
 
     status_cache_t _status;
     report_cache_t _reports;
+    storage::disk_space_alert _reports_disk_health
+      = storage::disk_space_alert::ok;
     last_reply_cache_t _last_replies;
+    std::optional<size_t> _bytes_in_cloud_storage;
 
-    ss::timer<ss::lowres_clock> _tick_timer;
     ss::gate _gate;
     mutex _refresh_mutex;
-    node::local_monitor _local_monitor;
+    ss::sharded<node::local_monitor>& _local_monitor;
 
     std::vector<std::pair<cluster::notification_id_type, health_node_cb_t>>
       _node_callbacks;

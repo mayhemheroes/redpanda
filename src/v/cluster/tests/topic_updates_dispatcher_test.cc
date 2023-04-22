@@ -21,7 +21,7 @@ using namespace std::chrono_literals;
 
 struct topic_table_updates_dispatcher_fixture : topic_table_fixture {
     topic_table_updates_dispatcher_fixture()
-      : dispatcher(allocator, table, leaders) {}
+      : dispatcher(allocator, table, leaders, pb_state) {}
 
     void create_topics() {
         auto cmd_1 = make_create_topic_cmd("test_tp_1", 1, 3);
@@ -56,8 +56,8 @@ struct topic_table_updates_dispatcher_fixture : topic_table_fixture {
 };
 
 constexpr uint64_t node_initial_capacity(uint32_t cores) {
-    return (cluster::allocation_node::max_allocations_per_core * cores)
-           - cluster::allocation_node::core0_extra_weight;
+    return (topic_table_fixture::partitions_per_shard * cores)
+           - topic_table_fixture::partitions_reserve_shard0;
 }
 
 uint64_t
@@ -84,20 +84,17 @@ FIXTURE_TEST(
     auto md = table.local().all_topics_metadata();
 
     BOOST_REQUIRE_EQUAL(md.size(), 3);
-    std::sort(
-      md.begin(),
-      md.end(),
-      [](const model::topic_metadata& a, const model::topic_metadata& b) {
-          return a.tp_ns.tp < b.tp_ns.tp;
-      });
-    BOOST_REQUIRE_EQUAL(md[0].tp_ns, make_tp_ns("test_tp_1"));
-    BOOST_REQUIRE_EQUAL(md[1].tp_ns, make_tp_ns("test_tp_2"));
-    BOOST_REQUIRE_EQUAL(md[2].tp_ns, make_tp_ns("test_tp_3"));
 
-    BOOST_REQUIRE_EQUAL(md[0].partitions.size(), 1);
-    BOOST_REQUIRE_EQUAL(md[1].partitions.size(), 12);
-    BOOST_REQUIRE_EQUAL(md[2].partitions.size(), 8);
+    BOOST_REQUIRE_EQUAL(md.contains(make_tp_ns("test_tp_1")), true);
+    BOOST_REQUIRE_EQUAL(md.contains(make_tp_ns("test_tp_2")), true);
+    BOOST_REQUIRE_EQUAL(md.contains(make_tp_ns("test_tp_3")), true);
 
+    BOOST_REQUIRE_EQUAL(
+      md.find(make_tp_ns("test_tp_1"))->second.get_assignments().size(), 1);
+    BOOST_REQUIRE_EQUAL(
+      md.find(make_tp_ns("test_tp_2"))->second.get_assignments().size(), 12);
+    BOOST_REQUIRE_EQUAL(
+      md.find(make_tp_ns("test_tp_3"))->second.get_assignments().size(), 8);
     // Initial capacity
     // (cpus * max_allocations_per_core) - core0_extra_weight;
     // node 1, 8 cores
@@ -118,23 +115,25 @@ FIXTURE_TEST(
 FIXTURE_TEST(
   test_dispatching_happy_path_delete, topic_table_updates_dispatcher_fixture) {
     create_topics();
-    auto res_1 = dispatcher
-                   .apply_update(serialize_cmd(cluster::delete_topic_cmd(
-                                                 make_tp_ns("test_tp_2"),
-                                                 make_tp_ns("test_tp_2")))
-                                   .get0())
-                   .get0();
-    auto res_2 = dispatcher
-                   .apply_update(serialize_cmd(cluster::delete_topic_cmd(
-                                                 make_tp_ns("test_tp_3"),
-                                                 make_tp_ns("test_tp_3")))
-                                   .get0())
-                   .get0();
+    dispatcher
+      .apply_update(
+        serialize_cmd(cluster::delete_topic_cmd(
+                        make_tp_ns("test_tp_2"), make_tp_ns("test_tp_2")))
+          .get0())
+      .get0();
+    dispatcher
+      .apply_update(
+        serialize_cmd(cluster::delete_topic_cmd(
+                        make_tp_ns("test_tp_3"), make_tp_ns("test_tp_3")))
+          .get0())
+      .get0();
 
     auto md = table.local().all_topics_metadata();
     BOOST_REQUIRE_EQUAL(md.size(), 1);
-    BOOST_REQUIRE_EQUAL(md[0].tp_ns, make_tp_ns("test_tp_1"));
-    BOOST_REQUIRE_EQUAL(md[0].partitions.size(), 1);
+
+    BOOST_REQUIRE_EQUAL(md.contains(make_tp_ns("test_tp_1")), true);
+    BOOST_REQUIRE_EQUAL(
+      md.find(make_tp_ns("test_tp_1"))->second.get_assignments().size(), 1);
 
     BOOST_REQUIRE_EQUAL(
       current_cluster_capacity(allocator.local().state().allocation_nodes()),

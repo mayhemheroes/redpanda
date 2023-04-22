@@ -6,7 +6,7 @@ v_cc_library(
     transport.cc
     reconnect_transport.cc
     connection_cache.cc
-    simple_protocol.cc
+    rpc_server.cc
   DEPS
     Seastar::seastar
     v::bytes
@@ -18,4 +18,3 @@ v_cc_library(
     v::net
   )
 add_subdirectory(test)
-add_subdirectory(demo)

@@ -61,20 +61,6 @@ Iterator find_machine(Iterator begin, Iterator end, model::node_id id) {
       begin, end, [id](decltype(*begin) b) { return b.id() == id; });
 }
 
-inline constexpr model::offset next_offset(model::offset o) {
-    if (o < model::offset{0}) {
-        return model::offset{0};
-    }
-    return o + model::offset{1};
-}
-
-inline constexpr model::offset prev_offset(model::offset o) {
-    if (o <= model::offset{0}) {
-        return model::offset{};
-    }
-    return o - model::offset{1};
-}
-
 class term_assigning_reader : public model::record_batch_reader::impl {
 public:
     using data_t = model::record_batch_reader::data_t;
@@ -118,12 +104,10 @@ private:
 
 // clang-format off
 template<typename Func>
-CONCEPT(
     requires requires(Func f, model::record_batch b){
         { f(std::move(b)) } 
             -> std::same_as<ss::futurize_t<std::invoke_result_t<Func, model::record_batch&&>>>;
     }
-)
 // clang-format on
 // Consumer applying an async action to each element in the reader
 class do_for_each_batch_consumer {
@@ -204,5 +188,6 @@ ss::future<> bootstrap_pre_existing_partition(
   model::offset min_rp_offset,
   model::offset max_rp_offset,
   model::term_id last_included_term,
-  std::vector<model::broker> initial_nodes);
+  std::vector<model::broker> initial_nodes,
+  ss::lw_shared_ptr<storage::offset_translator_state> ot_state);
 } // namespace raft::details

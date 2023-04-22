@@ -12,6 +12,7 @@
 #include "cluster/controller.h"
 #include "cluster/id_allocator_service.h"
 #include "cluster/logger.h"
+#include "cluster/members_table.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/partition_leaders_table.h"
 #include "cluster/partition_manager.h"
@@ -22,6 +23,7 @@
 #include "config/configuration.h"
 #include "model/namespace.h"
 #include "model/record_batch_reader.h"
+#include "rpc/connection_cache.h"
 #include "vformat.h"
 
 #include <seastar/core/coroutine.hh>
@@ -81,7 +83,8 @@ id_allocator_frontend::allocate_id(model::timeout_clock::duration timeout) {
         auto leader_opt = _leaders.local().get_leader(model::id_allocator_ntp);
         if (unlikely(!leader_opt)) {
             error = vformat(
-              "can't find {} in the leaders cache", model::id_allocator_ntp);
+              fmt::runtime("can't find {} in the leaders cache"),
+              model::id_allocator_ntp);
             vlog(
               clusterlog.trace,
               "waiting for {} to fill leaders cache, retries left: {}",
@@ -109,11 +112,11 @@ id_allocator_frontend::allocate_id(model::timeout_clock::duration timeout) {
         }
 
         if (likely(r.ec != errc::replication_error)) {
-            error = vformat("id allocation failed with {}", r.ec);
+            error = vformat(fmt::runtime("id allocation failed with {}"), r.ec);
             break;
         }
 
-        error = vformat("id allocation failed with {}", r.ec);
+        error = vformat(fmt::runtime("id allocation failed with {}"), r.ec);
         vlog(
           clusterlog.trace, "id allocation failed, retries left: {}", retries);
         co_await sleep_abortable(delay_ms, _as);
@@ -146,7 +149,7 @@ id_allocator_frontend::dispatch_allocate_id_to_leader(
               vlog(
                 clusterlog.warn,
                 "got error {} on remote allocate_id",
-                r.error());
+                r.error().message());
               return allocate_id_reply{0, errc::timeout};
           }
           return r.value();
@@ -205,7 +208,7 @@ ss::future<allocate_id_reply> id_allocator_frontend::do_allocate_id(
                     vlog(
                       clusterlog.warn,
                       "allocate id stm call failed with {}",
-                      r.raft_status);
+                      raft::make_error_code(r.raft_status).message());
                     return allocate_id_reply{r.id, errc::replication_error};
                 }
 
@@ -219,7 +222,7 @@ ss::future<bool> id_allocator_frontend::try_create_id_allocator_topic() {
       model::kafka_internal_namespace,
       model::id_allocator_topic,
       1,
-      config::shard_local_cfg().id_allocator_replication()};
+      _controller->internal_topic_replication()};
 
     topic.properties.cleanup_policy_bitflags
       = model::cleanup_policy_bitflags::none;

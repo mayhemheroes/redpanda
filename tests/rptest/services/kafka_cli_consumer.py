@@ -24,7 +24,10 @@ class KafkaCliConsumer(BackgroundThreadService):
                  offset=None,
                  partitions=None,
                  isolation_level=None,
-                 consumer_properties={}):
+                 from_beginning=False,
+                 consumer_properties={},
+                 formatter_properties={},
+                 instance_name=None):
         super(KafkaCliConsumer, self).__init__(context, num_nodes=1)
         self._redpanda = redpanda
         self._topic = topic
@@ -32,8 +35,12 @@ class KafkaCliConsumer(BackgroundThreadService):
         self._offset = offset
         self._partitions = partitions
         self._isolation_level = isolation_level
+        self._from_beginning = from_beginning
         self._consumer_properties = consumer_properties
+        self._formatter_properties = formatter_properties
         self._stopping = threading.Event()
+        self._instance_name = "cli-consumer" if instance_name is None else instance_name
+        self._done = None
         assert self._partitions is not None or self._group is not None, "either partitions or group have to be set"
 
         self._cli = KafkaCliTools(self._redpanda)
@@ -43,6 +50,7 @@ class KafkaCliConsumer(BackgroundThreadService):
         return self._cli._script("kafka-console-consumer.sh")
 
     def _worker(self, _, node):
+        self._done = False
         self._stopping.clear()
         try:
 
@@ -56,19 +64,21 @@ class KafkaCliConsumer(BackgroundThreadService):
                 cmd += ['--partition', ','.join(self._partitions)]
             if self._isolation_level is not None:
                 cmd += ["--isolation-level", str(self._isolation_level)]
+            if self._from_beginning:
+                cmd += ["--from-beginning"]
             for k, v in self._consumer_properties.items():
                 cmd += ['--consumer-property', f"{k}={v}"]
+            for k, v in self._formatter_properties.items():
+                cmd += ['--property', f"{k}={v}"]
 
             cmd += ["--bootstrap-server", self._redpanda.brokers()]
 
             for line in node.account.ssh_capture(' '.join(cmd)):
                 line.strip()
-                self.logger.debug(f"consumed: '{line}'")
+                line = line.replace("\n", "")
+                self.logger.debug(
+                    f"[{self._instance_name}] consumed: '{line}'")
                 self._messages.append(line)
-
-                if self._stopping.is_set():
-                    break
-
         except:
             if self._stopping.is_set():
                 # Expect a non-zero exit code when killing during teardown
@@ -76,13 +86,37 @@ class KafkaCliConsumer(BackgroundThreadService):
             else:
                 raise
         finally:
-            self.done = True
+            self._done = True
 
     def wait_for_messages(self, messages, timeout=30):
         wait_until(lambda: len(self._messages) >= messages,
                    timeout,
                    backoff_sec=2)
 
+    def wait_for_started(self, timeout=10):
+        def all_started():
+            return all([
+                len(node.account.java_pids("ConsoleConsumer")) == 1
+                for node in self.nodes
+            ])
+
+        wait_until(all_started, timeout, backoff_sec=1)
+
     def stop_node(self, node):
         self._stopping.set()
-        node.account.kill_process("java", clean_shutdown=False)
+        node.account.kill_process("java", clean_shutdown=True)
+
+        try:
+            wait_until(lambda: self._done is None or self._done == True,
+                       timeout_sec=10)
+        except:
+            self.logger.warn(
+                f"{self._instance_name} running on {node.name} failed to stop gracefully"
+            )
+            node.account.kill_process("java", clean_shutdown=False)
+            wait_until(
+                lambda: self._done is None or self._done == True,
+                timeout_sec=5,
+                err_msg=
+                f"{self._instance_name} running on {node.name} failed to stop after SIGKILL"
+            )

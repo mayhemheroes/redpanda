@@ -19,6 +19,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const thpDir string = "/sys/kernel/mm/transparent_hugepage"
+
 func TestTHPTunerSupported(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -28,7 +30,7 @@ func TestTHPTunerSupported(t *testing.T) {
 	}{
 		{
 			name:     "should return true if the default dir exists",
-			thpDir:   "/sys/kernel/mm/transparent_hugepage",
+			thpDir:   thpDir,
 			expected: true,
 		},
 		{
@@ -48,7 +50,7 @@ func TestTHPTunerSupported(t *testing.T) {
 			fs := afero.NewMemMapFs()
 
 			if tt.thpDir != "" {
-				err := fs.MkdirAll(tt.thpDir, 0755)
+				err := fs.MkdirAll(tt.thpDir, 0o755)
 				require.NoError(st, err)
 			}
 			exec := executors.NewDirectExecutor()
@@ -72,8 +74,8 @@ echo 'always' > /sys/kernel/mm/transparent_hugepage/enabled
 	fs := afero.NewMemMapFs()
 	scriptFileName := "script.sh"
 	exec := executors.NewScriptRenderingExecutor(fs, scriptFileName)
-	dir := "/sys/kernel/mm/transparent_hugepage"
-	err := fs.MkdirAll(dir, 0755)
+	dir := thpDir
+	err := fs.MkdirAll(dir, 0o755)
 	require.NoError(t, err)
 
 	_, err = fs.Create(filepath.Join(dir, "enabled"))
@@ -102,9 +104,9 @@ func TestTHPTunerDirectExecutor(t *testing.T) {
 	expected := "always"
 	fs := afero.NewMemMapFs()
 	exec := executors.NewDirectExecutor()
-	dir := "/sys/kernel/mm/transparent_hugepage"
+	dir := thpDir
 	filePath := filepath.Join(dir, "enabled")
-	err := fs.MkdirAll(dir, 0755)
+	err := fs.MkdirAll(dir, 0o755)
 	require.NoError(t, err)
 
 	_, err = fs.Create(filePath)
@@ -124,7 +126,7 @@ func TestTHPTunerDirectExecutor(t *testing.T) {
 
 func TestTHPCheckID(t *testing.T) {
 	c := tuners.NewTransparentHugePagesChecker(afero.NewMemMapFs())
-	require.Equal(t, tuners.CheckerID(tuners.TransparentHugePagesChecker), c.Id())
+	require.Equal(t, tuners.CheckerID(tuners.TransparentHugePagesChecker), c.ID())
 }
 
 func TestTHPCheck(t *testing.T) {
@@ -152,8 +154,8 @@ func TestTHPCheck(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(st *testing.T) {
 			fs := afero.NewMemMapFs()
-			dir := "/sys/kernel/mm/transparent_hugepage"
-			err := fs.MkdirAll(dir, 0755)
+			dir := thpDir
+			err := fs.MkdirAll(dir, 0o755)
 			require.NoError(t, err)
 
 			f, err := fs.Create(filepath.Join(dir, "enabled"))

@@ -13,17 +13,24 @@
 
 #include "cluster/config_frontend.h"
 #include "cluster/controller_service.h"
+#include "cluster/controller_snapshot.h"
 #include "cluster/errc.h"
-#include "cluster/feature_table.h"
 #include "cluster/logger.h"
+#include "cluster/members_table.h"
 #include "cluster/partition_leaders_table.h"
 #include "config/configuration.h"
 #include "config/node_config.h"
+#include "features/feature_table.h"
 #include "resource_mgmt/io_priority.h"
+#include "rpc/connection_cache.h"
 #include "utils/file_io.h"
 #include "vlog.h"
 
 #include <seastar/core/coroutine.hh>
+
+#include <absl/container/flat_hash_map.h>
+
+#include <algorithm>
 
 namespace cluster {
 
@@ -52,13 +59,15 @@ config_manager::config_manager(
   ss::sharded<config_frontend>& cf,
   ss::sharded<rpc::connection_cache>& cc,
   ss::sharded<partition_leaders_table>& pl,
-  ss::sharded<feature_table>& ft,
+  ss::sharded<features::feature_table>& ft,
+  ss::sharded<cluster::members_table>& mt,
   ss::sharded<ss::abort_source>& as)
-  : _self(config::node().node_id())
+  : _self(*config::node().node_id())
   , _frontend(cf)
   , _connection_cache(cc)
   , _leaders(pl)
   , _feature_table(ft)
+  , _members(mt)
   , _as(as) {
     if (ss::this_shard_id() == controller_stm_shard) {
         // Only the controller stm shard handles updates: leave these
@@ -85,54 +94,51 @@ config_manager::config_manager(
  */
 void config_manager::start_bootstrap() {
     // Detach fiber
-    ssx::background
-      = ssx::spawn_with_gate_then(_gate, [this] {
-            return ss::do_until(
-              [this] {
-                  return _as.local().abort_requested() || _bootstrap_complete;
-              },
-              [this]() -> ss::future<> {
-                  if (_seen_version != config_version_unset) {
-                      vlog(
-                        clusterlog.info,
-                        "Bootstrap complete (version {})",
-                        _seen_version);
-                      _bootstrap_complete = true;
-                      co_return;
-                  } else {
-                      auto leader = co_await _leaders.local().wait_for_leader(
-                        model::controller_ntp,
-                        model::timeout_clock::now() + bootstrap_retry,
-                        _as.local());
-                      if (leader == _self) {
-                          // We are the leader.  Proceed to bootstrap cluster
-                          // configuration from our local configuration.
-                          if (!_feature_table.local().is_active(
-                                feature::central_config)) {
-                              vlog(
-                                clusterlog.trace,
-                                "Central config feature not active, waiting");
-                              co_await _feature_table.local().await_feature(
-                                feature::central_config, _as.local());
-                          }
-                          co_await do_bootstrap();
-                          vlog(
-                            clusterlog.info, "Completed bootstrap as leader");
-                      } else {
-                          // Someone else got leadership.  Maybe they
-                          // successfully bootstrap config, maybe they don't.
-                          // Wait a short time before checking again.
-                          co_await ss::sleep_abortable(
-                            bootstrap_retry, _as.local());
-                      }
-                  }
-              });
-        }).handle_exception([](const std::exception_ptr& e) {
-            // Explicitly handle exception so that we do not risk an
-            // 'ignored exceptional future' error.  The only exceptions
-            // we expect here are things like sleep_aborted during shutdown.
-            vlog(clusterlog.warn, "Exception during bootstrap: {}", e);
-        });
+    ssx::background = ssx::spawn_with_gate_then(_gate, [this] {
+                          return ss::do_until(
+                            [this] {
+                                return _as.local().abort_requested()
+                                       || _bootstrap_complete;
+                            },
+                            [this] { return wait_for_bootstrap(); });
+                      }).handle_exception([](const std::exception_ptr& e) {
+        // Explicitly handle exception so that we do not risk an
+        // 'ignored exceptional future' error.  The only exceptions
+        // we expect here are things like sleep_aborted during shutdown.
+        vlog(clusterlog.warn, "Exception during bootstrap: {}", e);
+    });
+}
+
+ss::future<> config_manager::wait_for_bootstrap() {
+    if (_seen_version != config_version_unset) {
+        vlog(clusterlog.info, "Bootstrap complete (version {})", _seen_version);
+        _bootstrap_complete = true;
+        co_return;
+    } else {
+        auto leader = co_await _leaders.local().wait_for_leader(
+          model::controller_ntp,
+          model::timeout_clock::now() + bootstrap_retry,
+          _as.local());
+        if (leader == _self) {
+            // We are the leader.  Proceed to bootstrap cluster
+            // configuration from our local configuration.
+            if (!_feature_table.local().is_active(
+                  features::feature::central_config)) {
+                vlog(
+                  clusterlog.trace,
+                  "Central config feature not active, waiting");
+                co_await _feature_table.local().await_feature(
+                  features::feature::central_config, _as.local());
+            }
+            co_await do_bootstrap();
+            vlog(clusterlog.info, "Completed bootstrap as leader");
+        } else {
+            // Someone else got leadership.  Maybe they
+            // successfully bootstrap config, maybe they don't.
+            // Wait a short time before checking again.
+            co_await ss::sleep_abortable(bootstrap_retry, _as.local());
+        }
+    }
 }
 
 /**
@@ -145,18 +151,18 @@ void config_manager::start_bootstrap() {
 ss::future<> config_manager::do_bootstrap() {
     config_update_request update;
 
-    config::shard_local_cfg().for_each([&update](
-                                         const config::base_property& p) {
-        if (!p.is_default()) {
-            json::StringBuffer buf;
-            json::Writer<json::StringBuffer> writer(buf);
-            p.to_json(writer);
-            ss::sstring key_str(p.name());
-            ss::sstring val_str = buf.GetString();
-            vlog(clusterlog.info, "Importing property {}={}", key_str, val_str);
-            update.upsert.push_back({key_str, val_str});
-        }
-    });
+    config::shard_local_cfg().for_each(
+      [&update](const config::base_property& p) {
+          if (!p.is_default()) {
+              json::StringBuffer buf;
+              json::Writer<json::StringBuffer> writer(buf);
+              p.to_json(writer, config::redact_secrets::no);
+              ss::sstring key_str(p.name());
+              ss::sstring val_str = buf.GetString();
+              vlog(clusterlog.info, "Importing property {}", p);
+              update.upsert.emplace_back(key_str, val_str);
+          }
+      });
 
     // Version of the first write
     _frontend.local().set_next_version(config_version{1});
@@ -190,7 +196,7 @@ ss::future<> config_manager::start() {
     if (_seen_version == config_version_unset) {
         vlog(clusterlog.trace, "Starting config_manager... (initial)");
 
-        // Background: wait til we have a leader. If this node is leader
+        // Background: wait till we have a leader. If this node is leader
         // then bootstrap cluster configuration from local config.
         start_bootstrap();
     } else {
@@ -212,12 +218,38 @@ ss::future<> config_manager::start() {
         vlog(clusterlog.warn, "Exception from reconcile_status: {}", e);
     });
 
+    _member_removed_notification
+      = _members.local().register_members_updated_notification(
+        [this](auto current_members) {
+            handle_cluster_members_update(std::move(current_members));
+        });
+
+    _raft0_leader_changed_notification
+      = _leaders.local().register_leadership_change_notification(
+        model::controller_ntp,
+        [this](model::ntp, model::term_id, std::optional<model::node_id>) {
+            _reconcile_wait.signal();
+        });
+
     return ss::now();
+}
+void config_manager::handle_cluster_members_update(
+  const std::vector<model::node_id>& member_ids) {
+    std::erase_if(status, [&member_ids](const auto& status_pair) {
+        // it is fine to look up every time as the members list is usually short
+        return std::find(
+                 member_ids.begin(), member_ids.end(), status_pair.first)
+               == member_ids.end();
+    });
 }
 
 ss::future<> config_manager::stop() {
-    vlog(clusterlog.info, "stopping cluster::config_manager...");
+    vlog(clusterlog.info, "Stopping Config Manager...");
     _reconcile_wait.broken();
+    _members.local().unregister_members_updated_notification(
+      _member_removed_notification);
+    _leaders.local().unregister_leadership_change_notification(
+      _raft0_leader_changed_notification);
     co_await _gate.close();
 }
 
@@ -268,13 +300,13 @@ static void preload_local(
     result) {
     auto& cfg = config::shard_local_cfg();
     if (cfg.contains(key)) {
+        auto& property = cfg.get(key);
         try {
             // Cache values are string-ized yaml.  In many cases this
             // is the same as the underlying value (e.g. integers, bools),
             // but for strings it's not (the literal value in the cache is
             // "\"foo\"").
             auto decoded = YAML::Load(value.as<std::string>());
-            auto& property = cfg.get(key);
             property.set_value(decoded);
 
             // Because we are in preload, it doesn't matter if the property
@@ -294,7 +326,7 @@ static void preload_local(
                   clusterlog.info,
                   "Ignoring invalid property: {}={}",
                   key,
-                  YAML::Dump(value));
+                  property.format_raw(YAML::Dump(value)));
                 result.value().get().invalid.push_back(key);
             }
         }
@@ -472,7 +504,8 @@ ss::future<> config_manager::reconcile_status() {
         } else {
             vlog(
               clusterlog.trace,
-              "reconcile_status: sending status update to leader");
+              "reconcile_status: sending status update to leader: {}",
+              my_latest_status);
             if (_self == *leader) {
                 auto err = co_await _frontend.local().set_status(
                   my_latest_status, model::timeout_clock::now() + timeout);
@@ -516,22 +549,17 @@ ss::future<> config_manager::reconcile_status() {
     }
 
     try {
-        if (failed) {
-            // If we were dirty & failed to send our update, sleep until retry
-            co_await ss::sleep_abortable(status_retry, _as.local());
-        } else if (should_send_status()) {
-            // Our status updated while we were sending, proceed
-            // immediately to next iteration of loop.
+        if (failed || should_send_status()) {
+            co_await _reconcile_wait.wait(status_retry);
         } else {
             // We are clean: sleep until signalled.
-            co_await _reconcile_wait.wait();
+            co_await _reconcile_wait.wait(
+              [this]() { return should_send_status(); });
         }
-    } catch (ss::condition_variable_timed_out) {
+    } catch (ss::condition_variable_timed_out&) {
         // Wait complete - proceed around next loop of do_until
-    } catch (ss::broken_condition_variable) {
+    } catch (ss::broken_condition_variable&) {
         // Shutting down - nextiteration will drop out
-    } catch (ss::sleep_aborted) {
-        // Shutting down - next iteration will drop out
     }
 }
 
@@ -552,17 +580,17 @@ apply_local(cluster_config_delta_cmd_data const& data, bool silent) {
     auto& cfg = config::shard_local_cfg();
     auto result = config_manager::apply_result{};
     for (const auto& u : data.upsert) {
-        if (!cfg.contains(u.first)) {
+        if (!cfg.contains(u.key)) {
             // We never heard of this property.  Record it as unknown
             // in our config_status.
             if (!silent) {
-                vlog(clusterlog.info, "Unknown property {}", u.first);
+                vlog(clusterlog.info, "Unknown property {}", u.key);
             }
-            result.unknown.push_back(u.first);
+            result.unknown.push_back(u.key);
             continue;
         }
-        auto& property = cfg.get(u.first);
-        auto& val_yaml = u.second;
+        auto& property = cfg.get(u.key);
+        auto& val_yaml = u.value;
 
         try {
             auto val = YAML::Load(val_yaml);
@@ -570,7 +598,7 @@ apply_local(cluster_config_delta_cmd_data const& data, bool silent) {
             vlog(
               clusterlog.trace,
               "apply: upsert {}={}",
-              u.first,
+              u.key,
               property.format_raw(val_yaml));
 
             auto validation_err = property.validate(val);
@@ -579,11 +607,11 @@ apply_local(cluster_config_delta_cmd_data const& data, bool silent) {
                     vlog(
                       clusterlog.warn,
                       "Invalid property value {}: {} ({})",
-                      u.first,
-                      val_yaml,
+                      u.key,
+                      property.format_raw(val_yaml),
                       validation_err.value().error_message());
                 }
-                result.invalid.push_back(u.first);
+                result.invalid.push_back(u.key);
 
                 // We still proceed to set_value after failing validation.
                 // The property class is responsible for clamping or rejecting
@@ -594,27 +622,27 @@ apply_local(cluster_config_delta_cmd_data const& data, bool silent) {
 
             bool changed = property.set_value(val);
             result.restart |= (property.needs_restart() && changed);
-        } catch (YAML::ParserException) {
+        } catch (YAML::ParserException&) {
             if (!silent) {
                 vlog(
                   clusterlog.warn,
                   "Invalid syntax in property {}: {}",
-                  u.first,
+                  u.key,
                   property.format_raw(val_yaml));
             }
-            result.invalid.push_back(u.first);
+            result.invalid.push_back(u.key);
             continue;
-        } catch (YAML::BadConversion) {
+        } catch (YAML::BadConversion&) {
             if (!silent) {
                 vlog(
                   clusterlog.warn,
                   "Invalid value for property {}: {}",
-                  u.first,
+                  u.key,
                   property.format_raw(val_yaml));
             }
-            result.invalid.push_back(u.first);
+            result.invalid.push_back(u.key);
             continue;
-        } catch (std::bad_alloc) {
+        } catch (std::bad_alloc&) {
             // Don't include bad_alloc in the catch-all below
             throw;
         } catch (...) {
@@ -627,11 +655,11 @@ apply_local(cluster_config_delta_cmd_data const& data, bool silent) {
                 vlog(
                   clusterlog.warn,
                   "Unexpected error setting property {}={}: {}",
-                  u.first,
+                  u.key,
                   property.format_raw(val_yaml),
                   std::current_exception());
             }
-            result.invalid.push_back(u.first);
+            result.invalid.push_back(u.key);
             continue;
         }
     }
@@ -657,11 +685,6 @@ void config_manager::merge_apply_result(
   config_status& status,
   cluster_config_delta_cmd_data const& data,
   apply_result const& r) {
-    vlog(
-      clusterlog.trace,
-      "merge_apply_result: data {} {}",
-      fmt::ptr(&data),
-      data.upsert.size());
     status.restart |= r.restart;
 
     std::set<ss::sstring> errored_properties;
@@ -678,8 +701,8 @@ void config_manager::merge_apply_result(
         ok_properties.insert(i);
     }
     for (const auto& i : data.upsert) {
-        if (!errored_properties.contains(i.first)) {
-            ok_properties.insert(i.first);
+        if (!errored_properties.contains(i.key)) {
+            ok_properties.insert(i.key);
         }
     }
 
@@ -721,18 +744,8 @@ void config_manager::merge_apply_result(
 ss::future<> config_manager::store_delta(
   config_version const& delta_version,
   cluster_config_delta_cmd_data const& data) {
-    _seen_version = delta_version;
-
-    // version_shard is chosen to match controller_stm_shard, so
-    // our raft0 stm apply operations do not need a core jump to
-    // update the frontend version state.
-    vassert(
-      ss::this_shard_id() == config_frontend::version_shard,
-      "Must be called on frontend version_shard");
-    _frontend.local().set_next_version(_seen_version + config_version{1});
-
     for (const auto& u : data.upsert) {
-        _raw_values[u.first] = u.second;
+        _raw_values[u.key] = u.value;
     }
     for (const auto& d : data.remove) {
         _raw_values.erase(d);
@@ -799,6 +812,14 @@ config_manager::apply_delta(cluster_config_delta_cmd&& cmd_in) {
           _seen_version);
         co_return errc::success;
     }
+    _seen_version = delta_version;
+    // version_shard is chosen to match controller_stm_shard, so
+    // our raft0 stm apply operations do not need a core jump to
+    // update the frontend version state.
+    vassert(
+      ss::this_shard_id() == config_frontend::version_shard,
+      "Must be called on frontend version_shard");
+    _frontend.local().set_next_version(_seen_version + config_version{1});
 
     const cluster_config_delta_cmd_data& data = cmd.value;
     vlog(
@@ -833,16 +854,15 @@ config_manager::apply_status(cluster_config_status_cmd&& cmd) {
     auto node_id = cmd.key;
     auto data = std::move(cmd.value);
 
-    // TODO: hook into node decom to remove nodes from
-    // the status map.
-
     vlog(
       clusterlog.trace,
       "apply_status: updating node {}: {}",
       node_id,
       data.status);
-
-    status[node_id] = data.status;
+    // do not apply status to the map if node is removed
+    if (_members.local().contains(node_id)) {
+        status[node_id] = data.status;
+    }
 
     co_return errc::success;
 }
@@ -861,6 +881,73 @@ config_manager::apply_update(model::record_batch b) {
       [this](cluster_config_status_cmd cmd) {
           return apply_status(std::move(cmd));
       });
+}
+
+config_manager::status_map config_manager::get_projected_status() const {
+    status_map r = status;
+
+    // If our local status is ahead of the persistent status map,
+    // update the projected result: the persistent status map is
+    // guaranteed to catch up to this eventually via reconcile_status.
+    //
+    // This behaviour is useful to get read-after-write consistency
+    // when writing config updates to the controller leader + then
+    // reading back the status from the same leader node.
+    //
+    // A more comprehensive approach to waiting for status updates
+    // inline with config updates is discussed in
+    // https://github.com/redpanda-data/redpanda/issues/5833
+    auto it = r.find(_self);
+    if (it == r.end() || it->second.version < my_latest_status.version) {
+        r[_self] = my_latest_status;
+    }
+
+    return r;
+}
+
+ss::future<> config_manager::fill_snapshot(controller_snapshot& snap) const {
+    snap.config.version = _seen_version;
+
+    snap.config.values.insert(_raw_values.begin(), _raw_values.end());
+
+    auto& nodes_status = snap.config.nodes_status;
+    for (const auto& kv : status) {
+        nodes_status.push_back(kv.second);
+    }
+
+    return ss::now();
+}
+
+ss::future<>
+config_manager::apply_snapshot(model::offset, const controller_snapshot& snap) {
+    status.clear();
+    for (const auto& st : snap.config.nodes_status) {
+        status.emplace(st.node, st);
+    }
+
+    // craft a delta that, when applied, will be equivalent to the set of values
+    // in the snapshot.
+    const auto& values = snap.config.values;
+    cluster_config_delta_cmd_data delta;
+    delta.upsert.reserve(values.size());
+    for (const auto& [key, val] : values) {
+        delta.upsert.emplace_back(key, val);
+    }
+    for (const auto& [key, val] : _raw_values) {
+        if (!values.contains(key)) {
+            delta.remove.push_back(key);
+        }
+    }
+
+    auto ec = co_await apply_delta(
+      cluster_config_delta_cmd{snap.config.version, std::move(delta)});
+    if (ec) {
+        throw std::runtime_error(fmt_with_ctx(
+          fmt::format,
+          "Failed to apply config_manager part of controller snapshot: {} ({})",
+          ec.message(),
+          ec));
+    }
 }
 
 } // namespace cluster

@@ -72,6 +72,11 @@
             "output_type": "finish_reallocation_reply"
         },
         {
+            "name": "revert_cancel_partition_move",
+            "input_type": "revert_cancel_partition_move_request",
+            "output_type": "revert_cancel_partition_move_reply"
+        },
+        {
             "name": "set_maintenance_mode",
             "input_type": "set_maintenance_mode_request",
             "output_type": "set_maintenance_mode_reply"
@@ -110,6 +115,31 @@
             "name": "hello",
             "input_type": "hello_request",
             "output_type": "hello_reply"
+        },
+        {
+            "name": "cancel_all_partition_movements",
+            "input_type": "cancel_all_partition_movements_request",
+            "output_type": "cancel_partition_movements_reply"
+        },
+        {
+            "name": "cancel_node_partition_movements",
+            "input_type": "cancel_node_partition_movements_request",
+            "output_type": "cancel_partition_movements_reply"
+        },
+        {
+            "name": "transfer_leadership",
+            "input_type": "transfer_leadership_request",
+            "output_type": "transfer_leadership_reply"
+        },
+        {
+            "name": "cloud_storage_usage",
+            "input_type": "cloud_storage_usage_request",
+            "output_type": "cloud_storage_usage_reply"
+        },
+        {
+            "name": "get_partition_state",
+            "input_type": "partition_state_request",
+            "output_type": "partition_state_reply"
         }
     ]
 }

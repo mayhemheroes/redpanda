@@ -59,9 +59,21 @@ std::ostream& operator<<(std::ostream& o, const status& s) {
         return o << "rpc::status::request_timeout";
     case status::server_error:
         return o << "rpc::status::server_error";
+    case status::version_not_supported:
+        return o << "rpc::status::version_not_supported";
+    case status::service_unavailable:
+        return o << "rpc::status::service_unavailable";
     default:
         return o << "rpc::status::unknown";
     }
+}
+
+std::ostream& operator<<(std::ostream& o, transport_version v) {
+    fmt::print(
+      o,
+      "rpc::transport_version::v{}",
+      static_cast<std::underlying_type_t<transport_version>>(v));
+    return o;
 }
 
 } // namespace rpc

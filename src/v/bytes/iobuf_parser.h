@@ -51,6 +51,12 @@ public:
         return {val, length_size};
     }
 
+    std::pair<uint32_t, uint8_t> read_unsigned_varint() {
+        auto [val, length_size] = unsigned_vint::deserialize(_in);
+        _in.skip(length_size);
+        return {val, length_size};
+    }
+
     ss::sstring read_string(size_t len) {
         ss::sstring str = ss::uninitialized_string(len);
         _in.consume_to(str.size(), str.begin());
@@ -78,12 +84,10 @@ public:
 
     void skip(size_t n) { _in.skip(n); }
 
-    // clang-format off
     template<typename Consumer>
-    CONCEPT(requires requires(Consumer c, const char* src, size_t max) {
+    requires requires(Consumer c, const char* src, size_t max) {
         { c(src, max) } -> std::same_as<ss::stop_iteration>;
-    })
-    // clang-format on
+    }
     size_t consume(const size_t n, Consumer&& f) {
         return _in.consume(n, std::forward<Consumer>(f));
     }
@@ -138,9 +142,9 @@ public:
     iobuf share_no_consume(size_t len) {
         return ref().share(bytes_consumed(), len);
     }
-};
 
-inline std::ostream& operator<<(std::ostream& o, const iobuf_parser& p) {
-    return o << "{bytes_left:" << p.bytes_left()
-             << ", bytes_consumed:" << p.bytes_consumed() << "}";
-}
+    friend std::ostream& operator<<(std::ostream& o, const iobuf_parser& p) {
+        return o << "{bytes_left:" << p.bytes_left()
+                 << ", bytes_consumed:" << p.bytes_consumed() << "}";
+    }
+};

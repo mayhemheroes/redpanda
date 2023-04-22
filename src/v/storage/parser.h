@@ -18,6 +18,7 @@
 #include "storage/exceptions.h"
 #include "storage/failure_probes.h"
 #include "storage/parser_errc.h"
+#include "storage/segment_reader.h"
 #include "utils/vint.h"
 
 #include <seastar/core/byteorder.hh>
@@ -83,21 +84,21 @@ public:
     virtual void print(std::ostream&) const = 0;
 
 private:
-    friend std::ostream& operator<<(std::ostream&, const batch_consumer&);
+    friend std::ostream& operator<<(std::ostream& os, const batch_consumer& c) {
+        c.print(os);
+        return os;
+    }
 };
-
-inline std::ostream& operator<<(std::ostream& os, const batch_consumer& c) {
-    c.print(os);
-    return os;
-}
 
 class continuous_batch_parser {
 public:
     continuous_batch_parser(
       std::unique_ptr<batch_consumer> consumer,
-      ss::input_stream<char> input) noexcept
+      segment_reader_handle input,
+      bool recovery = false) noexcept
       : _consumer(std::move(consumer))
-      , _input(std::move(input)) {}
+      , _input(std::move(input))
+      , _recovery(recovery) {}
     continuous_batch_parser(const continuous_batch_parser&) = delete;
     continuous_batch_parser& operator=(const continuous_batch_parser&) = delete;
     continuous_batch_parser(continuous_batch_parser&&) noexcept = default;
@@ -126,9 +127,17 @@ private:
     size_t consumed_batch_bytes() const;
     void add_bytes_and_reset();
 
+    ss::input_stream<char>& get_stream() { return _input.stream(); }
+
 private:
     std::unique_ptr<batch_consumer> _consumer;
-    ss::input_stream<char> _input;
+    segment_reader_handle _input;
+
+    // If _recovery is true, we do not log unexpected data at the
+    // end of the stream as an error (it is expected after an unclean
+    // shutdown)
+    bool _recovery{false};
+
     std::optional<model::record_batch_header> _header;
     parser_errc _err = parser_errc::none;
     size_t _bytes_consumed{0};
@@ -151,6 +160,7 @@ using record_batch_transform_predicate = ss::noncopyable_function<
 ss::future<result<size_t>> transform_stream(
   ss::input_stream<char> in,
   ss::output_stream<char> out,
-  record_batch_transform_predicate pred);
+  record_batch_transform_predicate pred,
+  opt_abort_source_t as = std::nullopt);
 
 } // namespace storage

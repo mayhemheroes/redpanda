@@ -14,7 +14,6 @@
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/list_offset_request.h"
 #include "kafka/protocol/schemata/list_offset_response.h"
-#include "kafka/server/response.h"
 #include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -26,16 +25,6 @@
 
 namespace kafka {
 
-struct list_offsets_response;
-
-class list_offsets_api final {
-public:
-    using response_type = list_offsets_response;
-
-    static constexpr const char* name = "list_offsets";
-    static constexpr api_key key = api_key(2);
-};
-
 struct list_offsets_request final {
     using api_type = list_offsets_api;
 
@@ -44,11 +33,11 @@ struct list_offsets_request final {
 
     list_offset_request_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
 
@@ -60,12 +49,12 @@ struct list_offsets_request final {
         model::topic_partition tp(t, id);
         return tp_dups.find(tp) != tp_dups.end();
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const list_offsets_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const list_offsets_request& r) {
+        return os << r.data;
+    }
+};
 
 struct list_offsets_response final {
     using api_type = list_offsets_api;
@@ -106,7 +95,7 @@ struct list_offsets_response final {
           invalid_leader_epoch);
     }
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         // convert to version zero in which the data model supported returning
         // multiple offsets instead of just one
         if (version == api_version(0)) {
@@ -122,11 +111,11 @@ struct list_offsets_response final {
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const list_offsets_response& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const list_offsets_response& r) {
+        return os << r.data;
+    }
+};
 
 } // namespace kafka

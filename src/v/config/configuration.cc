@@ -9,53 +9,62 @@
 
 #include "config/configuration.h"
 
-#include "cluster/node/constants.h"
 #include "config/base_property.h"
+#include "config/bounded_property.h"
 #include "config/node_config.h"
 #include "config/validators.h"
 #include "model/metadata.h"
+#include "security/gssapi_principal_mapper.h"
+#include "security/mtls.h"
 #include "storage/chunk_cache.h"
 #include "storage/segment_appender.h"
 #include "units.h"
+#include "utils/bottomless_token_bucket.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace config {
 using namespace std::chrono_literals;
-
-uint32_t default_raft_non_local_requests() {
-    /**
-     * raft max non local requests
-     * - up to 7000 groups per core
-     * - up to 256 concurrent append entries per group
-     * - additional requests like (vote, snapshot, timeout now)
-     *
-     * All the values have to be multiplied by core count minus one since
-     * part of the requests will be core local
-     *
-     * 7000*256 * (number of cores-1) + 10 * 7000 * (number of cores-1)
-     *         ^                                 ^
-     * append entries requests          additional requests
-     */
-    static constexpr uint32_t max_partitions_per_core = 7000;
-    static constexpr uint32_t max_append_requests_per_follower = 256;
-    static constexpr uint32_t additional_requests_per_follower = 10;
-
-    return max_partitions_per_core
-           * (max_append_requests_per_follower + additional_requests_per_follower)
-           * (ss::smp::count - 1);
-}
 
 configuration::configuration()
   : log_segment_size(
     *this,
     "log_segment_size",
-    "How large in bytes should each log segment be (default 1G)",
+    "Default log segment size in bytes for topics which do not set "
+    "segment.bytes",
     {.needs_restart = needs_restart::no,
      .example = "2147483648",
      .visibility = visibility::tunable},
-    1_GiB,
+    128_MiB,
     {.min = 1_MiB})
+  , log_segment_size_min(
+      *this,
+      "log_segment_size_min",
+      "Lower bound on topic segment.bytes: lower values will be clamped to "
+      "this limit",
+      {.needs_restart = needs_restart::no,
+       .example = "16777216",
+       .visibility = visibility::tunable},
+      1_MiB)
+  , log_segment_size_max(
+      *this,
+      "log_segment_size_max",
+      "Upper bound on topic segment.bytes: higher values will be clamped to "
+      "this limit",
+      {.needs_restart = needs_restart::no,
+       .example = "268435456",
+       .visibility = visibility::tunable},
+      std::nullopt)
+  , log_segment_size_jitter_percent(
+      *this,
+      "log_segment_size_jitter_percent",
+      "Random variation to the segment size limit used for each partition",
+      {.needs_restart = needs_restart::yes,
+       .example = "2",
+       .visibility = visibility::tunable},
+      5,
+      {.min = 0, .max = 99})
   , compacted_log_segment_size(
       *this,
       "compacted_log_segment_size",
@@ -72,6 +81,34 @@ configuration::configuration()
       "Duration after which inactive readers will be evicted from cache",
       {.visibility = visibility::tunable},
       30s)
+  , log_segment_ms(
+      *this,
+      "log_segment_ms",
+      "Default log segment lifetime in ms for topics which do not set "
+      "segment.ms",
+      {.needs_restart = needs_restart::no,
+       .example = "3600000",
+       .visibility = visibility::user},
+      std::chrono::weeks{2},
+      {.min = 60s})
+  , log_segment_ms_min(
+      *this,
+      "log_segment_ms_min",
+      "Lower bound on topic segment.ms: lower values will be clamped to this "
+      "value",
+      {.needs_restart = needs_restart::no,
+       .example = "60000",
+       .visibility = visibility::tunable},
+      60s)
+  , log_segment_ms_max(
+      *this,
+      "log_segment_ms_max",
+      "Upper bound on topic segment.ms: higher values will be clamped to this "
+      "value",
+      {.needs_restart = needs_restart::no,
+       .example = "31536000000",
+       .visibility = visibility::tunable},
+      24h * 365)
   , rpc_server_listen_backlog(
       *this,
       "rpc_server_listen_backlog",
@@ -82,14 +119,14 @@ configuration::configuration()
   , rpc_server_tcp_recv_buf(
       *this,
       "rpc_server_tcp_recv_buf",
-      "TCP receive buffer size in bytes.",
+      "Internal RPC TCP receive buffer size in bytes.",
       {.example = "65536"},
       std::nullopt,
       {.min = 32_KiB, .align = 4_KiB})
   , rpc_server_tcp_send_buf(
       *this,
       "rpc_server_tcp_send_buf",
-      "TCP transmit buffer size in bytes.",
+      "Internal RPC TCP transmit buffer size in bytes.",
       {.example = "65536"},
       std::nullopt,
       {.min = 32_KiB, .align = 4_KiB})
@@ -139,11 +176,39 @@ configuration::configuration()
       "topic_fds_per_partition",
       "Required file handles per partition when creating topics",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      10,
+      5,
       {
         .min = 1,   // At least one FD per partition, required for appender.
         .max = 1000 // A system with 1M ulimit should be allowed to create at
                     // least 1000 partitions
+      })
+  , topic_partitions_per_shard(
+      *this,
+      "topic_partitions_per_shard",
+      "Maximum number of partitions which may be allocated to one shard (CPU "
+      "core)",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1000,
+      {
+        .min = 16,    // Forbid absurdly small values that would prevent most
+                      // practical workloads from running
+        .max = 131072 // An upper bound to prevent pathological values, although
+                      // systems will most likely hit issues far before reaching
+                      // this.  This property is principally intended to be
+                      // tuned downward from the default, not upward.
+      },
+      legacy_default<uint32_t>(7000, legacy_version{9}))
+  , topic_partitions_reserve_shard0(
+      *this,
+      "topic_partitions_reserve_shard0",
+      "Reserved partition slots on shard (CPU core) 0 on each node.  If this "
+      "is >= topic_partitions_per_core, no data partitions will be scheduled "
+      "on shard 0",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      2,
+      {
+        .min = 0,     // It is not mandatory to reserve any capacity
+        .max = 131072 // Same max as topic_partitions_per_shard
       })
   , admin_api_require_auth(
       *this,
@@ -158,14 +223,14 @@ configuration::configuration()
       *this,
       "raft_heartbeat_interval_ms",
       "Milliseconds for raft leader heartbeats",
-      {.visibility = visibility::tunable},
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       std::chrono::milliseconds(150),
       {.min = std::chrono::milliseconds(1)})
   , raft_heartbeat_timeout_ms(
       *this,
       "raft_heartbeat_timeout_ms",
       "raft heartbeat RPC timeout",
-      {.visibility = visibility::tunable},
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       3s,
       {.min = std::chrono::milliseconds(1)})
   , raft_heartbeat_disconnect_failures(
@@ -195,6 +260,41 @@ configuration::configuration()
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       512_KiB,
       {.min = 128, .max = 5_MiB})
+  , enable_usage(
+      *this,
+      "enable_usage",
+      "Enables the usage tracking mechanism, storing windowed history of "
+      "kafka/cloud_storage metrics over time",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      false)
+  , usage_num_windows(
+      *this,
+      "usage_num_windows",
+      "The number of windows to persist in memory and disk",
+      {.needs_restart = needs_restart::no,
+       .example = "24",
+       .visibility = visibility::tunable},
+      24,
+      {.min = 2, .max = 86400})
+  , usage_window_width_interval_sec(
+      *this,
+      "usage_window_width_interval_sec",
+      "The width of a usage window, tracking cloud and kafka ingress/egress "
+      "traffic each interval",
+      {.needs_restart = needs_restart::no,
+       .example = "3600",
+       .visibility = visibility::tunable},
+      std::chrono::seconds(3600),
+      {.min = std::chrono::seconds(1)})
+  , usage_disk_persistance_interval_sec(
+      *this,
+      "usage_disk_persistance_interval_sec",
+      "The interval in which all usage stats are written to disk",
+      {.needs_restart = needs_restart::no,
+       .example = "300",
+       .visibility = visibility::tunable},
+      std::chrono::seconds(60 * 5),
+      {.min = std::chrono::seconds(1)})
   , use_scheduling_groups(*this, "use_scheduling_groups")
   , enable_admin_api(*this, "enable_admin_api")
   , default_num_windows(
@@ -220,23 +320,56 @@ configuration::configuration()
   , target_quota_byte_rate(
       *this,
       "target_quota_byte_rate",
-      "Target quota byte rate (bytes per second) - 2GB default",
+      "Target request size quota byte rate (bytes per second) - 2GB default",
       {.needs_restart = needs_restart::no,
        .example = "1073741824",
        .visibility = visibility::user},
       2_GiB,
       {.min = 1_MiB})
+  , target_fetch_quota_byte_rate(
+      *this,
+      "target_fetch_quota_byte_rate",
+      "Target fetch size quota byte rate (bytes per second) - disabled default",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      std::nullopt)
+  , kafka_admin_topic_api_rate(
+      *this,
+      "kafka_admin_topic_api_rate",
+      "Target quota rate (partition mutations per default_window_sec)",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      std::nullopt,
+      {.min = 1})
   , cluster_id(
       *this,
       "cluster_id",
       "Cluster identifier",
       {.needs_restart = needs_restart::no},
-      std::nullopt)
+      std::nullopt,
+      &validate_non_empty_string_opt)
   , disable_metrics(
       *this,
       "disable_metrics",
-      "Disable registering metrics",
+      "Disable registering metrics exposed on the internal metrics endpoint "
+      "(/metrics)",
       base_property::metadata{},
+      false)
+  , disable_public_metrics(
+      *this,
+      "disable_public_metrics",
+      "Disable registering metrics exposed on the public metrics endpoint "
+      "(/public_metrics)",
+      base_property::metadata{},
+      false)
+  , aggregate_metrics(
+      *this,
+      "aggregate_metrics",
+      "Enable aggregations of metrics returned by the prometheus '/metrics' "
+      "endpoint. "
+      "Metric aggregation is performed by summing the values of samples by "
+      "labels. "
+      "Aggregations are performed where it makes sense by the shard and/or "
+      "partition labels.",
+      {.needs_restart = needs_restart::yes},
       false)
   , group_min_session_timeout_ms(
       *this,
@@ -260,13 +393,34 @@ configuration::configuration()
       "group_initial_rebalance_delay",
       "Extra delay (ms) added to rebalance phase to wait for new members",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      300ms)
+      3s)
   , group_new_member_join_timeout(
       *this,
       "group_new_member_join_timeout",
       "Timeout for new member joins",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       30'000ms)
+  , group_offset_retention_sec(
+      *this,
+      "group_offset_retention_sec",
+      "Consumer group offset retention seconds. Offset retention can be "
+      "disabled by setting this value to null.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      24h * 7)
+  , group_offset_retention_check_ms(
+      *this,
+      "group_offset_retention_check_ms",
+      "How often the system should check for expired group offsets.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      10min)
+  , legacy_group_offset_retention_enabled(
+      *this,
+      "legacy_group_offset_retention_enabled",
+      "Group offset retention is enabled by default in versions of Redpanda >= "
+      "23.1. To enable offset retention after upgrading from an older version "
+      "set this option to true.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      false)
   , metadata_dissemination_interval_ms(
       *this,
       "metadata_dissemination_interval_ms",
@@ -292,15 +446,7 @@ configuration::configuration()
       "Time to wait state catch up before rejecting a request",
       {.visibility = visibility::user},
       10s)
-  , tm_violation_recovery_policy(
-      *this,
-      "tm_violation_recovery_policy",
-      "Describes how to recover from an invariant violation happened on the "
-      "transaction coordinator level",
-      {.example = "best_effort", .visibility = visibility::user},
-      model::violation_recovery_policy::crash,
-      {model::violation_recovery_policy::crash,
-       model::violation_recovery_policy::best_effort})
+  , tm_violation_recovery_policy(*this, "tm_violation_recovery_policy")
   , rm_sync_timeout_ms(
       *this,
       "rm_sync_timeout_ms",
@@ -319,15 +465,7 @@ configuration::configuration()
       "Delay before scheduling next check for timed out transactions",
       {.visibility = visibility::user},
       1000ms)
-  , rm_violation_recovery_policy(
-      *this,
-      "rm_violation_recovery_policy",
-      "Describes how to recover from an invariant violation happened on the "
-      "partition level",
-      {.example = "best_effort", .visibility = visibility::user},
-      model::violation_recovery_policy::crash,
-      {model::violation_recovery_policy::crash,
-       model::violation_recovery_policy::best_effort})
+  , rm_violation_recovery_policy(*this, "rm_violation_recovery_policy")
   , fetch_reads_debounce_timeout(
       *this,
       "fetch_reads_debounce_timeout",
@@ -403,6 +541,7 @@ configuration::configuration()
        .visibility = visibility::user},
       {},
       validate_connection_rate)
+
   , transactional_id_expiration_ms(
       *this,
       "transactional_id_expiration_ms",
@@ -410,6 +549,14 @@ configuration::configuration()
       "write with the given producer id.",
       {.visibility = visibility::user},
       10080min)
+  , max_concurrent_producer_ids(
+      *this,
+      "max_concurrent_producer_ids",
+      "Max cache size for pids which rm_stm stores inside internal state. In "
+      "overflow rm_stm will delete old pids and clear their status",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::numeric_limits<uint64_t>::max(),
+      {.min = 1})
   , enable_idempotence(
       *this,
       "enable_idempotence",
@@ -421,7 +568,7 @@ configuration::configuration()
       "enable_transactions",
       "Enable transactions",
       {.visibility = visibility::user},
-      false)
+      true)
   , abort_index_segment_size(
       *this,
       "abort_index_segment_size",
@@ -451,25 +598,23 @@ configuration::configuration()
       "group_topic_partitions",
       "Number of partitions in the internal group membership topic",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      1)
+      16)
   , default_topic_replication(
       *this,
       "default_topic_replications",
       "Default replication factor for new topics",
       {.needs_restart = needs_restart::no, .visibility = visibility::user},
-      1)
+      1,
+      {.min = 1, .oddeven = odd_even_constraint::odd})
   , transaction_coordinator_replication(
+      *this, "transaction_coordinator_replication")
+  , id_allocator_replication(*this, "id_allocator_replication")
+  , transaction_coordinator_partitions(
       *this,
-      "transaction_coordinator_replication",
-      "Replication factor for a transaction coordinator topic",
-      {.needs_restart = needs_restart::no, .visibility = visibility::user},
-      1)
-  , id_allocator_replication(
-      *this,
-      "id_allocator_replication",
-      "Replication factor for an id allocator topic",
-      {.needs_restart = needs_restart::no, .visibility = visibility::user},
-      1)
+      "transaction_coordinator_partitions",
+      "Amount of partitions for transactions coordinator",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      16)
   , transaction_coordinator_cleanup_policy(
       *this,
       "transaction_coordinator_cleanup_policy",
@@ -495,7 +640,14 @@ configuration::configuration()
       "abort_timed_out_transactions_interval_ms",
       "How often look for the inactive transactions and abort them",
       {.visibility = visibility::tunable},
-      1min)
+      10s)
+  , tx_log_stats_interval_s(
+      *this,
+      "tx_log_stats_interval_s",
+      "How often to log per partition tx stats, works only with debug logging "
+      "enabled.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      10s)
   , create_topic_timeout_ms(
       *this,
       "create_topic_timeout_ms",
@@ -555,7 +707,7 @@ configuration::configuration()
       *this,
       "raft_learner_recovery_rate",
       "Raft learner recovery rate limit in bytes per sec",
-      {.visibility = visibility::user},
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
       100_MiB)
   , raft_smp_max_non_local_requests(
       *this,
@@ -563,7 +715,7 @@ configuration::configuration()
       "Maximum number of x-core requests pending in Raft seastar::smp group. "
       "(for more details look at `seastar::smp_service_group` documentation)",
       {.visibility = visibility::tunable},
-      default_raft_non_local_requests())
+      std::nullopt)
   , raft_max_concurrent_append_requests_per_follower(
       *this,
       "raft_max_concurrent_append_requests_per_follower",
@@ -630,7 +782,7 @@ configuration::configuration()
       "max_kafka_throttle_delay_ms",
       "Fail-safe maximum throttle delay on kafka requests",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      60'000ms)
+      30'000ms)
   , kafka_max_bytes_per_fetch(
       *this,
       "kafka_max_bytes_per_fetch",
@@ -642,7 +794,7 @@ configuration::configuration()
       *this,
       "raft_io_timeout_ms",
       "Raft I/O timeout",
-      {.visibility = visibility::tunable},
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       10'000ms)
   , join_retry_timeout_ms(
       *this,
@@ -711,6 +863,36 @@ configuration::configuration()
        .visibility = visibility::tunable},
       32_MiB,
       storage::segment_appender::validate_fallocation_step)
+  , storage_target_replay_bytes(
+      *this,
+      "storage_target_replay_bytes",
+      "Target bytes to replay from disk on startup after clean shutdown: "
+      "controls frequency of snapshots and checkpoints",
+      {.needs_restart = needs_restart::no,
+       .example = "2147483648",
+       .visibility = visibility::tunable},
+      10_GiB,
+      {.min = 128_MiB, .max = 1_TiB})
+  , storage_max_concurrent_replay(
+      *this,
+      "storage_max_concurrent_replay",
+      "Maximum number of partitions' logs that will be replayed concurrently "
+      "at startup, or flushed concurrently on shutdown.",
+      {.needs_restart = needs_restart::no,
+       .example = "2048",
+       .visibility = visibility::tunable},
+      1024,
+      {.min = 128})
+  , storage_compaction_index_memory(
+      *this,
+      "storage_compaction_index_memory",
+      "Maximum number of bytes that may be used on each shard by compaction"
+      "index writers",
+      {.needs_restart = needs_restart::no,
+       .example = "1073741824",
+       .visibility = visibility::tunable},
+      128_MiB,
+      {.min = 16_MiB, .max = 100_GiB})
   , max_compacted_log_segment_size(
       *this,
       "max_compacted_log_segment_size",
@@ -719,6 +901,17 @@ configuration::configuration()
        .example = "10737418240",
        .visibility = visibility::tunable},
       5_GiB)
+  , storage_ignore_timestamps_in_future_sec(
+      *this,
+      "storage_ignore_timestamps_in_future_sec",
+      "If set, timestamps more than this many seconds in the future relative to"
+      "the server's clock will be ignored for data retention purposes, and "
+      "retention will act based on another timestamp in the same segment, or "
+      "the mtime of the segment file if no valid timestamp is available",
+      {.needs_restart = needs_restart::no,
+       .example = "3600",
+       .visibility = visibility::tunable},
+      std::nullopt)
   , id_allocator_log_capacity(
       *this,
       "id_allocator_log_capacity",
@@ -737,9 +930,66 @@ configuration::configuration()
   , enable_sasl(
       *this,
       "enable_sasl",
-      "Enable SASL authentication for Kafka connections.",
+      "Enable SASL authentication for Kafka connections, authorization is "
+      "required. see also `kafka_enable_authorization`",
       {.needs_restart = needs_restart::no, .visibility = visibility::user},
       false)
+  , sasl_mechanisms(
+      *this,
+      "sasl_mechanisms",
+      "A list of supported SASL mechanisms. `SCRAM` and `GSSAPI` are allowed.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      {"SCRAM"},
+      validate_sasl_mechanisms)
+  , sasl_kerberos_config(
+      *this,
+      "sasl_kerberos_config",
+      "The location of the Kerberos krb5.conf file for Redpanda",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      "/etc/krb5.conf")
+  , sasl_kerberos_keytab(
+      *this,
+      "sasl_kerberos_keytab",
+      "The location of the Kerberos keytab file for Redpanda",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      "/var/lib/redpanda/redpanda.keytab")
+  , sasl_kerberos_principal(
+      *this,
+      "sasl_kerberos_principal",
+      "The primary of the Kerberos Service Principal Name (SPN) for Redpanda",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      "redpanda",
+      &validate_non_empty_string_opt)
+  , sasl_kerberos_principal_mapping(
+      *this,
+      "sasl_kerberos_principal_mapping",
+      "Rules for mapping Kerberos Principal Names to Redpanda User Principals",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      {"DEFAULT"},
+      security::validate_kerberos_mapping_rules)
+  , kafka_enable_authorization(
+      *this,
+      "kafka_enable_authorization",
+      "Enable authorization for Kafka connections. Values:"
+      "- `nil`: Ignored. Authorization is enabled with `enable_sasl: true`"
+      "; `true`: authorization is required"
+      "; `false`: authorization is disabled"
+      ". See also: `enable_sasl` and `kafka_api[].authentication_method`",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      std::nullopt)
+  , kafka_mtls_principal_mapping_rules(
+      *this,
+      "kafka_mtls_principal_mapping_rules",
+      "Principal Mapping Rules for mTLS Authentication on the Kafka API",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      std::nullopt,
+      security::tls::validate_rules)
+  , kafka_enable_partition_reassignment(
+      *this,
+      "kafka_enable_partition_reassignment",
+      "Enable the Kafka partition reassignment API",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      true)
   , controller_backend_housekeeping_interval_ms(
       *this,
       "controller_backend_housekeeping_interval_ms",
@@ -752,6 +1002,34 @@ configuration::configuration()
       "Timeout for executing node management operations",
       {.visibility = visibility::tunable},
       5s)
+  , kafka_request_max_bytes(
+      *this,
+      "kafka_request_max_bytes",
+      "Maximum size of a single request processed via Kafka API",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      100_MiB)
+  , kafka_batch_max_bytes(
+      *this,
+      "kafka_batch_max_bytes",
+      "Maximum size of a batch processed by server. If batch is compressed the "
+      "limit applies to compressed batch size",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1_MiB)
+  , kafka_nodelete_topics(
+      *this,
+      "kafka_nodelete_topics",
+      "Prevents the topics in the list from being deleted via the kafka api",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      {"__audit", "__consumer_offsets", "_schemas"},
+      &validate_non_empty_string_vec)
+  , kafka_noproduce_topics(
+      *this,
+      "kafka_noproduce_topics",
+      "Prevents the topics in the list from having message produced to them "
+      "via the kafka api",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      {"__audit"},
+      &validate_non_empty_string_vec)
   , compaction_ctrl_update_interval_ms(
       *this,
       "compaction_ctrl_update_interval_ms",
@@ -826,6 +1104,54 @@ configuration::configuration()
        .visibility = visibility::user},
       {},
       validate_connection_rate)
+  , kafka_client_group_byte_rate_quota(
+      *this,
+      "kafka_client_group_byte_rate_quota",
+      "Per-group target produce quota byte rate (bytes per second). "
+      "Client is considered part of the group if client_id contains "
+      "clients_prefix",
+      {.needs_restart = needs_restart::no,
+       .example
+       = R"([{'group_name': 'first_group','clients_prefix': 'group_1','quota': 10240}])",
+       .visibility = visibility::user},
+      {},
+      validate_client_groups_byte_rate_quota)
+  , kafka_client_group_fetch_byte_rate_quota(
+      *this,
+      "kafka_client_group_fetch_byte_rate_quota",
+      "Per-group target fetch quota byte rate (bytes per second). "
+      "Client is considered part of the group if client_id contains "
+      "clients_prefix",
+      {.needs_restart = needs_restart::no,
+       .example
+       = R"([{'group_name': 'first_group','clients_prefix': 'group_1','quota': 10240}])",
+       .visibility = visibility::user},
+      {},
+      validate_client_groups_byte_rate_quota)
+  , kafka_rpc_server_tcp_recv_buf(
+      *this,
+      "kafka_rpc_server_tcp_recv_buf",
+      "Kafka server TCP receive buffer size in bytes.",
+      {.example = "65536"},
+      std::nullopt,
+      {.min = 32_KiB, .align = 4_KiB})
+  , kafka_rpc_server_tcp_send_buf(
+      *this,
+      "kafka_rpc_server_tcp_send_buf",
+      "Kafka server TCP transmit buffer size in bytes.",
+      {.example = "65536"},
+      std::nullopt,
+      {.min = 32_KiB, .align = 4_KiB})
+  , kafka_rpc_server_stream_recv_buf(
+      *this,
+      "kafka_rpc_server_stream_recv_buf",
+      "Userspace receive buffer max size in bytes",
+      {.example = "65536", .visibility = visibility::tunable},
+      std::nullopt,
+      // The minimum is set to match seastar's min_buffer_size (i.e. don't
+      // permit setting a max below the min).  The maximum is set to forbid
+      // contiguous allocations beyond that size.
+      {.min = 512, .max = 512_KiB, .align = 4_KiB})
   , cloud_storage_enabled(
       *this,
       "cloud_storage_enabled",
@@ -835,51 +1161,70 @@ configuration::configuration()
   , cloud_storage_enable_remote_read(
       *this,
       "cloud_storage_enable_remote_read",
-      "Enable remote read for all topics",
-      {.visibility = visibility::tunable},
+      "Default remote read config value for new topics",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       false)
   , cloud_storage_enable_remote_write(
       *this,
       "cloud_storage_enable_remote_write",
-      "Enable remote write for all topics",
-      {.visibility = visibility::tunable},
+      "Default remote write value for new topics",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       false)
   , cloud_storage_access_key(
       *this,
       "cloud_storage_access_key",
       "AWS access key",
       {.visibility = visibility::user},
-      std::nullopt)
+      std::nullopt,
+      &validate_non_empty_string_opt)
   , cloud_storage_secret_key(
       *this,
       "cloud_storage_secret_key",
       "AWS secret key",
       {.visibility = visibility::user, .secret = is_secret::yes},
-      std::nullopt)
+      std::nullopt,
+      &validate_non_empty_string_opt)
   , cloud_storage_region(
       *this,
       "cloud_storage_region",
       "AWS region that houses the bucket used for storage",
       {.visibility = visibility::user},
-      std::nullopt)
+      std::nullopt,
+      &validate_non_empty_string_opt)
   , cloud_storage_bucket(
       *this,
       "cloud_storage_bucket",
       "AWS bucket that should be used to store data",
       {.visibility = visibility::user},
-      std::nullopt)
+      std::nullopt,
+      &validate_non_empty_string_opt)
   , cloud_storage_api_endpoint(
       *this,
       "cloud_storage_api_endpoint",
       "Optional API endpoint",
       {.visibility = visibility::user},
-      std::nullopt)
-  , cloud_storage_reconciliation_ms(
+      std::nullopt,
+      &validate_non_empty_string_opt)
+  , cloud_storage_credentials_source(
       *this,
-      "cloud_storage_reconciliation_interval_ms",
-      "Interval at which the archival service runs reconciliation (ms)",
+      "cloud_storage_credentials_source",
+      "The source of credentials to connect to cloud services",
+      {.needs_restart = needs_restart::yes,
+       .example = "config_file",
+       .visibility = visibility::user},
+      model::cloud_credentials_source::config_file,
+      {model::cloud_credentials_source::config_file,
+       model::cloud_credentials_source::aws_instance_metadata,
+       model::cloud_credentials_source::sts,
+       model::cloud_credentials_source::gcp_instance_metadata})
+  , cloud_storage_roles_operation_timeout_ms(
+      *this,
+      "cloud_storage_roles_operation_timeout_ms",
+      "Timeout for IAM role related operations (ms)",
       {.visibility = visibility::tunable},
-      1s)
+      30s)
+  , cloud_storage_reconciliation_ms(
+      *this, "cloud_storage_reconciliation_interval_ms")
   , cloud_storage_upload_loop_initial_backoff_ms(
       *this,
       "cloud_storage_upload_loop_initial_backoff_ms",
@@ -897,7 +1242,8 @@ configuration::configuration()
   , cloud_storage_max_connections(
       *this,
       "cloud_storage_max_connections",
-      "Max number of simultaneous uploads to S3",
+      "Max number of simultaneous connections to S3 per shard (includes "
+      "connections used for both uploads and downloads)",
       {.visibility = visibility::user},
       20)
   , cloud_storage_disable_tls(
@@ -918,7 +1264,8 @@ configuration::configuration()
       "Path to certificate that should be used to validate server certificate "
       "during TLS handshake",
       {.visibility = visibility::user},
-      std::nullopt)
+      std::nullopt,
+      &validate_non_empty_string_opt)
   , cloud_storage_initial_backoff_ms(
       *this,
       "cloud_storage_initial_backoff_ms",
@@ -950,6 +1297,150 @@ configuration::configuration()
       "remote storage (sec)",
       {.visibility = visibility::tunable},
       std::nullopt)
+  , cloud_storage_manifest_max_upload_interval_sec(
+      *this,
+      "cloud_storage_manifest_max_upload_interval_sec",
+      "Wait at least this long between partition manifest uploads. Actual time "
+      "between uploads may be greater than this interval. If this is null, "
+      "metadata will be updated after each segment upload.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      60s)
+  , cloud_storage_readreplica_manifest_sync_timeout_ms(
+      *this,
+      "cloud_storage_readreplica_manifest_sync_timeout_ms",
+      "Timeout to check if new data is available for partition in S3 for read "
+      "replica",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      30s)
+  , cloud_storage_metadata_sync_timeout_ms(
+      *this,
+      "cloud_storage_metadata_sync_timeout_ms",
+      "Timeout for SI metadata synchronization",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      10s)
+  , cloud_storage_housekeeping_interval_ms(
+      *this,
+      "cloud_storage_housekeeping_interval_ms",
+      "Interval for cloud storage housekeeping tasks",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      5min)
+  , cloud_storage_idle_timeout_ms(
+      *this,
+      "cloud_storage_idle_timeout_ms",
+      "Timeout used to detect idle state of the cloud storage API. If the "
+      "average cloud storage request rate is below this threshold for a "
+      "configured amount of time the cloud storage is considered idle and the "
+      "housekeeping jobs are started.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      10s)
+  , cloud_storage_idle_threshold_rps(
+      *this,
+      "cloud_storage_idle_threshold_rps",
+      "The cloud storage request rate threshold for idle state detection. If "
+      "the average request rate for the configured period is lower than this "
+      "threshold the cloud storage is considered being idle.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1.0)
+  , cloud_storage_enable_segment_merging(
+      *this,
+      "cloud_storage_enable_segment_merging",
+      "Enables adjacent segment merging. The segments are reuploaded if there "
+      "is an opportunity for that and if it will improve the tiered-storage "
+      "performance",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      true)
+  , cloud_storage_max_segments_pending_deletion_per_partition(
+      *this,
+      "cloud_storage_max_segments_pending_deletion_per_partition",
+      "The per-partition limit for the number of segments pending deletion "
+      "from the cloud. Segments can be deleted due to retention or compaction. "
+      "If this limit is breached and deletion fails, then segments will be "
+      "orphaned in the cloud and will have to be removed manually",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      5000)
+  , cloud_storage_enable_compacted_topic_reupload(
+      *this,
+      "cloud_storage_enable_compacted_topic_reupload",
+      "Enable re-uploading data for compacted topics",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      true)
+  , cloud_storage_recovery_temporary_retention_bytes_default(
+      *this,
+      "cloud_storage_recovery_temporary_retention_bytes_default",
+      "Retention in bytes for topics created during automated recovery",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1_GiB)
+  , cloud_storage_segment_size_target(
+      *this,
+      "cloud_storage_segment_size_target",
+      "Desired segment size in the cloud storage. Default: segment.bytes",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::nullopt)
+  , cloud_storage_segment_size_min(
+      *this,
+      "cloud_storage_segment_size_min",
+      "Smallest acceptable segment size in the cloud storage. Default: "
+      "cloud_storage_segment_size_target/2",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::nullopt)
+  , cloud_storage_graceful_transfer_timeout_ms(
+      *this,
+      "cloud_storage_graceful_transfer_timeout",
+      "Time limit on waiting for uploads to complete before a leadership "
+      "transfer.  If this is null, leadership transfers will proceed without "
+      "waiting.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      5s)
+  , cloud_storage_backend(
+      *this,
+      "cloud_storage_backend",
+      "Optional cloud storage backend variant used to select API capabilities. "
+      "If not supplied, will be inferred from other configuration parameters.",
+      {.needs_restart = needs_restart::yes,
+       .example = "aws",
+       .visibility = visibility::user},
+      model::cloud_storage_backend::unknown,
+      {model::cloud_storage_backend::aws,
+       model::cloud_storage_backend::google_s3_compat,
+       model::cloud_storage_backend::azure,
+       model::cloud_storage_backend::minio,
+       model::cloud_storage_backend::unknown})
+  , cloud_storage_credentials_host(
+      *this,
+      "cloud_storage_credentials_host",
+      "The hostname to connect to for retrieving role based credentials. "
+      "Derived from cloud_storage_credentials_source if not set. Only required "
+      "when using IAM role based access.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      std::nullopt,
+      &validate_non_empty_string_opt)
+  , cloud_storage_azure_storage_account(
+      *this,
+      "cloud_storage_azure_storage_account",
+      "The name of the Azure storage account to use with Tiered Storage",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::user},
+      std::nullopt,
+      &validate_non_empty_string_opt)
+  , cloud_storage_azure_container(
+      *this,
+      "cloud_storage_azure_container",
+      "The name of the Azure container to use with Tiered Storage. Note that "
+      "the container must belong to 'cloud_storage_azure_storage_account'",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::user},
+      std::nullopt,
+      &validate_non_empty_string_opt)
+  , cloud_storage_azure_shared_key(
+      *this,
+      "cloud_storage_azure_shared_key",
+      "The shared key to be used for Azure Shared Key authentication with the "
+      "configured Azure storage account (see "
+      "'cloud_storage_azure_storage_account)'. Note that Redpanda expects this "
+      "string to be Base64 encoded.",
+      {.needs_restart = needs_restart::no,
+       .visibility = visibility::user,
+       .secret = is_secret::yes},
+      std::nullopt,
+      &validate_non_empty_string_opt)
   , cloud_storage_upload_ctrl_update_interval_ms(
       *this,
       "cloud_storage_upload_ctrl_update_interval_ms",
@@ -980,18 +1471,50 @@ configuration::configuration()
       "maximum number of IO and CPU shares that archival upload can use",
       {.visibility = visibility::tunable},
       1000)
+  , retention_local_target_bytes_default(
+      *this,
+      "retention_local_target_bytes_default",
+      "Local retention size target for partitions of topics with cloud storage "
+      "write enabled",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      std::nullopt)
+  , retention_local_target_ms_default(
+      *this,
+      "retention_local_target_ms_default",
+      "Local retention time target for partitions of topics with cloud storage "
+      "write enabled",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      24h)
   , cloud_storage_cache_size(
       *this,
       "cloud_storage_cache_size",
       "Max size of archival cache",
-      {.visibility = visibility::user},
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
       20_GiB)
   , cloud_storage_cache_check_interval_ms(
       *this,
       "cloud_storage_cache_check_interval",
-      "Timeout to check if cache eviction should be triggered",
+      "Minimum time between trims of tiered storage cache.  If a fetch "
+      "operation requires trimming the cache, and the most recent trim was "
+      "within this period, then trimming will be delayed until this period has "
+      "elapsed",
       {.visibility = visibility::tunable},
-      30s)
+      5s)
+  , cloud_storage_max_readers_per_shard(
+      *this,
+      "cloud_storage_max_readers_per_shard",
+      "Maximum concurrent readers of remote data per CPU core.  If unset, "
+      "value of `topic_partitions_per_shard` is used, i.e. one reader per "
+      "partition if the shard is at its maximum partition capacity.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::nullopt)
+  , cloud_storage_max_materialized_segments_per_shard(
+      *this,
+      "cloud_storage_max_materialized_segments_per_shard",
+      "Maximum concurrent readers of remote data per CPU core.  If unset, "
+      "value of `topic_partitions_per_shard` multiplied by 2 is used.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::nullopt)
   , superusers(
       *this,
       "superusers",
@@ -1074,14 +1597,75 @@ configuration::configuration()
       *this,
       "enable_auto_rebalance_on_node_add",
       "Enable automatic partition rebalancing when new nodes are added",
-      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      {.needs_restart = needs_restart::no,
+       .visibility = visibility::deprecated},
       false)
+
+  , partition_autobalancing_mode(
+      *this,
+      "partition_autobalancing_mode",
+      "Partition autobalancing mode",
+      {.needs_restart = needs_restart::no,
+       .example = "node_add",
+       .visibility = visibility::user},
+      model::partition_autobalancing_mode::node_add,
+      {
+        model::partition_autobalancing_mode::off,
+        model::partition_autobalancing_mode::node_add,
+        model::partition_autobalancing_mode::continuous,
+      })
+  , partition_autobalancing_node_availability_timeout_sec(
+      *this,
+      "partition_autobalancing_node_availability_timeout_sec",
+      "Node unavailability timeout that triggers moving partitions from the "
+      "node",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      15min)
+  , partition_autobalancing_max_disk_usage_percent(
+      *this,
+      "partition_autobalancing_max_disk_usage_percent",
+      "Disk usage threshold that triggers moving partitions from the node",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      80,
+      {.min = 5, .max = 100})
+  , partition_autobalancing_tick_interval_ms(
+      *this,
+      "partition_autobalancing_tick_interval_ms",
+      "Partition autobalancer tick interval",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      30s)
+  , partition_autobalancing_movement_batch_size_bytes(
+      *this,
+      "partition_autobalancing_movement_batch_size_bytes",
+      "Total size of partitions that autobalancer is going to move in one "
+      "batch",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      5_GiB)
+  , partition_autobalancing_concurrent_moves(
+      *this,
+      "partition_autobalancing_concurrent_moves",
+      "Number of partitions that can be reassigned at once",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      50)
   , enable_leader_balancer(
       *this,
       "enable_leader_balancer",
       "Enable automatic leadership rebalancing",
       {.needs_restart = needs_restart::no, .visibility = visibility::user},
       true)
+  , leader_balancer_mode(
+      *this,
+      "leader_balancer_mode",
+      "Leader balancer mode",
+      {.needs_restart = needs_restart::no,
+       .example = model::leader_balancer_mode_to_string(
+         model::leader_balancer_mode::random_hill_climbing),
+       .visibility = visibility::user},
+      model::leader_balancer_mode::random_hill_climbing,
+      {
+        model::leader_balancer_mode::greedy_balanced_shards,
+        model::leader_balancer_mode::random_hill_climbing,
+      })
   , leader_balancer_idle_timeout(
       *this,
       "leader_balancer_idle_timeout",
@@ -1100,6 +1684,13 @@ configuration::configuration()
       "Leadership rebalancing node mute timeout",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       20s)
+  , leader_balancer_transfer_limit_per_shard(
+      *this,
+      "leader_balancer_transfer_limit_per_shard",
+      "Per shard limit for in progress leadership transfers",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      512,
+      {.min = 1, .max = 2048})
   , internal_topic_replication_factor(
       *this,
       "internal_topic_replication_factor",
@@ -1116,7 +1707,8 @@ configuration::configuration()
       *this,
       "health_monitor_tick_interval",
       "How often health monitor refresh cluster state",
-      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      {.needs_restart = needs_restart::no,
+       .visibility = visibility::deprecated},
       10s)
   , health_monitor_max_metadata_age(
       *this,
@@ -1131,16 +1723,37 @@ configuration::configuration()
       "alert",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       5,
-      {.min = cluster::node::min_percent_free_threshold,
-       .max = cluster::node::max_percent_free_threshold})
+      {.min = 0, .max = 50})
   , storage_space_alert_free_threshold_bytes(
       *this,
       "storage_space_alert_free_threshold_bytes",
       "Threshold of minimim bytes free space before setting storage space "
       "alert",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      1_GiB,
-      {.min = cluster::node::min_bytes_free_threshold})
+      0,
+      {.min = 0})
+  , storage_min_free_bytes(
+      *this,
+      "storage_min_free_bytes",
+      "Threshold of minimum bytes free space before rejecting producers.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      5_GiB,
+      {.min = 10_MiB})
+  , storage_strict_data_init(
+      *this,
+      "storage_strict_data_init",
+      "Requires that an empty file named `.redpanda_data_dir` be present in "
+      "the data directory. Redpanda will refuse to start if it is not found.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      false)
+  , memory_abort_on_alloc_failure(
+      *this,
+      "memory_abort_on_alloc_failure",
+      "If true, the redpanda process will terminate immediately when an "
+      "allocation cannot be satisfied due to memory exhasution. If false, an "
+      "exception is thrown instead.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      true)
   , enable_metrics_reporter(
       *this,
       "enable_metrics_reporter",
@@ -1177,7 +1790,166 @@ configuration::configuration()
       "enable_rack_awareness",
       "Enables rack-aware replica assignment",
       {.needs_restart = needs_restart::no, .visibility = visibility::user},
-      false) {}
+      false)
+  , node_status_interval(
+      *this,
+      "node_status_interval",
+      "Time interval between two node status messages. Node status messages "
+      "establish liveness status outside of the Raft protocol.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      100ms)
+  , enable_controller_log_rate_limiting(
+      *this,
+      "enable_controller_log_rate_limiting",
+      "Enables limiting of controller log write rate",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      false)
+  , rps_limit_topic_operations(
+      *this,
+      "rps_limit_topic_operations",
+      "Rate limit for controller topic operations",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1000)
+  , controller_log_accummulation_rps_capacity_topic_operations(
+      *this,
+      "controller_log_accummulation_rps_capacity_topic_operations",
+      "Maximum capacity of rate limit accumulation"
+      "in controller topic operations limit",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::nullopt)
+  , rps_limit_acls_and_users_operations(
+      *this,
+      "rps_limit_acls_and_users_operations",
+      "Rate limit for controller acls and users operations",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1000)
+  , controller_log_accummulation_rps_capacity_acls_and_users_operations(
+      *this,
+      "controller_log_accummulation_rps_capacity_acls_and_users_operations",
+      "Maximum capacity of rate limit accumulation"
+      "in controller acls and users operations limit",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::nullopt)
+  , rps_limit_node_management_operations(
+      *this,
+      "rps_limit_node_management_operations",
+      "Rate limit for controller node management operations",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1000)
+  , controller_log_accummulation_rps_capacity_node_management_operations(
+      *this,
+      "controller_log_accummulation_rps_capacity_node_management_operations",
+      "Maximum capacity of rate limit accumulation"
+      "in controller node management operations limit",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::nullopt)
+  , rps_limit_move_operations(
+      *this,
+      "rps_limit_move_operations",
+      "Rate limit for controller move operations",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1000)
+  , controller_log_accummulation_rps_capacity_move_operations(
+      *this,
+      "controller_log_accummulation_rps_capacity_move_operations",
+      "Maximum capacity of rate limit accumulation"
+      "in controller move operations limit",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::nullopt)
+  , rps_limit_configuration_operations(
+      *this,
+      "rps_limit_configuration_operations",
+      "Rate limit for controller configuration operations",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1000)
+  , controller_log_accummulation_rps_capacity_configuration_operations(
+      *this,
+      "controller_log_accummulation_rps_capacity_configuration_operations",
+      "Maximum capacity of rate limit accumulation"
+      "in controller configuration operations limit",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::nullopt)
+  , kafka_throughput_limit_node_in_bps(
+      *this,
+      "kafka_throughput_limit_node_in_bps",
+      "Node wide throughput ingress limit - maximum kafka traffic throughput "
+      "allowed on the ingress side of each node, in bytes/s. Default is no "
+      "limit.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      std::nullopt,
+      {.min = 1})
+  , kafka_throughput_limit_node_out_bps(
+      *this,
+      "kafka_throughput_limit_node_out_bps",
+      "Node wide throughput egress limit - maximum kafka traffic throughput "
+      "allowed on the egress side of each node, in bytes/s. Default is no "
+      "limit.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      std::nullopt,
+      {.min = 1})
+  , kafka_quota_balancer_window(
+      *this,
+      "kafka_quota_balancer_window_ms",
+      "Time window used to average current throughput measurement for quota "
+      "balancer, in milliseconds",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      5000ms,
+      {.min = 1ms, .max = bottomless_token_bucket::max_width})
+  , kafka_quota_balancer_node_period(
+      *this,
+      "kafka_quota_balancer_node_period_ms",
+      "Intra-node throughput quota balancer invocation period, in "
+      "milliseconds. Value of 0 disables the balancer and makes all the "
+      "throughput quotas immutable.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      750ms,
+      {.min = 0ms})
+  , kafka_quota_balancer_min_shard_throughput_ratio(
+      *this,
+      "kafka_quota_balancer_min_shard_throughput_ratio",
+      "The lowest value of the throughput quota a shard can get in the process "
+      "of quota balancing, expressed as a ratio of default shard quota. "
+      "0 means there is no minimum, 1 means no quota can be taken away "
+      "by the balancer.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      0.01,
+      &validate_0_to_1_ratio)
+  , kafka_quota_balancer_min_shard_throughput_bps(
+      *this,
+      "kafka_quota_balancer_min_shard_throughput_bps",
+      "The lowest value of the throughput quota a shard can get in the process "
+      "of quota balancing, in bytes/s. 0 means there is no minimum.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      256,
+      {.min = 0})
+  , node_isolation_heartbeat_timeout(
+      *this,
+      "node_isolation_heartbeat_timeout",
+      "How long after the last heartbeat request a node will wait before "
+      "considering itself to be isolated",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      3000,
+      {.min = 100, .max = 10000})
+  , controller_snapshot_max_age_sec(
+      *this,
+      "controller_snapshot_max_age_sec",
+      "Max time that will pass before we make an attempt to create a "
+      "controller snapshot, after a new controller command appears",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      60s)
+  , legacy_permit_unsafe_log_operation(
+      *this,
+      "legacy_permit_unsafe_log_operation",
+      "Permits the use of strings that may induct log injection/modification",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      true)
+  , legacy_unsafe_log_warning_interval_sec(
+      *this,
+      "legacy_unsafe_log_warning_interval_sec",
+      "Interval, in seconds, of how often a message informing the operator "
+      "that unsafe strings are permitted",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      300s) {}
 
 configuration::error_map_t configuration::load(const YAML::Node& root_node) {
     if (!root_node["redpanda"]) {

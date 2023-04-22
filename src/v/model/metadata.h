@@ -14,6 +14,7 @@
 #include "model/fundamental.h"
 #include "net/unresolved_address.h"
 #include "seastarx.h"
+#include "serde/envelope.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/sstring.hh>
@@ -22,7 +23,9 @@
 #include <bits/stdint-intn.h>
 #include <boost/functional/hash.hpp>
 
+#include <compare>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -30,6 +33,14 @@
 
 namespace model {
 using node_id = named_type<int32_t, struct node_id_model_type>;
+
+/**
+ * Reserved to represent the node_id value yet to be assigned
+ * when node is configured for automatic assignment of node_ids.
+ * Never used in node configuration.
+ */
+constexpr node_id unassigned_node_id(-1);
+
 /**
  * We use revision_id to identify entities evolution in time. f.e. NTP that was
  * first created and then removed, raft configuration
@@ -46,7 +57,9 @@ using initial_revision_id
 
 /// Rack id type
 using rack_id = named_type<ss::sstring, struct rack_id_model_type>;
-struct broker_properties {
+struct broker_properties
+  : serde::
+      envelope<broker_properties, serde::version<0>, serde::compat_version<0>> {
     uint32_t cores;
     uint32_t available_memory_gb;
     uint32_t available_disk_gb;
@@ -61,13 +74,26 @@ struct broker_properties {
                && mount_paths == other.mount_paths
                && etc_props == other.etc_props;
     }
+
+    friend std::ostream&
+    operator<<(std::ostream&, const model::broker_properties&);
+
+    auto serde_fields() {
+        return std::tie(
+          cores,
+          available_memory_gb,
+          available_disk_gb,
+          mount_paths,
+          etc_props);
+    }
 };
 
-struct broker_endpoint final {
+struct broker_endpoint final
+  : serde::
+      envelope<broker_endpoint, serde::version<0>, serde::compat_version<0>> {
     ss::sstring name;
     net::unresolved_address address;
 
-    // required for yaml serde
     broker_endpoint() = default;
 
     broker_endpoint(ss::sstring name, net::unresolved_address address) noexcept
@@ -79,11 +105,9 @@ struct broker_endpoint final {
 
     bool operator==(const broker_endpoint&) const = default;
     friend std::ostream& operator<<(std::ostream&, const broker_endpoint&);
+
+    auto serde_fields() { return std::tie(name, address); }
 };
-
-std::ostream& operator<<(std::ostream&, const broker_endpoint&);
-
-enum class violation_recovery_policy { crash = 0, best_effort };
 
 /**
  * Node membership can be in one of three states: active, draining and removed.
@@ -128,9 +152,14 @@ enum class membership_state : int8_t { active, draining, removed };
 enum class maintenance_state { active, inactive };
 
 std::ostream& operator<<(std::ostream&, membership_state);
+std::ostream& operator<<(std::ostream&, maintenance_state);
 
-class broker {
+class broker
+  : public serde::
+      envelope<broker, serde::version<0>, serde::compat_version<0>> {
 public:
+    broker() noexcept = default;
+
     broker(
       node_id id,
       std::vector<broker_endpoint> kafka_advertised_listeners,
@@ -158,6 +187,7 @@ public:
 
     broker(broker&&) noexcept = default;
     broker& operator=(broker&&) noexcept = default;
+    broker& operator=(const broker&) noexcept = default;
     broker(const broker&) = default;
     const node_id& id() const { return _id; }
 
@@ -168,18 +198,20 @@ public:
     const net::unresolved_address& rpc_address() const { return _rpc_address; }
     const std::optional<rack_id>& rack() const { return _rack; }
 
-    membership_state get_membership_state() const { return _membership_state; }
-    void set_membership_state(membership_state st) { _membership_state = st; }
-
-    maintenance_state get_maintenance_state() const {
-        return _maintenance_state;
-    }
-    void set_maintenance_state(maintenance_state st) {
-        _maintenance_state = st;
+    void replace_unassigned_node_id(const node_id id) {
+        vassert(
+          _id == unassigned_node_id,
+          "Cannot replace an assigned node_id in model::broker");
+        _id = id;
     }
 
     bool operator==(const model::broker& other) const = default;
     bool operator<(const model::broker& other) const { return _id < other._id; }
+
+    auto serde_fields() {
+        return std::tie(
+          _id, _kafka_advertised_listeners, _rpc_address, _rack, _properties);
+    }
 
 private:
     node_id _id;
@@ -187,14 +219,9 @@ private:
     net::unresolved_address _rpc_address;
     std::optional<rack_id> _rack;
     broker_properties _properties;
-    // in memory state, not serialized
-    membership_state _membership_state = membership_state::active;
-    maintenance_state _maintenance_state{maintenance_state::inactive};
 
     friend std::ostream& operator<<(std::ostream&, const broker&);
 };
-
-std::ostream& operator<<(std::ostream&, const broker&);
 
 /// type representing single replica assignment it contains the id of a broker
 /// and id of this broker shard.
@@ -206,14 +233,32 @@ struct broker_shard {
     uint32_t shard;
     friend std::ostream& operator<<(std::ostream&, const broker_shard&);
     bool operator==(const broker_shard&) const = default;
+    auto operator<=>(const model::broker_shard&) const = default;
 
     template<typename H>
     friend H AbslHashValue(H h, const broker_shard& s) {
         return H::combine(std::move(h), s.node_id(), s.shard);
     }
+
+    friend void write(iobuf& out, broker_shard bs) {
+        using serde::write;
+        write(out, bs.node_id);
+        write(out, bs.shard);
+    }
+
+    friend void read_nested(
+      iobuf_parser& in, broker_shard& bs, std::size_t const bytes_left_limit) {
+        using serde::read_nested;
+        read_nested(in, bs.node_id, bytes_left_limit);
+        read_nested(in, bs.shard, bytes_left_limit);
+    }
 };
 
-struct partition_metadata {
+struct partition_metadata
+  : serde::envelope<
+      partition_metadata,
+      serde::version<0>,
+      serde::compat_version<0>> {
     partition_metadata() noexcept = default;
     explicit partition_metadata(partition_id p) noexcept
       : id(p) {}
@@ -222,6 +267,10 @@ struct partition_metadata {
     std::optional<model::node_id> leader_node;
 
     friend std::ostream& operator<<(std::ostream&, const partition_metadata&);
+    friend bool operator==(const partition_metadata&, const partition_metadata&)
+      = default;
+
+    auto serde_fields() { return std::tie(id, replicas, leader_node); }
 };
 
 enum class isolation_level : int8_t {
@@ -249,6 +298,8 @@ struct topic_namespace_view {
 };
 
 struct topic_namespace {
+    topic_namespace() = default;
+
     topic_namespace(model::ns n, model::topic t)
       : ns(std::move(n))
       , tp(std::move(t)) {}
@@ -275,14 +326,26 @@ struct topic_namespace {
         return H::combine(std::move(h), tp_ns.ns, tp_ns.tp);
     }
 
+    friend void write(iobuf& out, topic_namespace t) {
+        using serde::write;
+        write(out, std::move(t.ns));
+        write(out, std::move(t.tp));
+    }
+
+    friend void read_nested(
+      iobuf_parser& in,
+      topic_namespace& t,
+      std::size_t const bytes_left_limit) {
+        using serde::read_nested;
+        read_nested(in, t.ns, bytes_left_limit);
+        read_nested(in, t.tp, bytes_left_limit);
+    }
+
     model::ns ns;
     model::topic tp;
 
     friend std::ostream& operator<<(std::ostream&, const topic_namespace&);
 };
-
-std::ostream& operator<<(std::ostream&, const topic_namespace&);
-std::ostream& operator<<(std::ostream&, const topic_namespace_view&);
 
 struct topic_namespace_hash {
     using is_transparent = void;
@@ -319,24 +382,91 @@ struct topic_namespace_eq {
     }
 };
 
-struct topic_metadata {
+struct topic_metadata
+  : serde::
+      envelope<topic_metadata, serde::version<0>, serde::compat_version<0>> {
+    topic_metadata() noexcept = default;
     explicit topic_metadata(topic_namespace v) noexcept
       : tp_ns(std::move(v)) {}
     topic_namespace tp_ns;
     std::vector<partition_metadata> partitions;
 
     friend std::ostream& operator<<(std::ostream&, const topic_metadata&);
+    friend bool operator==(const topic_metadata&, const topic_metadata&)
+      = default;
+
+    auto serde_fields() { return std::tie(tp_ns, partitions); }
+};
+
+enum class cloud_credentials_source {
+    config_file = 0,
+    aws_instance_metadata = 1,
+    sts = 2,
+    gcp_instance_metadata = 3,
+};
+
+std::ostream& operator<<(std::ostream& os, const cloud_credentials_source& cs);
+
+enum class partition_autobalancing_mode {
+    off = 0,
+    node_add,
+    continuous,
 };
 
 inline std::ostream&
-operator<<(std::ostream& o, const model::violation_recovery_policy& x) {
-    switch (x) {
-    case model::violation_recovery_policy::best_effort:
-        return o << "best_effort";
-    case model::violation_recovery_policy::crash:
-        return o << "crash";
+operator<<(std::ostream& o, const partition_autobalancing_mode& m) {
+    switch (m) {
+    case model::partition_autobalancing_mode::off:
+        return o << "off";
+    case model::partition_autobalancing_mode::node_add:
+        return o << "node_add";
+    case model::partition_autobalancing_mode::continuous:
+        return o << "continuous";
     }
 }
+
+enum class cloud_storage_backend {
+    aws = 0,
+    google_s3_compat = 1,
+    azure = 2,
+    minio = 3,
+    unknown = 4,
+};
+
+inline std::ostream& operator<<(std::ostream& os, cloud_storage_backend csb) {
+    switch (csb) {
+    case cloud_storage_backend::aws:
+        return os << "aws";
+    case cloud_storage_backend::google_s3_compat:
+        return os << "google_s3_compat";
+    case cloud_storage_backend::azure:
+        return os << "azure";
+    case cloud_storage_backend::minio:
+        return os << "minio";
+    case cloud_storage_backend::unknown:
+        return os << "unknown";
+    }
+}
+
+enum class leader_balancer_mode : uint8_t {
+    greedy_balanced_shards = 0,
+    random_hill_climbing = 1,
+};
+
+constexpr const char*
+leader_balancer_mode_to_string(leader_balancer_mode mode) {
+    switch (mode) {
+    case leader_balancer_mode::greedy_balanced_shards:
+        return "greedy_balanced_shards";
+    case leader_balancer_mode::random_hill_climbing:
+        return "random_hill_climbing";
+    default:
+        throw std::invalid_argument("unknown leader_balancer_mode");
+    }
+}
+
+std::ostream& operator<<(std::ostream&, leader_balancer_mode);
+std::istream& operator>>(std::istream&, leader_balancer_mode&);
 
 namespace internal {
 /*
@@ -357,6 +487,25 @@ struct broker_v0 {
 
 } // namespace internal
 } // namespace model
+
+template<>
+struct fmt::formatter<model::isolation_level> final
+  : fmt::formatter<std::string_view> {
+    using isolation_level = model::isolation_level;
+    template<typename FormatContext>
+    auto format(const isolation_level& s, FormatContext& ctx) const {
+        std::string_view str = "unknown";
+        switch (s) {
+        case isolation_level::read_uncommitted:
+            str = "read_uncommitted";
+            break;
+        case isolation_level::read_committed:
+            str = "read_committed";
+            break;
+        }
+        return formatter<string_view>::format(str, ctx);
+    }
+};
 
 namespace std {
 template<>

@@ -16,7 +16,6 @@
 #include "kafka/protocol/fetch.h"
 #include "kafka/types.h"
 #include "model/fundamental.h"
-#include "storage/tests/utils/random_batch.h"
 
 #include <seastar/testing/thread_test_case.hh>
 
@@ -31,8 +30,8 @@ make_record_set(model::offset offset, std::optional<size_t> count) {
         return std::nullopt;
     }
     iobuf record_set;
-    auto writer{kafka::response_writer(record_set)};
-    kafka::writer_serialize_batch(writer, make_batch(offset, *count));
+    auto writer{kafka::protocol::encoder(record_set)};
+    kafka::protocol::writer_serialize_batch(writer, make_batch(offset, *count));
     return kafka::batch_reader{std::move(record_set)};
 }
 

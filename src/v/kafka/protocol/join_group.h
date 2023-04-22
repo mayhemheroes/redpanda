@@ -23,15 +23,6 @@
 
 namespace kafka {
 
-struct join_group_response;
-
-struct join_group_api final {
-    using response_type = join_group_response;
-
-    static constexpr const char* name = "join group";
-    static constexpr api_key key = api_key(11);
-};
-
 struct join_group_request final {
     using api_type = join_group_api;
 
@@ -69,18 +60,19 @@ struct join_group_request final {
         return res;
     }
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
-};
 
-inline std::ostream& operator<<(std::ostream& os, const join_group_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const join_group_request& r) {
+        return os << r.data;
+    }
+};
 
 static inline const kafka::member_id no_member("");
 static inline const kafka::member_id no_leader("");
@@ -120,30 +112,24 @@ struct join_group_response final {
         data.members = std::move(members);
     }
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
+
+    friend std::ostream&
+    operator<<(std::ostream& os, const join_group_response& r) {
+        return os << r.data;
+    }
 };
 
 inline join_group_response
-_make_join_error(kafka::member_id member_id, error_code error) {
+make_join_error(kafka::member_id member_id, error_code error) {
     return join_group_response(
       error, no_generation, no_protocol, no_leader, std::move(member_id));
-}
-
-inline ss::future<join_group_response>
-make_join_error(kafka::member_id member_id, error_code error) {
-    return ss::make_ready_future<join_group_response>(
-      _make_join_error(std::move(member_id), error));
-}
-
-inline std::ostream&
-operator<<(std::ostream& os, const join_group_response& r) {
-    return os << r.data;
 }
 
 // group membership helper to compare a protocol set from the wire with our

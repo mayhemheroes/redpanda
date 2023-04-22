@@ -16,33 +16,24 @@
 
 namespace kafka {
 
-struct delete_groups_response;
-
-struct delete_groups_api final {
-    using response_type = delete_groups_response;
-
-    static constexpr const char* name = "delete groups";
-    static constexpr api_key key = api_key(42);
-};
-
 struct delete_groups_request final {
     using api_type = delete_groups_api;
 
     delete_groups_request_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const delete_groups_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const delete_groups_request& r) {
+        return os << r.data;
+    }
+};
 
 struct delete_groups_response final {
     using api_type = delete_groups_api;
@@ -54,18 +45,18 @@ struct delete_groups_response final {
         data.results = std::move(results);
     }
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const delete_groups_response& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const delete_groups_response& r) {
+        return os << r.data;
+    }
+};
 
 } // namespace kafka

@@ -20,6 +20,7 @@
 #include "coproc/partition_manager.h"
 #include "coproc/script_database.h"
 #include "model/metadata.h"
+#include "rpc/connection_cache.h"
 #include "storage/api.h"
 
 #include <seastar/core/coroutine.hh>
@@ -78,7 +79,7 @@ reconciliation_backend::reconciliation_backend(
   ss::sharded<partition_manager>& coproc_pm,
   ss::sharded<pacemaker>& pacemaker,
   ss::sharded<wasm::script_database>& sdb) noexcept
-  : _self(model::node_id(config::node().node_id))
+  : _self(model::node_id(*config::node().node_id()))
   , _data_directory(config::node().data_directory().as_sstring())
   , _topics(topics)
   , _shard_table(shard_table)
@@ -87,10 +88,11 @@ reconciliation_backend::reconciliation_backend(
   , _pacemaker(pacemaker)
   , _sdb(sdb) {}
 
-void reconciliation_backend::enqueue_events(std::vector<update_t> deltas) {
+void reconciliation_backend::enqueue_events(
+  cluster::topic_table::delta_range_t deltas) {
     for (auto& d : deltas) {
         if (is_non_replicable_event(d.type)) {
-            _topic_deltas[d.ntp].push_back(std::move(d));
+            _topic_deltas[d.ntp].push_back(d);
         } else {
             /// Obtain all child ntps from the source, and key
             /// by materialized ntps, otherwise out of order
@@ -106,9 +108,9 @@ void reconciliation_backend::enqueue_events(std::vector<update_t> deltas) {
 
 ss::future<> reconciliation_backend::start() {
     _id_cb = _topics.local().register_delta_notification(
-      [this](std::vector<update_t> deltas) {
+      [this](cluster::topic_table::delta_range_t deltas) {
           if (!_gate.is_closed()) {
-              enqueue_events(std::move(deltas));
+              enqueue_events(deltas);
           } else {
               vlog(
                 coproclog.debug,
@@ -193,33 +195,58 @@ ss::future<std::error_code>
 reconciliation_backend::process_update(model::ntp ntp, update_t delta) {
     using op_t = update_t::op_type;
     model::revision_id rev(delta.offset());
-    const auto& replicas = delta.type == op_t::update
-                             ? delta.previous_assignment->replicas
-                             : delta.new_assignment.replicas;
-    if (!cluster::has_local_replicas(_self, replicas)) {
-        return ss::make_ready_future<std::error_code>(errc::success);
-    }
-
     switch (delta.type) {
     case op_t::add_non_replicable:
-        return create_non_replicable_partition(
+        if (!cluster::has_local_replicas(
+              _self, delta.new_assignment.replicas)) {
+            co_return errc::success;
+        }
+        co_return co_await create_non_replicable_partition(
           delta.ntp, rev, delta.new_assignment.replicas);
     case op_t::del_non_replicable:
-        return delete_non_replicable_partition(delta.ntp, rev);
+        if (!cluster::has_local_replicas(
+              _self, delta.new_assignment.replicas)) {
+            co_return errc::success;
+        }
+        co_return co_await delete_non_replicable_partition(delta.ntp, rev);
     case op_t::update:
-        return process_shutdown(
+        if (!cluster::has_local_replicas(
+              _self, delta.previous_replica_set.value())) {
+            co_return errc::success;
+        }
+        co_return co_await process_shutdown(
           delta.ntp, ntp, rev, std::move(delta.new_assignment.replicas));
     case op_t::update_finished:
-        return process_restart(
+        if (!cluster::has_local_replicas(
+              _self, delta.new_assignment.replicas)) {
+            co_return errc::success;
+        }
+        co_return co_await process_restart(
           delta.ntp, ntp, rev, delta.new_assignment.replicas);
+    case op_t::reset: {
+        const auto& prev_replicas = delta.previous_replica_set.value();
+        const auto& new_replicas = delta.new_assignment.replicas;
+        if (
+          !cluster::has_local_replicas(_self, prev_replicas)
+          && !cluster::has_local_replicas(_self, new_replicas)) {
+            co_return errc::success;
+        }
+        auto ec = co_await process_shutdown(delta.ntp, ntp, rev, prev_replicas);
+        if (ec) {
+            co_return ec;
+        }
+        co_return co_await process_restart(delta.ntp, ntp, rev, new_replicas);
+    }
     case op_t::add:
     case op_t::del:
+    case op_t::cancel_update:
+    case op_t::force_abort_update:
     case op_t::update_properties:
         /// All other case statements are no-ops because those events are
         /// expected to be handled in cluster::controller_backend. Convsersely
         /// the controller_backend will not handle the types of events that
         /// reconciliation_backend is responsible for
-        return ss::make_ready_future<std::error_code>(errc::success);
+        co_return errc::success;
     }
     __builtin_unreachable();
 }
@@ -228,7 +255,7 @@ ss::future<std::error_code> reconciliation_backend::process_shutdown(
   model::ntp src,
   model::ntp ntp,
   model::revision_id rev,
-  std::vector<model::broker_shard> new_replicas) {
+  std::vector<model::broker_shard>) {
     vlog(coproclog.info, "Processing shutdown of: {}", ntp);
     auto ids = co_await _pacemaker.local().shutdown_partition(src);
     vlog(coproclog.debug, "Ids {} shutdown", ids);
@@ -310,7 +337,7 @@ bool reconciliation_backend::stale_create_non_replicable_partition_request(
   const std::vector<model::broker_shard>& replicas) {
     /// If the source partition exists in the topics table, but not in
     /// the cluster::partition_manager, either this request occurred before the
-    /// source partition has been instered into the partition_manager and a
+    /// source partition has been inserted into the partition_manager and a
     /// retry of creating 'this' partition should occur (until success), OR the
     /// source topic has been moved to another broker_shard and this request is
     /// therefore stale
@@ -365,7 +392,7 @@ reconciliation_backend::create_non_replicable_partition(
         }
         // Non-replicated topics are not integrated with shadow indexing yet,
         // so the initial_revision_id is set to invalid value.
-        auto ntp_cfg = tt_md->second.get_configuration().cfg.make_ntp_config(
+        auto ntp_cfg = tt_md->second.get_configuration().make_ntp_config(
           _data_directory,
           ntp.tp.partition,
           rev,

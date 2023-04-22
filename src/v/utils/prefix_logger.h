@@ -62,10 +62,12 @@ public:
     ss::sstring format(const char* format, Args&&... args) const {
         auto line_fmt = ss::sstring("{} - ") + format;
         return ssx::sformat(
-          fmt::string_view(line_fmt.begin(), line_fmt.length()),
+          fmt::runtime(fmt::string_view(line_fmt.begin(), line_fmt.length())),
           _prefix,
           std::forward<Args>(args)...);
     }
+
+    const ss::logger& logger() const { return _logger; }
 
 private:
     ss::logger& _logger;

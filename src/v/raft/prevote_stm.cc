@@ -18,6 +18,8 @@
 #include "raft/logger.h"
 #include "raft/raftgen_service.h"
 #include "raft/types.h"
+#include "rpc/types.h"
+#include "ssx/semaphore.h"
 
 #include <seastar/util/bool_class.hh>
 
@@ -27,7 +29,8 @@ namespace raft {
 
 prevote_stm::prevote_stm(consensus* p)
   : _ptr(p)
-  , _sem(0)
+  , _sem{0, "raft/prevote"}
+  , _prevote_timeout(rpc::timeout_spec::none)
   , _ctxlog(_ptr->group(), _ptr->ntp()) {}
 
 prevote_stm::~prevote_stm() {
@@ -38,7 +41,7 @@ prevote_stm::~prevote_stm() {
 
 ss::future<result<vote_reply>> prevote_stm::do_dispatch_prevote(vnode n) {
     auto tout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      _prevote_timeout.time_since_epoch());
+      _prevote_timeout.timeout_at().time_since_epoch());
     vlog(
       _ctxlog.trace,
       "Sending prevote request to {} from {} with tout: {}",
@@ -49,8 +52,9 @@ ss::future<result<vote_reply>> prevote_stm::do_dispatch_prevote(vnode n) {
     r.target_node_id = n;
     return _ptr->_client_protocol
       .vote(n.id(), std::move(r), rpc::client_opts(_prevote_timeout))
-      .then([this](result<vote_reply> reply) {
-          return _ptr->validate_reply_target_node("prevote", std::move(reply));
+      .then([this, target_node_id = n.id()](result<vote_reply> reply) {
+          return _ptr->validate_reply_target_node(
+            "prevote", reply, target_node_id);
       });
 }
 
@@ -59,37 +63,49 @@ prevote_stm::process_reply(vnode n, ss::future<result<vote_reply>> f) {
     auto voter_reply = _replies.find(n);
 
     try {
-        if (_prevote_timeout < clock_type::now()) {
+        if (_prevote_timeout.has_timed_out()) {
             vlog(_ctxlog.trace, "prevote ack from {} timed out", n);
             voter_reply->second._is_failed = true;
             voter_reply->second._is_pending = false;
         } else {
-            auto r = f.get0();
-            if (r.has_value()) {
-                auto v = r.value();
-                if (v.log_ok) {
-                    vlog(
-                      _ctxlog.trace,
-                      "prevote ack: node {} caught up with a candidate",
-                      n);
-                    voter_reply->second._is_ok = true;
-                    voter_reply->second._is_pending = false;
+            if (f.failed()) {
+                // This can be e.g. a semaphore_timed_out
+                vlog(
+                  _ctxlog.trace,
+                  "prevote ack: node {} threw exception {}",
+                  f.get_exception(),
+                  n);
+                voter_reply->second._is_failed = true;
+                voter_reply->second._is_pending = false;
+            } else {
+                auto r = f.get0();
+                if (r.has_value()) {
+                    auto v = r.value();
+                    _ptr->maybe_update_node_reply_timestamp(n);
+                    if (v.log_ok) {
+                        vlog(
+                          _ctxlog.trace,
+                          "prevote ack: node {} caught up with a candidate",
+                          n);
+                        voter_reply->second._is_ok = true;
+                        voter_reply->second._is_pending = false;
+                    } else {
+                        vlog(
+                          _ctxlog.trace,
+                          "prevote ack: node {} is ahead of a candidate",
+                          n);
+                        voter_reply->second._is_failed = true;
+                        voter_reply->second._is_pending = false;
+                    }
                 } else {
                     vlog(
                       _ctxlog.trace,
-                      "prevote ack: node {} is ahead of a candidate",
-                      n);
+                      "prevote ack from {} doesn't have value, error: {}",
+                      n,
+                      r.error().message());
                     voter_reply->second._is_failed = true;
                     voter_reply->second._is_pending = false;
                 }
-            } else {
-                vlog(
-                  _ctxlog.trace,
-                  "prevote ack from {} doesn't have value, error: {}",
-                  n,
-                  r.error().message());
-                voter_reply->second._is_failed = true;
-                voter_reply->second._is_pending = false;
             }
         }
     } catch (...) {
@@ -150,7 +166,8 @@ ss::future<bool> prevote_stm::prevote(bool leadership_transfer) {
             .prev_log_term = last_entry_term,
             .leadership_transfer = leadership_transfer};
 
-          _prevote_timeout = clock_type::now() + _ptr->_jit.base_duration();
+          _prevote_timeout = rpc::timeout_spec::from_now(
+            _ptr->_jit.base_duration());
 
           auto m = _replies.find(_ptr->self());
           m->second._is_ok = true;
@@ -161,7 +178,8 @@ ss::future<bool> prevote_stm::prevote(bool leadership_transfer) {
 
 ss::future<bool> prevote_stm::do_prevote() {
     // dispatch requests to all voters
-    _config->for_each_voter([this](vnode id) { (void)dispatch_prevote(id); });
+    _config->for_each_voter(
+      [this](vnode id) { ssx::background = dispatch_prevote(id); });
 
     // process results
     return process_replies().then([this]() {

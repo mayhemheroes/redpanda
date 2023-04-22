@@ -12,6 +12,7 @@
 #pragma once
 
 #include <optional>
+#include <regex>
 #include <stdexcept>
 #include <string>
 
@@ -173,6 +174,17 @@ public:
           S1, S2, S3, S4, S5, S6, S7, S8, S9, value);
     }
 
+    constexpr string_switch& match_expr(std::string_view expr, T value) {
+        if (
+          !result
+          && std::regex_search(
+            std::string{view.data(), view.size()},
+            std::regex{expr.data(), expr.size()})) {
+            result = std::move(value);
+        }
+        return *this;
+    }
+
     constexpr R default_match(T value) {
         if (result) {
             return std::move(*result);
@@ -182,7 +194,10 @@ public:
 
     constexpr operator R() { // NOLINT
         if (!result) {
-            throw std::runtime_error("Fell off the end of a string-switch");
+            throw std::runtime_error(
+              std::string(
+                "Fell off the end of a string-switch while matching: ")
+              + std::string(view));
         }
         return std::move(*result);
     }

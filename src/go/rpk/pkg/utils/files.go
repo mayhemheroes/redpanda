@@ -69,7 +69,7 @@ func CopyFile(fs afero.Fs, src string, dst string) error {
 	if err != nil {
 		return err
 	}
-	err = afero.WriteFile(fs, dst, input, 0644)
+	err = afero.WriteFile(fs, dst, input, 0o644)
 	return err
 }
 
@@ -115,5 +115,5 @@ func ReadIntFromFile(fs afero.Fs, file string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return strconv.Atoi(strings.TrimSpace(string(content)))
+	return strconv.Atoi(strings.TrimSpace(content))
 }

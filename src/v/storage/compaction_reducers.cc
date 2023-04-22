@@ -73,7 +73,7 @@ compaction_key_reducer::operator()(compacted_index::entry&& e) {
     ++_natural_index; // MOST important
     return ss::make_ready_future<stop_t>(stop_t::no);
 }
-Roaring compaction_key_reducer::end_of_stream() {
+roaring::Roaring compaction_key_reducer::end_of_stream() {
     // TODO: optimization - detect if the index does not need compaction
     // by linear scan of natural_index from 0-N with no gaps.
     for (auto& e : _indices) {
@@ -97,8 +97,7 @@ index_filtered_copy_reducer::operator()(compacted_index::entry&& e) {
     const bool should_add = _bm.contains(_natural_index);
     ++_natural_index;
     if (should_add) {
-        bytes_view bv = e.key;
-        return _writer->index(bv, e.offset, e.delta)
+        return _writer->index(e.key, e.offset, e.delta)
           .then([k = std::move(e.key)] {
               return ss::make_ready_future<stop_t>(stop_t::no);
           });
@@ -118,10 +117,28 @@ std::optional<model::record_batch>
 copy_data_segment_reducer::filter(model::record_batch&& batch) {
     // do not compact raft configuration and archival metadata as they shift
     // offset translation
-    if (
-      batch.header().type == model::record_batch_type::raft_configuration
-      || batch.header().type == model::record_batch_type::archival_metadata) {
+    if (!is_compactible(batch)) {
         return std::move(batch);
+    }
+
+    // 0. Reset the transactional bit, we need not carry it forward.
+    // All the data batches retained until this point are committed.
+    // From this point on, these batches are treated like non transaction
+    // batches by subsequent compactions.
+    // Client implementations treat transactional batches differently
+    // from non transactional batches. For transactional batches an
+    // additional filter is applied to check if they fall in the
+    // aborted list of transactions. Marking these batches here as
+    // non transactional means that clients skip that extra check.
+    auto& hdr = batch.header();
+    bool hdr_changed = false;
+    if (hdr.attrs.is_transactional() && !hdr.attrs.is_control()) {
+        hdr.attrs.unset_transactional_type();
+        // We do not recompute crc here as the batch records may
+        // be filtered in step 4 in which case we need to recompute
+        // it anyway. It is expensive to loop through the batch and
+        // is wasteful to do it twice.
+        hdr_changed = true;
     }
 
     // 1. compute which records to keep
@@ -141,6 +158,10 @@ copy_data_segment_reducer::filter(model::record_batch&& batch) {
 
     // 3. keep all records
     if (offset_deltas.size() == static_cast<size_t>(batch.record_count())) {
+        if (hdr_changed) {
+            hdr.crc = model::crc_record_batch(batch);
+            hdr.header_crc = model::internal_header_only_crc(hdr);
+        }
         return std::move(batch);
     }
 
@@ -213,69 +234,64 @@ copy_data_segment_reducer::filter(model::record_batch&& batch) {
     // Additionally, the MaxTimestamp of an empty batch always retains the
     // previous value prior to becoming empty.
     //
-    const auto& oldh = batch.header();
     const auto first_time = model::timestamp(
-      oldh.first_timestamp() + first_timestamp_delta.value());
-    auto last_time = oldh.max_timestamp;
-    if (oldh.attrs.timestamp_type() == model::timestamp_type::create_time) {
+      hdr.first_timestamp() + first_timestamp_delta.value());
+    auto last_time = hdr.max_timestamp;
+    if (hdr.attrs.timestamp_type() == model::timestamp_type::create_time) {
         last_time = model::timestamp(first_time() + last_timestamp_delta);
     }
-    auto h = oldh;
-    h.first_timestamp = first_time;
-    h.max_timestamp = last_time;
-    h.record_count = rec_count;
-    reset_size_checksum_metadata(h, ret);
+    auto new_hdr = hdr;
+    new_hdr.first_timestamp = first_time;
+    new_hdr.max_timestamp = last_time;
+    new_hdr.record_count = rec_count;
+    reset_size_checksum_metadata(new_hdr, ret);
     auto new_batch = model::record_batch(
-      h, std::move(ret), model::record_batch::tag_ctor_ng{});
+      new_hdr, std::move(ret), model::record_batch::tag_ctor_ng{});
     return new_batch;
 }
+
 ss::future<ss::stop_iteration> copy_data_segment_reducer::do_compaction(
-  model::compression original, model::record_batch&& b) {
+  model::compression original, model::record_batch b) {
     using stop_t = ss::stop_iteration;
     auto to_copy = filter(std::move(b));
     if (to_copy == std::nullopt) {
-        return ss::make_ready_future<stop_t>(stop_t::no);
+        co_return stop_t::no;
     }
-    return compress_batch(original, std::move(to_copy.value()))
-      .then([this](model::record_batch&& b) {
-          return ss::do_with(std::move(b), [this](model::record_batch& batch) {
-              auto const start_offset = _appender->file_byte_offset();
-              auto const header_size = batch.header().size_bytes;
-              _acc += header_size;
-              if (_idx.maybe_index(
-                    _acc,
-                    32_KiB,
-                    start_offset,
-                    batch.base_offset(),
-                    batch.last_offset(),
-                    batch.header().first_timestamp,
-                    batch.header().max_timestamp)) {
-                  _acc = 0;
-              }
-              return storage::write(*_appender, batch)
-                .then([this, start_offset, header_size] {
-                    vassert(
-                      _appender->file_byte_offset()
-                        == start_offset + header_size,
-                      "Size must be deterministic. Expected:{} == {}",
-                      _appender->file_byte_offset(),
-                      start_offset + header_size);
-                });
-          });
-      })
-      .then([] { return ss::make_ready_future<stop_t>(stop_t::no); });
+    auto batch = co_await compress_batch(original, std::move(to_copy.value()));
+    auto const start_offset = _appender->file_byte_offset();
+    auto const header_size = batch.header().size_bytes;
+    _acc += header_size;
+    if (_idx.maybe_index(
+          _acc,
+          32_KiB,
+          start_offset,
+          batch.base_offset(),
+          batch.last_offset(),
+          batch.header().first_timestamp,
+          batch.header().max_timestamp,
+          _internal_topic
+            || batch.header().type == model::record_batch_type::raft_data)) {
+        _acc = 0;
+    }
+    co_await storage::write(*_appender, batch);
+    vassert(
+      _appender->file_byte_offset() == start_offset + header_size,
+      "Size must be deterministic. Expected:{} == {}",
+      _appender->file_byte_offset(),
+      start_offset + header_size);
+
+    co_return stop_t::no;
 }
 
 ss::future<ss::stop_iteration>
-copy_data_segment_reducer::operator()(model::record_batch&& b) {
+copy_data_segment_reducer::operator()(model::record_batch b) {
     const auto comp = b.header().attrs.compression();
     if (!b.compressed()) {
-        return do_compaction(comp, std::move(b));
+        co_return co_await do_compaction(comp, std::move(b));
     }
-    return decompress_batch(std::move(b))
-      .then([comp, this](model::record_batch&& b) {
-          return do_compaction(comp, std::move(b));
-      });
+    auto batch = co_await decompress_batch(std::move(b));
+
+    co_return co_await do_compaction(comp, std::move(batch));
 }
 
 ss::future<ss::stop_iteration>
@@ -296,9 +312,119 @@ index_rebuilder_reducer::operator()(model::record_batch&& b) {
 ss::future<> index_rebuilder_reducer::do_index(model::record_batch&& b) {
     return ss::do_with(std::move(b), [this](model::record_batch& b) {
         return model::for_each_record(
-          b, [this, o = b.base_offset()](model::record& r) {
-              return _w->index(r.key(), o, r.offset_delta());
+          b,
+          [this, bt = b.header().type, o = b.base_offset()](model::record& r) {
+              return _w->index(bt, r.key(), o, r.offset_delta());
           });
     });
 }
+
+void tx_reducer::consume_aborted_txs(model::offset upto) {
+    while (!_aborted_txs.empty() && _aborted_txs.top().first <= upto) {
+        const auto& top = _aborted_txs.top();
+        _ongoing_aborted_txs[top.pid] = top;
+        _aborted_txs.pop();
+    }
+}
+
+bool tx_reducer::handle_tx_control_batch(const model::record_batch& b) {
+    auto batch_type = _stm_mgr->parse_tx_control_batch(b);
+    auto pid = model::producer_identity(
+      b.header().producer_id, b.header().producer_epoch);
+    switch (batch_type) {
+    case model::control_record_type::unknown: // unlikely
+    case model::control_record_type::tx_commit: {
+        break;
+    }
+    case model::control_record_type::tx_abort: {
+        if (!_ongoing_aborted_txs.erase(pid)) {
+            // This highly likely points to a bug with incorrect aborted tx
+            // range considered for this segment compaction. We likely retained
+            // aborted data batches for this pid with offsets close to
+            // base_offset().
+            // A corner case where this is not a problem is when the abort
+            // marker is the first entry in the segment.
+            vlog(
+              stlog.warn,
+              "No ongoing aborted tx found for pid {}, offset {}",
+              pid,
+              b.base_offset());
+        }
+        break;
+    }
+    }
+    auto discard = batch_type == model::control_record_type::tx_commit
+                   || batch_type == model::control_record_type::tx_abort;
+    if (discard) {
+        _stats._tx_control_batches_discarded++;
+    }
+    return discard;
+}
+
+bool tx_reducer::handle_tx_data_batch(const model::record_batch& b) {
+    auto pid = model::producer_identity(
+      b.header().producer_id, b.header().producer_epoch);
+    auto discard = _ongoing_aborted_txs.contains(pid);
+    if (discard) {
+        _stats._tx_data_batches_discarded++;
+    }
+    return discard;
+}
+
+bool tx_reducer::handle_non_tx_control_batch(const model::record_batch& b) {
+    auto type = b.header().type;
+    vassert(
+      type == model::record_batch_type::tx_prepare
+        || type == model::record_batch_type::tx_fence,
+      "{} unknown type encountered",
+      type);
+    // Fence batches cannot be discarded because they contain epoch information
+    // from pids that are tracked in the state machine. We key the records with
+    // pid, so the combination of batch_type + pid should always retain the
+    // latest epoch in the indexer_reducer. OTOH prepare batches can be
+    // discarded.
+    bool discard = type == model::record_batch_type::tx_prepare;
+    if (discard) {
+        _stats._non_tx_control_batches_discarded++;
+    }
+    return discard;
+}
+
+ss::future<ss::stop_iteration> tx_reducer::operator()(model::record_batch&& b) {
+    if (unlikely(_non_transactional)) {
+        co_return co_await _delegate(std::move(b));
+    }
+
+    _stats._all_batches++;
+    consume_aborted_txs(b.last_offset());
+
+    auto is_tx = b.header().attrs.is_transactional();
+    auto is_control = b.header().attrs.is_control();
+    auto is_data = b.header().type == model::record_batch_type::raft_data;
+
+    bool discard_batch = false;
+    if (is_tx) {
+        if (is_control) {
+            // tx_commit / tx_abort / unknown
+            discard_batch = handle_tx_control_batch(b);
+        } else if (is_data) {
+            // User produced data batches in tx scope..
+            discard_batch = handle_tx_data_batch(b);
+        }
+    } else {
+        if (is_control && !is_data) {
+            // tx_prepare / tx_fence
+            discard_batch = handle_non_tx_control_batch(b);
+        }
+        // else includes data batches from non tx producers which
+        // cannot be discarded.
+    }
+
+    if (discard_batch) {
+        _stats._all_batches_discarded++;
+        co_return ss::stop_iteration::no;
+    }
+    co_return co_await _delegate(std::move(b));
+}
+
 } // namespace storage::internal

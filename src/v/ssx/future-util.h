@@ -10,7 +10,6 @@
  */
 
 #pragma once
-#include "utils/concepts-enabled.h"
 #include "utils/functional.h"
 
 #include <seastar/core/abort_source.hh>
@@ -18,7 +17,6 @@
 #include <seastar/core/future-util.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/when_all.hh>
 
@@ -73,14 +71,12 @@ async_transform(Iterator begin, Iterator end, Func&& func) {
 /// function invocations that resolves when all the function invocations
 /// complete.  If one or more return an exception, the return value contains one
 /// of the exceptions.
-// clang-format off
 template<typename Iterator, typename Func>
-CONCEPT(requires requires(Func f, Iterator i) {
+requires requires(Func f, Iterator i) {
     *(++i);
     { i != i } -> std::convertible_to<bool>;
     seastar::futurize_invoke(f, *i).get0();
-})
-// clang-format on
+}
 inline auto async_transform(Iterator begin, Iterator end, Func&& func) {
     using result_type = decltype(seastar::futurize_invoke(func, *begin).get0());
     return detail::async_transform<result_type>(
@@ -111,15 +107,13 @@ inline auto async_transform(Iterator begin, Iterator end, Func&& func) {
 /// function invocations that resolves when all the function invocations
 /// complete.  If one or more return an exception, the return value contains one
 /// of the exceptions.
-// clang-format off
 template<typename Rng, typename Func>
-CONCEPT(requires requires(Func f, Rng r) {
+requires requires(Func f, Rng r) {
     r.begin();
     r.end();
     { r.begin() != r.begin() } -> std::convertible_to<bool>;
     seastar::futurize_invoke(f, *r.begin()).get0();
-})
-// clang-format on
+}
 inline auto async_transform(Rng& rng, Func&& func) {
     return async_transform(rng.begin(), rng.end(), std::forward<Func>(func));
 }
@@ -144,15 +138,13 @@ inline auto async_transform(Rng& rng, Func&& func) {
 /// of the results of the function invocations that resolves when all the
 /// function invocations complete.  If one or more return an exception, the
 /// return value contains one of the exceptions.
-// clang-format off
 template<typename Iterator, typename Func>
-CONCEPT(requires requires(Func f, Iterator i) {
+requires requires(Func f, Iterator i) {
     *(++i);
-    { i != i } ->std::convertible_to<bool>;
+    { i != i } -> std::convertible_to<bool>;
     seastar::futurize_invoke(f, *i).get0().begin();
     seastar::futurize_invoke(f, *i).get0().end();
-})
-// clang-format on
+}
 inline auto async_flat_transform(Iterator begin, Iterator end, Func&& func) {
     using result_type = decltype(seastar::futurize_invoke(func, *begin).get0());
     using value_type = typename result_type::value_type;
@@ -171,15 +163,13 @@ inline auto async_flat_transform(Iterator begin, Iterator end, Func&& func) {
       });
 }
 
-// clang-format off
 template<typename Rng, typename Func>
-CONCEPT(requires requires(Func f, Rng r) {
+requires requires(Func f, Rng r) {
     r.begin();
     r.end();
     { r.begin() != r.begin() } -> std::convertible_to<bool>;
     seastar::futurize_invoke(f, *r.begin()).get0();
-})
-// clang-format on
+}
 inline auto async_flat_transform(Rng& rng, Func&& func) {
     return async_flat_transform(
       rng.begin(), rng.end(), std::forward<Func>(func));
@@ -201,13 +191,11 @@ inline auto async_flat_transform(Rng& rng, Func&& func) {
 /// function invocations that resolves when all the function invocations
 /// complete.  If one or more return an exception, the return value contains one
 /// of the exceptions.
-// clang-format off
 template<typename Iterator, typename Func>
-CONCEPT(requires requires(Func f, Iterator i) {
+requires requires(Func f, Iterator i) {
     *(++i);
     { i != i } -> std::convertible_to<bool>;
-})
-// clang-format on
+}
 inline auto parallel_transform(Iterator begin, Iterator end, Func func) {
     using value_type = typename std::iterator_traits<Iterator>::value_type;
     using future = decltype(seastar::futurize_invoke(
@@ -245,14 +233,12 @@ inline auto parallel_transform(Iterator begin, Iterator end, Func func) {
 /// function invocations that resolves when all the function invocations
 /// complete.  If one or more return an exception, the return value contains one
 /// of the exceptions.
-// clang-format off
 template<typename Rng, typename Func>
-CONCEPT(requires requires(Func f, Rng r) {
+requires requires(Func f, Rng r) {
     r.begin();
     r.end();
     { r.begin() != r.begin() } -> std::convertible_to<bool>;
-})
-// clang-format on
+}
 inline auto parallel_transform(Rng rng, Func func) {
     return seastar::do_with(
       std::move(rng), [func{std::move(func)}](Rng& rng) mutable {
@@ -297,6 +283,7 @@ inline auto spawn_with_gate_then(seastar::gate& g, Func&& func) noexcept {
       .handle_exception_type([](const seastar::abort_requested_exception&) {})
       .handle_exception_type([](const seastar::gate_closed_exception&) {})
       .handle_exception_type([](const seastar::broken_semaphore&) {})
+      .handle_exception_type([](const seastar::broken_promise&) {})
       .handle_exception_type([](const seastar::broken_condition_variable&) {});
 }
 
@@ -312,6 +299,37 @@ inline auto spawn_with_gate_then(seastar::gate& g, Func&& func) noexcept {
 template<typename Func>
 inline void spawn_with_gate(seastar::gate& g, Func&& func) noexcept {
     background = spawn_with_gate_then(g, std::forward<Func>(func));
+}
+
+/// \brief Works the same as std::partition however assumes that the predicate
+/// returns item of type seastar::future<bool> instead of bool.
+/// \param begin an \c InputIterator designating the beginning of the range
+/// \param end an \c InputIterator designating the end of the range
+/// \param p Function to invoke with each element in the range
+template<typename Iter, typename UnaryAsyncPredicate>
+requires requires(UnaryAsyncPredicate f, Iter i) {
+    *(++i);
+    { i != i } -> std::convertible_to<bool>;
+    seastar::futurize_invoke(f, *i).get0();
+}
+seastar::future<Iter> partition(Iter begin, Iter end, UnaryAsyncPredicate p) {
+    auto itr = begin;
+    for (; itr != end; ++itr) {
+        if (!co_await p(*itr)) {
+            break;
+        }
+    }
+    if (itr == end) {
+        co_return itr;
+    }
+
+    for (auto i = std::next(itr); i != end; ++i) {
+        if (co_await p(*i)) {
+            std::iter_swap(i, itr);
+            ++itr;
+        }
+    }
+    co_return itr;
 }
 
 /// \brief Create a future that resolves either when the original future

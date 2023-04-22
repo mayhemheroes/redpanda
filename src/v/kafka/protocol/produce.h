@@ -23,21 +23,10 @@
 
 namespace kafka {
 
-struct produce_response;
-
 /**
  * Support starts at version 3 because this is the first version that supports
  * version 2 of the kafka message format.
  */
-class produce_api final {
-public:
-    using response_type = produce_response;
-
-    static constexpr const char* name = "produce";
-    static constexpr api_key key = api_key(0);
-};
-
-struct produce_response;
 
 struct produce_request final {
     using api_type = produce_api;
@@ -59,18 +48,24 @@ struct produce_request final {
         data.topics = std::move(topics);
     }
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
+    }
+
+    friend std::ostream&
+    operator<<(std::ostream& os, const produce_request& r) {
+        return os << r.data;
     }
 
     /**
      * Build a generic error response for a given request.
      */
     produce_response make_error_response(error_code error) const;
+    produce_response make_full_disk_response() const;
 
     /// True if the request contains a batch with a transactional id.
     bool has_transactional = false;
@@ -79,10 +74,6 @@ struct produce_request final {
     bool has_idempotent = false;
 };
 
-inline std::ostream& operator<<(std::ostream& os, const produce_request& r) {
-    return os << r.data;
-}
-
 struct produce_response final {
     using api_type = produce_api;
     using partition = partition_produce_response;
@@ -90,7 +81,10 @@ struct produce_response final {
 
     produce_response_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    // Used for usage/metering to relay this value back to the connection layer
+    size_t internal_topic_bytes{0};
+
+    void encode(protocol::encoder& writer, api_version version) {
         // normalize errors
         for (auto& r : data.responses) {
             for (auto& p : r.partitions) {
@@ -107,10 +101,11 @@ struct produce_response final {
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
-};
 
-inline std::ostream& operator<<(std::ostream& os, const produce_response& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const produce_response& r) {
+        return os << r.data;
+    }
+};
 
 } // namespace kafka

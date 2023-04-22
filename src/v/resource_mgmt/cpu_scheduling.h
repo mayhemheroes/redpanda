@@ -36,6 +36,8 @@ public:
           "raft_learner_recovery", 50);
         _archival_upload = co_await ss::create_scheduling_group(
           "archival_upload", 100);
+        _node_status = co_await ss::create_scheduling_group("node_status", 50);
+        _self_test = co_await ss::create_scheduling_group("self_test", 100);
     }
 
     ss::future<> destroy_groups() {
@@ -48,6 +50,8 @@ public:
         co_await destroy_scheduling_group(_compaction);
         co_await destroy_scheduling_group(_raft_learner_recovery);
         co_await destroy_scheduling_group(_archival_upload);
+        co_await destroy_scheduling_group(_node_status);
+        co_await destroy_scheduling_group(_self_test);
         co_return;
     }
 
@@ -64,8 +68,29 @@ public:
         return _raft_learner_recovery;
     }
     ss::scheduling_group archival_upload() { return _archival_upload; }
+    ss::scheduling_group node_status() { return _node_status; }
+    ss::scheduling_group self_test_sg() { return _self_test; }
+
+    std::vector<std::reference_wrapper<const ss::scheduling_group>>
+    all_scheduling_groups() const {
+        return {
+          std::cref(_default),
+          std::cref(_admin),
+          std::cref(_raft),
+          std::cref(_kafka),
+          std::cref(_cluster),
+          std::cref(_coproc),
+          std::cref(_cache_background_reclaim),
+          std::cref(_compaction),
+          std::cref(_raft_learner_recovery),
+          std::cref(_archival_upload),
+          std::cref(_node_status),
+          std::cref(_self_test)};
+    }
 
 private:
+    ss::scheduling_group _default{
+      seastar::default_scheduling_group()}; // created and managed by seastar
     ss::scheduling_group _admin;
     ss::scheduling_group _raft;
     ss::scheduling_group _kafka;
@@ -75,4 +100,6 @@ private:
     ss::scheduling_group _compaction;
     ss::scheduling_group _raft_learner_recovery;
     ss::scheduling_group _archival_upload;
+    ss::scheduling_group _node_status;
+    ss::scheduling_group _self_test;
 };

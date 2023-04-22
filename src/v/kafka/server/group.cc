@@ -15,16 +15,19 @@
 #include "cluster/tx_utils.h"
 #include "config/configuration.h"
 #include "kafka/protocol/errors.h"
-#include "kafka/protocol/response_writer.h"
 #include "kafka/protocol/schemata/describe_groups_response.h"
 #include "kafka/protocol/sync_group.h"
+#include "kafka/protocol/wire.h"
 #include "kafka/server/group_manager.h"
 #include "kafka/server/group_metadata.h"
 #include "kafka/server/logger.h"
+#include "kafka/server/member.h"
 #include "kafka/types.h"
 #include "likely.h"
 #include "model/fundamental.h"
+#include "model/namespace.h"
 #include "raft/errc.h"
+#include "ssx/future-util.h"
 #include "storage/record_batch_builder.h"
 #include "utils/to_string.h"
 #include "vassert.h"
@@ -42,13 +45,13 @@ namespace kafka {
 
 using member_config = join_group_response_member;
 
-using violation_recovery_policy = model::violation_recovery_policy;
-
 group::group(
   kafka::group_id id,
   group_state s,
   config::configuration& conf,
   ss::lw_shared_ptr<cluster::partition> partition,
+  ss::sharded<cluster::tx_gateway_frontend>& tx_frontend,
+  ss::sharded<features::feature_table>& feature_table,
   group_metadata_serializer serializer,
   enable_group_metrics group_metrics)
   : _id(std::move(id))
@@ -59,37 +62,54 @@ group::group(
   , _new_member_added(false)
   , _conf(conf)
   , _partition(std::move(partition))
-  , _recovery_policy(
-      config::shard_local_cfg().rm_violation_recovery_policy.value())
+  , _probe(_members, _static_members, _offsets)
   , _ctxlog(klog, *this)
   , _ctx_txlog(cluster::txlog, *this)
   , _md_serializer(std::move(serializer))
-  , _enable_group_metrics(group_metrics) {}
+  , _enable_group_metrics(group_metrics)
+  , _abort_interval_ms(config::shard_local_cfg()
+                         .abort_timed_out_transactions_interval_ms.value())
+  , _tx_frontend(tx_frontend)
+  , _feature_table(feature_table) {
+    if (_enable_group_metrics) {
+        _probe.setup_public_metrics(_id);
+    }
+
+    start_abort_timer();
+}
 
 group::group(
   kafka::group_id id,
   group_metadata_value& md,
   config::configuration& conf,
   ss::lw_shared_ptr<cluster::partition> partition,
+  ss::sharded<cluster::tx_gateway_frontend>& tx_frontend,
+  ss::sharded<features::feature_table>& feature_table,
   group_metadata_serializer serializer,
   enable_group_metrics group_metrics)
   : _id(std::move(id))
+  , _state(md.members.empty() ? group_state::empty : group_state::stable)
+  , _state_timestamp(
+      md.state_timestamp == model::timestamp(-1)
+        ? std::optional<model::timestamp>(std::nullopt)
+        : md.state_timestamp)
+  , _generation(md.generation)
   , _num_members_joining(0)
+  , _protocol_type(md.protocol_type)
+  , _protocol(md.protocol)
+  , _leader(md.leader)
   , _new_member_added(false)
   , _conf(conf)
   , _partition(std::move(partition))
-  , _recovery_policy(
-      config::shard_local_cfg().rm_violation_recovery_policy.value())
+  , _probe(_members, _static_members, _offsets)
   , _ctxlog(klog, *this)
   , _ctx_txlog(cluster::txlog, *this)
   , _md_serializer(std::move(serializer))
-  , _enable_group_metrics(group_metrics) {
-    _state = md.members.empty() ? group_state::empty : group_state::stable;
-    _generation = md.generation;
-    _protocol_type = md.protocol_type;
-    _protocol = md.protocol;
-    _leader = md.leader;
-    _state_timestamp = md.state_timestamp;
+  , _enable_group_metrics(group_metrics)
+  , _abort_interval_ms(config::shard_local_cfg()
+                         .abort_timed_out_transactions_interval_ms.value())
+  , _tx_frontend(tx_frontend)
+  , _feature_table(feature_table) {
     for (auto& m : md.members) {
         auto member = ss::make_lw_shared<group_member>(
           std::move(m),
@@ -102,6 +122,15 @@ group::group(
         vlog(_ctxlog.trace, "Initializing group with member {}", member);
         add_member_no_join(member);
     }
+
+    // update when restoring from metadata value
+    update_subscriptions();
+
+    if (_enable_group_metrics) {
+        _probe.setup_public_metrics(_id);
+    }
+
+    start_abort_timer();
 }
 
 bool group::valid_previous_state(group_state s) const {
@@ -143,6 +172,33 @@ static model::record_batch make_tx_batch(
     builder.add_raw_kv(std::move(key), std::move(value));
 
     return std::move(builder).build();
+}
+
+static model::record_batch make_tx_fence_batch(
+  const model::producer_identity& pid, group_log_fencing_v0 cmd) {
+    return make_tx_batch(
+      model::record_batch_type::tx_fence,
+      group::fence_control_record_v0_version,
+      pid,
+      cmd);
+}
+
+static model::record_batch make_tx_fence_batch(
+  const model::producer_identity& pid, group_log_fencing_v1 cmd) {
+    return make_tx_batch(
+      model::record_batch_type::tx_fence,
+      group::fence_control_record_v1_version,
+      pid,
+      cmd);
+}
+
+static model::record_batch make_tx_fence_batch(
+  const model::producer_identity& pid, group_log_fencing cmd) {
+    return make_tx_batch(
+      model::record_batch_type::tx_fence,
+      group::fence_control_record_version,
+      pid,
+      cmd);
 }
 
 group_state group::set_state(group_state s) {
@@ -190,6 +246,17 @@ bool group::supports_protocols(const join_group_request& r) const {
 }
 
 void group::add_member_no_join(member_ptr member) {
+    if (member->group_instance_id()) {
+        auto [_, success] = _static_members.emplace(
+          *member->group_instance_id(), member->id());
+        if (!success) {
+            throw std::runtime_error(fmt::format(
+              "group already contains member with group instance id: {}, group "
+              "state: {}",
+              member,
+              *this));
+        }
+    }
     if (_members.empty()) {
         _protocol_type = member->protocol_type();
     }
@@ -219,7 +286,7 @@ ss::future<join_group_response> group::add_member(member_ptr member) {
     return member->get_join_response();
 }
 
-ss::future<join_group_response> group::update_member(
+void group::update_member_no_join(
   member_ptr member, std::vector<member_protocol>&& new_protocols) {
     vlog(
       _ctxlog.trace,
@@ -246,6 +313,11 @@ ss::future<join_group_response> group::update_member(
     for (auto& p : member->protocols()) {
         _supported_protocols[p.name]++;
     }
+}
+
+ss::future<join_group_response> group::update_member(
+  member_ptr member, std::vector<member_protocol>&& new_protocols) {
+    update_member_no_join(member, std::move(new_protocols));
 
     if (!member->is_joining()) {
         _num_members_joining++;
@@ -290,7 +362,7 @@ std::vector<member_config> group::member_metadata() const {
       std::back_inserter(out),
       [this](const member_map::value_type& m) {
           auto& group_inst = m.second->group_instance_id();
-          auto metadata = m.second->get_protocol_metadata(*_protocol);
+          auto metadata = m.second->get_protocol_metadata(_protocol.value());
           return member_config{
             .member_id = m.first,
             .group_instance_id = group_inst,
@@ -334,6 +406,7 @@ void group::advance_generation() {
         _protocol = select_protocol();
         set_state(group_state::completing_rebalance);
     }
+    update_subscriptions(); // call after protocol is set
     vlog(_ctxlog.trace, "Advanced generation with protocol {}", _protocol);
 }
 
@@ -443,7 +516,7 @@ bool group::leader_rejoined() {
     }
 }
 
-ss::future<join_group_response>
+group::join_group_stages
 group::handle_join_group(join_group_request&& r, bool is_new_group) {
     vlog(
       _ctxlog.trace,
@@ -452,8 +525,7 @@ group::handle_join_group(join_group_request&& r, bool is_new_group) {
       (is_new_group ? "new" : "existing"),
       *this);
 
-    auto ret = ss::make_ready_future<join_group_response>(
-      join_group_response(error_code::none));
+    auto ret = join_group_stages(join_group_response(error_code::none));
 
     if (r.data.member_id == unknown_member_id) {
         ret = join_group_unknown_member(std::move(r));
@@ -464,7 +536,9 @@ group::handle_join_group(join_group_request&& r, bool is_new_group) {
     // TODO: move the logic in this method up to group manager to make the
     // handling of is_new_group etc.. clearner rather than passing these flags
     // down into the group-level handler.
-    if (!is_new_group && in_state(group_state::preparing_rebalance)) {
+    if (
+      !is_new_group && !_initial_join_in_progress
+      && in_state(group_state::preparing_rebalance)) {
         /*
          * - after join_group completes the group may be in a state where the
          * join phase can complete immediately rather than waiting on the join
@@ -494,23 +568,204 @@ group::handle_join_group(join_group_request&& r, bool is_new_group) {
 }
 
 // DONE
-ss::future<join_group_response>
+
+group::join_group_stages
 group::join_group_unknown_member(join_group_request&& r) {
     if (in_state(group_state::dead)) {
         vlog(_ctxlog.trace, "Join rejected in state {}", _state);
-        return make_join_error(
-          unknown_member_id, error_code::coordinator_not_available);
+        return join_group_stages(make_join_error(
+          unknown_member_id, error_code::coordinator_not_available));
 
     } else if (!supports_protocols(r)) {
-        return make_join_error(
-          unknown_member_id, error_code::inconsistent_group_protocol);
+        return join_group_stages(make_join_error(
+          unknown_member_id, error_code::inconsistent_group_protocol));
     }
 
     auto new_member_id = group::generate_member_id(r);
+    if (r.data.group_instance_id) {
+        return add_new_static_member(std::move(new_member_id), std::move(r));
+    }
+    return add_new_dynamic_member(std::move(new_member_id), std::move(r));
+}
 
+group::join_group_stages
+group::add_new_static_member(member_id new_member_id, join_group_request&& r) {
+    auto it = _static_members.find(r.data.group_instance_id.value());
+
+    if (it != _static_members.end()) {
+        vlog(
+          _ctxlog.debug,
+          "Static member with unknown member id and instance id {} joins the "
+          "group, replacing previously mapped {} member id with new member_id "
+          "{}",
+          r.data.group_instance_id.value(),
+          it->second,
+          new_member_id);
+        return update_static_member_and_rebalance(
+          it->second, std::move(new_member_id), std::move(r));
+    }
+    vlog(
+      _ctxlog.debug,
+      "Static member with unknown member id and instance id {} joins the "
+      "group new member id: {}",
+      r.data.group_instance_id.value(),
+      new_member_id);
+    return add_member_and_rebalance(std::move(new_member_id), std::move(r));
+}
+
+group::join_group_stages group::update_static_member_and_rebalance(
+  member_id old_member_id, member_id new_member_id, join_group_request&& r) {
+    auto member = replace_static_member(
+      *r.data.group_instance_id, old_member_id, new_member_id);
+    /*
+     * <kafka> Heartbeat of old member id will expire without effect since the
+     * group no longer contains that member id. New heartbeat shall be scheduled
+     * with new member id.</kafka>
+     */
+    schedule_next_heartbeat_expiration(member);
+    auto f = update_member(member, r.native_member_protocols());
+    auto old_protocols = _members.at(new_member_id)->protocols();
+    switch (state()) {
+    case group_state::stable: {
+        auto next_gen_protocol = select_protocol();
+        if (_protocol == next_gen_protocol) {
+            vlog(
+              _ctxlog.trace,
+              "static member {} joins in stable state with the protocol that "
+              "does not require group protocol update, will not trigger "
+              "rebalance",
+              r.data.group_instance_id);
+            ssx::background
+              = store_group(checkpoint())
+                  .then([this,
+                         member,
+                         instance_id = *r.data.group_instance_id,
+                         new_member_id = std::move(new_member_id),
+                         old_member_id = std::move(old_member_id),
+                         old_protocols = std::move(old_protocols)](
+                          result<raft::replicate_result> result) mutable {
+                      if (!result) {
+                          vlog(
+                            _ctxlog.warn,
+                            "unable to store group checkpoint - {}",
+                            result.error());
+                          // <kafka>Failed to persist member.id of the
+                          // given static member, revert the update of
+                          // the static member in the group.</kafka>
+                          auto member = replace_static_member(
+                            instance_id, new_member_id, old_member_id);
+                          update_member_no_join(
+                            member, std::move(old_protocols));
+                          schedule_next_heartbeat_expiration(member);
+                          try_finish_joining_member(
+                            member,
+                            make_join_error(
+                              unknown_member_id,
+                              map_store_offset_error_code(result.error())));
+                          return;
+                      }
+                      // leader    -> member metadata
+                      // followers -> []
+                      std::vector<member_config> md;
+                      if (is_leader(new_member_id)) {
+                          md = member_metadata();
+                      }
+
+                      auto reply = join_group_response(
+                        error_code::none,
+                        generation(),
+                        protocol().value_or(kafka::protocol_name()),
+                        leader().value_or(kafka::member_id()),
+                        new_member_id,
+                        std::move(md));
+                      try_finish_joining_member(member, std::move(reply));
+                  })
+                  .finally([group = shared_from_this()] {
+                      // keep the group alive while the background task runs
+                  });
+            return join_group_stages(std::move(f));
+        } else {
+            vlog(
+              _ctxlog.trace,
+              "static member {} joins in stable state with the protocol that "
+              "requires group protocol update, trying to trigger rebalance",
+              r.data.group_instance_id);
+            try_prepare_rebalance();
+        }
+        return join_group_stages(std::move(f));
+    }
+    case group_state::preparing_rebalance:
+        return join_group_stages(std::move(f));
+    case group_state::completing_rebalance:
+        vlog(
+          _ctxlog.trace,
+          "updating static member {} (member_id: {}) metadata",
+          member->group_instance_id().value(),
+          member->id());
+        try_prepare_rebalance();
+        return join_group_stages(std::move(f));
+    case group_state::empty:
+        [[fallthrough]];
+    case group_state::dead:
+        throw std::runtime_error(fmt::format(
+          "group was not supposed to be in {} state when the unknown static "
+          "member {} rejoins, group state: {}",
+          state(),
+          r.data.group_instance_id,
+          *this));
+    }
+}
+
+member_ptr group::replace_static_member(
+  const group_instance_id& instance_id,
+  const member_id& old_member_id,
+  const member_id& new_member_id) {
+    auto it = _members.find(old_member_id);
+    if (it == _members.end()) {
+        throw std::runtime_error(fmt::format(
+          "can not replace not existing member with id {}, group state: {}",
+          old_member_id,
+          *this));
+    }
+    auto member = it->second;
+    _members.erase(it);
+    member->replace_id(new_member_id);
+    _members.emplace(new_member_id, member);
+
+    if (member->is_joining()) {
+        try_finish_joining_member(
+          member,
+          make_join_error(old_member_id, error_code::fenced_instance_id));
+    }
+    if (member->is_syncing()) {
+        member->set_sync_response(
+          sync_group_response(error_code::fenced_instance_id));
+    }
+    if (is_leader(old_member_id)) {
+        _leader = member->id();
+    }
+
+    auto static_it = _static_members.find(instance_id);
+    vassert(
+      static_it != _static_members.end(),
+      "Static member that is going to be replaced must existing in group "
+      "static members map. instance_id: {}, group_state: {}",
+      instance_id,
+      *this);
+    static_it->second = new_member_id;
+
+    return member;
+}
+
+group::join_group_stages
+group::add_new_dynamic_member(member_id new_member_id, join_group_request&& r) {
+    vassert(
+      !r.data.group_instance_id,
+      "Group instance id must be empty for dynamic members, request: {}",
+      r.data);
     // <kafka>Only return MEMBER_ID_REQUIRED error if joinGroupRequest version
     // is >= 4 and groupInstanceId is configured to unknown.</kafka>
-    if (r.version >= api_version(4) && !r.data.group_instance_id) {
+    if (r.version >= api_version(4)) {
         // <kafka>If member id required (dynamic membership), register the
         // member in the pending member list and send back a response to
         // call for another join group request with allocated member id.
@@ -520,13 +775,14 @@ group::join_group_unknown_member(join_group_request&& r) {
           "Requesting rejoin for unknown member with new id {}",
           new_member_id);
         add_pending_member(new_member_id, r.data.session_timeout_ms);
-        return make_join_error(new_member_id, error_code::member_id_required);
+        return join_group_stages(
+          make_join_error(new_member_id, error_code::member_id_required));
     } else {
         return add_member_and_rebalance(std::move(new_member_id), std::move(r));
     }
 }
 
-ss::future<join_group_response>
+group::join_group_stages
 group::join_group_known_member(join_group_request&& r) {
     if (in_state(group_state::dead)) {
         vlog(
@@ -534,23 +790,26 @@ group::join_group_known_member(join_group_request&& r) {
           "Join rejected in state {} for {}",
           _state,
           r.data.member_id);
-        return make_join_error(
-          r.data.member_id, error_code::coordinator_not_available);
+        return join_group_stages(make_join_error(
+          r.data.member_id, error_code::coordinator_not_available));
 
     } else if (!supports_protocols(r)) {
-        return make_join_error(
-          r.data.member_id, error_code::inconsistent_group_protocol);
+        return join_group_stages(make_join_error(
+          r.data.member_id, error_code::inconsistent_group_protocol));
 
     } else if (contains_pending_member(r.data.member_id)) {
         kafka::member_id new_member_id = std::move(r.data.member_id);
         return add_member_and_rebalance(std::move(new_member_id), std::move(r));
 
-    } else if (!contains_member(r.data.member_id)) {
+    } else if (auto ec = validate_existing_member(
+                 r.data.member_id, r.data.group_instance_id, "join");
+               ec != error_code::none) {
         vlog(
           _ctxlog.trace,
-          "Join rejected for unregistered member {}",
-          r.data.member_id);
-        return make_join_error(r.data.member_id, error_code::unknown_member_id);
+          "Join rejected for invalid member {} - {}",
+          r.data.member_id,
+          ec);
+        return join_group_stages(make_join_error(r.data.member_id, ec));
     }
 
     auto member = get_member(r.data.member_id);
@@ -592,8 +851,7 @@ group::join_group_known_member(join_group_request&& r) {
               member->id(),
               response);
 
-            return ss::make_ready_future<join_group_response>(
-              std::move(response));
+            return join_group_stages(std::move(response));
 
         } else {
             // <kafka>member has changed metadata, so force a rebalance</kafka>
@@ -626,21 +884,21 @@ group::join_group_known_member(join_group_request&& r) {
 
             vlog(_ctxlog.trace, "Handling idemponent group join {}", response);
 
-            return ss::make_ready_future<join_group_response>(
-              std::move(response));
+            return join_group_stages(std::move(response));
         }
 
     case group_state::empty:
         [[fallthrough]];
 
     case group_state::dead:
-        return make_join_error(r.data.member_id, error_code::unknown_member_id);
+        return join_group_stages(
+          make_join_error(r.data.member_id, error_code::unknown_member_id));
     }
 
     __builtin_unreachable();
 }
 
-ss::future<join_group_response> group::add_member_and_rebalance(
+group::join_group_stages group::add_member_and_rebalance(
   kafka::member_id member_id, join_group_request&& r) {
     auto member = ss::make_lw_shared<group_member>(
       std::move(member_id),
@@ -699,15 +957,15 @@ ss::future<join_group_response> group::add_member_and_rebalance(
       *this);
 
     try_prepare_rebalance();
-    return response;
+    return join_group_stages(std::move(response));
 }
 
-ss::future<join_group_response>
+group::join_group_stages
 group::update_member_and_rebalance(member_ptr member, join_group_request&& r) {
     auto response = update_member(
       std::move(member), r.native_member_protocols());
     try_prepare_rebalance();
-    return response;
+    return join_group_stages(std::move(response));
 }
 
 void group::try_prepare_rebalance() {
@@ -724,13 +982,15 @@ void group::try_prepare_rebalance() {
     }
 
     auto prev_state = set_state(group_state::preparing_rebalance);
-
-    if (prev_state == group_state::empty) {
+    _initial_join_in_progress = prev_state == group_state::empty;
+    if (_initial_join_in_progress) {
         // debounce joins to an empty group. for a bounded delay, we'll avoid
         // competing the join phase as long as new members are arriving.
-        auto rebalance = rebalance_timeout();
+        auto rebalance = std::chrono::duration_cast<std::chrono::milliseconds>(
+          rebalance_timeout());
         auto initial = _conf.group_initial_rebalance_delay();
-        auto remaining = std::max(rebalance - initial, duration_type(0));
+        auto remaining = std::max(
+          rebalance - initial, std::chrono::milliseconds(0));
 
         _join_timer.cancel();
         _join_timer.set_callback(
@@ -740,7 +1000,7 @@ void group::try_prepare_rebalance() {
                   auto prev_delay = delay;
                   delay = std::min(initial, remaining);
                   remaining = std::max(
-                    remaining - prev_delay, duration_type(0));
+                    remaining - prev_delay, std::chrono::milliseconds(0));
                   vlog(
                     _ctxlog.trace,
                     "Scheduling debounce join timer for {} ms remaining {} ms",
@@ -787,12 +1047,13 @@ void group::try_prepare_rebalance() {
  */
 void group::complete_join() {
     vlog(_ctxlog.trace, "Completing join for group {}", *this);
+    _initial_join_in_progress = false;
 
     // <kafka>remove dynamic members who haven't joined the group yet</kafka>
     // this is the old group->remove_unjoined_members();
     const auto prev_leader = _leader;
     for (auto it = _members.begin(); it != _members.end();) {
-        if (!it->second->is_joining()) {
+        if (!it->second->is_joining() && !it->second->is_static()) {
             vlog(_ctxlog.trace, "Removing unjoined member {}", it->first);
 
             // cancel the heartbeat timer
@@ -858,14 +1119,11 @@ void group::complete_join() {
 
         if (in_state(group_state::empty)) {
             vlog(_ctxlog.trace, "Checkpointing empty group {}", *this);
-            auto batch = checkpoint(assignments_type{});
-            auto reader = model::make_memory_record_batch_reader(
-              std::move(batch));
-            (void)_partition
-              ->replicate(
-                std::move(reader),
-                raft::replicate_options(raft::consistency_level::quorum_ack))
-              .then([]([[maybe_unused]] result<raft::replicate_result> r) {});
+            ssx::background
+              = store_group(checkpoint(assignments_type{}))
+                  .then(
+                    []([[maybe_unused]] result<raft::replicate_result> r) {})
+                  .finally([this_group = shared_from_this()] {});
         } else {
             std::for_each(
               std::cbegin(_members),
@@ -980,7 +1238,9 @@ void group::remove_pending_member(kafka::member_id member_id) {
     }
 }
 
-void group::shutdown() {
+ss::future<> group::shutdown() {
+    _auto_abort_timer.cancel();
+    co_await _gate.close();
     // cancel join timer
     _join_timer.cancel();
     // cancel pending members timers
@@ -995,7 +1255,7 @@ void group::shutdown() {
               error_code::not_coordinator, member->assignment()));
         } else if (member->is_joining()) {
             try_finish_joining_member(
-              member, _make_join_error(member_id, error_code::not_coordinator));
+              member, make_join_error(member_id, error_code::not_coordinator));
         }
     }
 }
@@ -1008,7 +1268,7 @@ void group::remove_member(member_ptr member) {
     // the member. We return UNKNOWN_MEMBER_ID so that the consumer will retry
     // the JoinGroup request if is still active.</kafka>
     try_finish_joining_member(
-      member, _make_join_error(no_member, error_code::unknown_member_id));
+      member, make_join_error(no_member, error_code::unknown_member_id));
 
     // TODO: (not blocker) avoid the double look-up. we could do the removal
     // from the index in the caller and then pass in the shared_ptr.
@@ -1023,6 +1283,9 @@ void group::remove_member(member_ptr member) {
                 _num_members_joining--;
                 vassert(_num_members_joining >= 0, "negative members joining");
             }
+        }
+        if (it->second->group_instance_id()) {
+            _static_members.erase(it->second->group_instance_id().value());
         }
         _members.erase(it);
     }
@@ -1071,20 +1334,23 @@ void group::remove_member(member_ptr member) {
     }
 }
 
-ss::future<sync_group_response>
-group::handle_sync_group(sync_group_request&& r) {
+group::sync_group_stages group::handle_sync_group(sync_group_request&& r) {
     vlog(_ctxlog.trace, "Handling sync group request {}", r);
 
     if (in_state(group_state::dead)) {
         vlog(_ctxlog.trace, "Sync rejected for group state {}", _state);
-        return make_sync_error(error_code::coordinator_not_available);
+        return sync_group_stages(
+          sync_group_response(error_code::coordinator_not_available));
 
-    } else if (!contains_member(r.data.member_id)) {
+    } else if (auto ec = validate_existing_member(
+                 r.data.member_id, r.data.group_instance_id, "sync");
+               ec != error_code::none) {
         vlog(
           _ctxlog.trace,
-          "Sync rejected for unregistered member {}",
-          r.data.member_id);
-        return make_sync_error(error_code::unknown_member_id);
+          "Sync rejected for invalid member {} - {}",
+          r.data.member_id,
+          ec);
+        return sync_group_stages(sync_group_response(ec));
 
     } else if (r.data.generation_id != generation()) {
         vlog(
@@ -1092,7 +1358,8 @@ group::handle_sync_group(sync_group_request&& r) {
           "Sync rejected with out-of-date generation {} != {}",
           r.data.generation_id,
           generation());
-        return make_sync_error(error_code::illegal_generation);
+        return sync_group_stages(
+          sync_group_response(error_code::illegal_generation));
     }
 
     // the two states of interest are `completing rebalance` and `stable`.
@@ -1113,11 +1380,13 @@ group::handle_sync_group(sync_group_request&& r) {
     switch (state()) {
     case group_state::empty:
         vlog(_ctxlog.trace, "Sync rejected for group state {}", _state);
-        return make_sync_error(error_code::unknown_member_id);
+        return sync_group_stages(
+          sync_group_response(error_code::unknown_member_id));
 
     case group_state::preparing_rebalance:
         vlog(_ctxlog.trace, "Sync rejected for group state {}", _state);
-        return make_sync_error(error_code::rebalance_in_progress);
+        return sync_group_stages(
+          sync_group_response(error_code::rebalance_in_progress));
 
     case group_state::completing_rebalance: {
         auto member = get_member(r.data.member_id);
@@ -1135,7 +1404,7 @@ group::handle_sync_group(sync_group_request&& r) {
           "Handling idemponent group sync for member {} with reply {}",
           member,
           reply);
-        return ss::make_ready_future<sync_group_response>(std::move(reply));
+        return sync_group_stages(sync_group_response(std::move(reply)));
     }
 
     case group_state::dead:
@@ -1147,38 +1416,23 @@ group::handle_sync_group(sync_group_request&& r) {
 }
 
 model::record_batch group::checkpoint(const assignments_type& assignments) {
-    group_metadata_key key;
-    key.group_id = _id;
-    group_metadata_value metadata;
-
-    metadata.protocol_type = protocol_type().value_or(kafka::protocol_type(""));
-    metadata.generation = generation();
-    metadata.protocol = protocol();
-    metadata.leader = leader();
-    metadata.state_timestamp = _state_timestamp;
-
-    for (const auto& it : _members) {
-        auto& member = it.second;
-        auto state = it.second->state().copy();
-        // this is not coming from the member itself because the checkpoint
-        // occurs right before the members go live and get their assignments.
-        state.assignment = bytes_to_iobuf(assignments.at(member->id()));
-        state.subscription = bytes_to_iobuf(
-          it.second->get_protocol_metadata(_protocol.value()));
-        metadata.members.push_back(std::move(state));
-    }
-
-    cluster::simple_batch_builder builder(
-      model::record_batch_type::raft_data, model::offset(0));
-
-    auto kv = _md_serializer.to_kv(
-      group_metadata_kv{.key = std::move(key), .value = std::move(metadata)});
-    builder.add_raw_kv(std::move(kv.key), std::move(kv.value));
-
-    return std::move(builder).build();
+    return do_checkpoint(
+      [&assignments](const member_id& id) { return assignments.at(id); });
 }
 
-ss::future<sync_group_response> group::sync_group_completing_rebalance(
+model::record_batch group::checkpoint() {
+    return do_checkpoint([this](const member_id& id) {
+        auto it = _members.find(id);
+        vassert(
+          it != _members.end(),
+          "Checkpointed member {} must be part of the group {}",
+          id,
+          *this);
+        return it->second->assignment();
+    });
+}
+
+group::sync_group_stages group::sync_group_completing_rebalance(
   member_ptr member, sync_group_request&& r) {
     // this response will be set by the leader when it arrives. the leader also
     // sets its own response which reduces the special cases in the code, but we
@@ -1192,7 +1446,7 @@ ss::future<sync_group_response> group::sync_group_completing_rebalance(
           _ctxlog.trace,
           "Non-leader member waiting for assignment {}",
           member->id());
-        return response;
+        return sync_group_stages(std::move(response));
     }
 
     vlog(_ctxlog.trace, "Completing group sync with leader {}", member->id());
@@ -1204,53 +1458,52 @@ ss::future<sync_group_response> group::sync_group_completing_rebalance(
     auto assignments = std::move(r).member_assignments();
     add_missing_assignments(assignments);
 
-    auto batch = checkpoint(assignments);
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
+    auto f = store_group(checkpoint(assignments))
+               .then([this,
+                      response = std::move(response),
+                      expected_generation = generation(),
+                      assignments = std::move(assignments)](
+                       result<raft::replicate_result> r) mutable {
+                   /*
+                    * the group's state has changed (e.g. another member
+                    * joined). there's nothing to do now except have the client
+                    * wait for an update.
+                    */
+                   if (
+                     !in_state(group_state::completing_rebalance)
+                     || expected_generation != generation()) {
+                       vlog(
+                         _ctxlog.trace,
+                         "Group state changed while completing sync");
+                       return std::move(response);
+                   }
 
-    return _partition
-      ->replicate(
-        std::move(reader),
-        raft::replicate_options(raft::consistency_level::quorum_ack))
-      .then([this,
-             response = std::move(response),
-             expected_generation = generation(),
-             assignments = std::move(assignments)](
-              result<raft::replicate_result> r) mutable {
-          /*
-           * the group's state has changed (e.g. another member joined). there's
-           * nothing to do now except have the client wait for an update.
-           */
-          if (
-            !in_state(group_state::completing_rebalance)
-            || expected_generation != generation()) {
-              vlog(_ctxlog.trace, "Group state changed while completing sync");
-              return std::move(response);
-          }
+                   if (r) {
+                       // the group state was successfully persisted:
+                       //   - save the member assignments; clients may
+                       //   re-request
+                       //   - unblock any clients waiting on their assignment
+                       //   - transition the group to the stable state
+                       set_assignments(std::move(assignments));
+                       finish_syncing_members(error_code::none);
+                       set_state(group_state::stable);
+                       vlog(_ctxlog.trace, "Successfully completed group sync");
+                   } else {
+                       vlog(
+                         _ctxlog.trace,
+                         "An error occurred completing group sync {}",
+                         r.error());
+                       // an error was encountered persisting the group state:
+                       //   - clear all the member assignments
+                       //   - propogate error back to waiting clients
+                       clear_assignments();
+                       finish_syncing_members(error_code::not_coordinator);
+                       try_prepare_rebalance();
+                   }
 
-          if (r) {
-              // the group state was successfully persisted:
-              //   - save the member assignments; clients may re-request
-              //   - unblock any clients waiting on their assignment
-              //   - transition the group to the stable state
-              set_assignments(std::move(assignments));
-              finish_syncing_members(error_code::none);
-              set_state(group_state::stable);
-              vlog(_ctxlog.trace, "Successfully completed group sync");
-          } else {
-              vlog(
-                _ctxlog.trace,
-                "An error occurred completing group sync {}",
-                r.error());
-              // an error was encountered persisting the group state:
-              //   - clear all the member assignments
-              //   - propogate error back to waiting clients
-              clear_assignments();
-              finish_syncing_members(error_code::not_coordinator);
-              try_prepare_rebalance();
-          }
-
-          return std::move(response);
-      });
+                   return std::move(response);
+               });
+    return sync_group_stages(std::move(f));
 }
 
 ss::future<heartbeat_response> group::handle_heartbeat(heartbeat_request&& r) {
@@ -1260,12 +1513,15 @@ ss::future<heartbeat_response> group::handle_heartbeat(heartbeat_request&& r) {
         vlog(_ctxlog.trace, "Heartbeat rejected for group state {}", _state);
         return make_heartbeat_error(error_code::coordinator_not_available);
 
-    } else if (!contains_member(r.data.member_id)) {
+    } else if (auto ec = validate_existing_member(
+                 r.data.member_id, r.data.group_instance_id, "heartbeat");
+               ec != error_code::none) {
         vlog(
           _ctxlog.trace,
-          "Heartbeat rejected for unregistered member {}",
-          r.data.member_id);
-        return make_heartbeat_error(error_code::unknown_member_id);
+          "Heartbeat rejected for invalid member {} - {}",
+          r.data.member_id,
+          ec);
+        return make_heartbeat_error(ec);
 
     } else if (r.data.generation_id != generation()) {
         vlog(
@@ -1308,30 +1564,72 @@ ss::future<heartbeat_response> group::handle_heartbeat(heartbeat_request&& r) {
 ss::future<leave_group_response>
 group::handle_leave_group(leave_group_request&& r) {
     vlog(_ctxlog.trace, "Handling leave group request {}", r);
-
     if (in_state(group_state::dead)) {
         vlog(_ctxlog.trace, "Leave rejected for group state {}", _state);
         return make_leave_error(error_code::coordinator_not_available);
+    }
+    /**
+     * Leave group prior to version 3 were requesting only a single member
+     * leave.
+     */
+    if (r.version < api_version(3)) {
+        auto err = member_leave_group(r.data.member_id, std::nullopt);
+        return make_leave_error(err);
+    }
 
-    } else if (contains_pending_member(r.data.member_id)) {
+    leave_group_response response(error_code::none);
+
+    response.data.members.reserve(r.data.members.size());
+    for (auto& m : r.data.members) {
+        auto ec = member_leave_group(m.member_id, m.group_instance_id);
+        response.data.members.push_back(member_response{
+          .member_id = m.member_id,
+          .group_instance_id = m.group_instance_id,
+          .error_code = ec});
+    }
+    return ss::make_ready_future<leave_group_response>(std::move(response));
+}
+
+kafka::error_code group::member_leave_group(
+  const member_id& member_id,
+  const std::optional<group_instance_id>& group_instance_id) {
+    // <kafka>The LeaveGroup API allows administrative removal of members by
+    // GroupInstanceId in which case we expect the MemberId to be
+    // undefined.</kafka>
+    if (member_id == unknown_member_id) {
+        if (!group_instance_id) {
+            return error_code::unknown_member_id;
+        }
+
+        auto it = _static_members.find(*group_instance_id);
+        if (it == _static_members.end()) {
+            return error_code::unknown_member_id;
+        }
+        // recurse with found mapping
+        return member_leave_group(it->second, group_instance_id);
+    }
+
+    if (contains_pending_member(member_id)) {
         // <kafka>if a pending member is leaving, it needs to be removed
         // from the pending list, heartbeat cancelled and if necessary,
         // prompt a JoinGroup completion.</kafka>
-        remove_pending_member(r.data.member_id);
-        return make_leave_error(error_code::none);
+        remove_pending_member(member_id);
+        return error_code::none;
 
-    } else if (!contains_member(r.data.member_id)) {
+    } else if (auto ec = validate_existing_member(
+                 member_id, group_instance_id, "leave");
+               ec != error_code::none) {
         vlog(
           _ctxlog.trace,
-          "Leave rejected for unregistered member {}",
-          r.data.member_id);
-        return make_leave_error(error_code::unknown_member_id);
-
+          "Leave rejected for invalid member {} - {}",
+          member_id,
+          ec);
+        return ec;
     } else {
-        auto member = get_member(r.data.member_id);
+        auto member = get_member(member_id);
         member->expire_timer().cancel();
         remove_member(member);
-        return make_leave_error(error_code::none);
+        return error_code::none;
     }
 }
 
@@ -1369,16 +1667,79 @@ void group::reset_tx_state(model::term_id term) {
 
 void group::insert_prepared(prepared_tx tx) {
     auto pid = tx.pid;
+
+    // TODO: warn when legacy support is removed and _tx_data doesn't contain
+    // pid
+    auto [txseq_it, inserted] = _tx_data.try_emplace(
+      pid.get_id(), tx_data{tx.tx_seq, model::legacy_tm_ntp.tp.partition});
+    if (!inserted) {
+        if (txseq_it->second.tx_seq != tx.tx_seq) {
+            vlog(
+              _ctx_txlog.warn,
+              "prepared_tx of pid {} has tx_seq {} while {} expected",
+              tx.pid,
+              tx.tx_seq,
+              txseq_it->second.tx_seq);
+        }
+    }
+
     _prepared_txs[pid] = std::move(tx);
 }
 
 ss::future<cluster::commit_group_tx_reply>
 group::commit_tx(cluster::commit_group_tx_request r) {
-    // doesn't make sense to fence off a commit because transaction
-    // manager has already decided to commit and acked to a client
-
     if (_partition->term() != _term) {
         co_return make_commit_tx_reply(cluster::tx_errc::stale);
+    }
+
+    auto fence_it = _fence_pid_epoch.find(r.pid.get_id());
+    if (fence_it == _fence_pid_epoch.end()) {
+        vlog(
+          _ctx_txlog.warn,
+          "Can't prepare tx: fence with pid {} isn't set",
+          r.pid);
+        co_return make_commit_tx_reply(cluster::tx_errc::request_rejected);
+    }
+    if (r.pid.get_epoch() != fence_it->second) {
+        vlog(
+          _ctx_txlog.trace,
+          "Can't prepare tx with pid {} - the fence doesn't match {}",
+          r.pid,
+          fence_it->second);
+        co_return make_commit_tx_reply(cluster::tx_errc::request_rejected);
+    }
+
+    auto txseq_it = _tx_data.find(r.pid.get_id());
+    if (txseq_it == _tx_data.end()) {
+        if (is_transaction_ga()) {
+            vlog(
+              _ctx_txlog.trace,
+              "can't find a tx {}, probably already comitted",
+              r.pid);
+            co_return make_commit_tx_reply(cluster::tx_errc::none);
+        }
+    } else if (txseq_it->second.tx_seq > r.tx_seq) {
+        // rare situation:
+        //   * tm_stm begins (tx_seq+1)
+        //   * request on this group passes but then tm_stm fails and forgets
+        //   about this tx
+        //   * during recovery tm_stm recommits previous tx (tx_seq)
+        // existence of {pid, tx_seq+1} implies {pid, tx_seq} is committed
+        vlog(
+          _ctx_txlog.trace,
+          "Already commited pid:{} tx_seq:{} - a higher tx_seq:{} was observed",
+          r.pid,
+          r.tx_seq,
+          txseq_it->second.tx_seq);
+        co_return make_commit_tx_reply(cluster::tx_errc::none);
+    } else if (txseq_it->second.tx_seq != r.tx_seq) {
+        vlog(
+          _ctx_txlog.warn,
+          "Can't commit pid {}: passed txseq {} doesn't match ongoing {}",
+          r.pid,
+          r.tx_seq,
+          txseq_it->second.tx_seq);
+        co_return make_commit_tx_reply(cluster::tx_errc::request_rejected);
     }
 
     auto prepare_it = _prepared_txs.find(r.pid);
@@ -1389,7 +1750,6 @@ group::commit_tx(cluster::commit_group_tx_request r) {
           r.pid);
         co_return make_commit_tx_reply(cluster::tx_errc::none);
     }
-
     if (prepare_it->second.tx_seq > r.tx_seq) {
         // rare situation:
         //   * tm_stm prepares (tx_seq+1)
@@ -1405,64 +1765,11 @@ group::commit_tx(cluster::commit_group_tx_request r) {
           r.tx_seq);
         co_return make_commit_tx_reply(cluster::tx_errc::none);
     } else if (prepare_it->second.tx_seq < r.tx_seq) {
-        if (_recovery_policy == violation_recovery_policy::best_effort) {
-            vlog(
-              _ctx_txlog.error,
-              "Rejecting commit with tx_seq:{} since prepare with lesser "
-              "tx_seq:{} exists",
-              r.tx_seq,
-              prepare_it->second.tx_seq);
-            co_return make_commit_tx_reply(cluster::tx_errc::request_rejected);
-        } else {
-            vassert(
-              false,
-              "Received commit with tx_seq:{} while prepare with lesser "
-              "tx_seq:{} exists",
-              r.tx_seq,
-              prepare_it->second.tx_seq);
-        }
+        co_return make_commit_tx_reply(cluster::tx_errc::request_rejected);
     }
 
     // we commit only if a provided tx_seq matches prepared tx_seq
-
-    group_log_commit_tx commit_tx;
-    commit_tx.group_id = r.group_id;
-    // TODO: https://app.clubhouse.io/vectorized/story/2200
-    // include producer_id+type into key to make it unique-ish
-    // to prevent being GCed by the compaction
-    auto batch = make_tx_batch(
-      model::record_batch_type::group_commit_tx,
-      commit_tx_record_version,
-      r.pid,
-      std::move(commit_tx));
-
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
-
-    auto e = co_await _partition->replicate(
-      _term,
-      std::move(reader),
-      raft::replicate_options(raft::consistency_level::quorum_ack));
-
-    if (!e) {
-        co_return make_commit_tx_reply(cluster::tx_errc::unknown_server_error);
-    }
-
-    prepare_it = _prepared_txs.find(r.pid);
-    if (prepare_it == _prepared_txs.end()) {
-        vlog(
-          _ctx_txlog.error,
-          "can't find already observed prepared tx pid:{}",
-          r.pid);
-        co_return make_commit_tx_reply(cluster::tx_errc::unknown_server_error);
-    }
-
-    for (const auto& [tp, md] : prepare_it->second.offsets) {
-        try_upsert_offset(tp, md);
-    }
-
-    _prepared_txs.erase(prepare_it);
-
-    co_return make_commit_tx_reply(cluster::tx_errc::none);
+    co_return co_await do_commit(r.group_id, r.pid);
 }
 
 cluster::begin_group_tx_reply make_begin_tx_reply(cluster::tx_errc ec) {
@@ -1492,71 +1799,130 @@ cluster::abort_group_tx_reply make_abort_tx_reply(cluster::tx_errc ec) {
 ss::future<cluster::begin_group_tx_reply>
 group::begin_tx(cluster::begin_group_tx_request r) {
     if (_partition->term() != _term) {
+        vlog(
+          _ctx_txlog.trace,
+          "processing name:begin_tx pid:{} tx_seq:{} timeout:{} => stale "
+          "leader",
+          r.pid,
+          r.tx_seq,
+          r.timeout);
         co_return make_begin_tx_reply(cluster::tx_errc::stale);
     }
 
+    vlog(
+      _ctx_txlog.trace,
+      "processing name:begin_tx pid:{} tx_seq:{} timeout:{} in term:{}",
+      r.pid,
+      r.tx_seq,
+      r.timeout,
+      _term);
     auto fence_it = _fence_pid_epoch.find(r.pid.get_id());
-    if (
-      fence_it != _fence_pid_epoch.end()
-      && r.pid.get_epoch() < fence_it->second) {
+    if (fence_it == _fence_pid_epoch.end()) {
+        // intentionally empty
+    } else if (r.pid.get_epoch() < fence_it->second) {
         vlog(
           _ctx_txlog.error,
           "pid {} fenced out by epoch {}",
           r.pid,
           fence_it->second);
         co_return make_begin_tx_reply(cluster::tx_errc::fenced);
+    } else if (r.pid.get_epoch() > fence_it->second) {
+        // there is a fence, it might be that tm_stm failed, forget about
+        // an ongoing transaction, assigned next pid for the same tx.id and
+        // started a new transaction without aborting the previous one.
+        //
+        // at the same time it's possible that it already aborted the old
+        // tx before starting this. do_abort_tx is idempotent so calling it
+        // just in case to proactivly abort the tx instead of waiting for
+        // the timeout
+
+        auto old_pid = model::producer_identity{
+          r.pid.get_id(), fence_it->second};
+        auto ar = co_await do_try_abort_old_tx(old_pid);
+        if (ar != cluster::tx_errc::none) {
+            vlog(
+              _ctx_txlog.trace,
+              "can't begin tx {} because abort of a prev tx {} failed with {}; "
+              "retrying",
+              r.pid,
+              old_pid,
+              ar);
+            co_return make_begin_tx_reply(cluster::tx_errc::stale);
+        }
     }
 
-    if (
-      fence_it == _fence_pid_epoch.end()
-      || r.pid.get_epoch() > fence_it->second) {
-        group_log_fencing fence{.group_id = id()};
-
-        // TODO: https://app.clubhouse.io/vectorized/story/2200
-        // include producer_id into key to make it unique-ish
-        // to prevent being GCed by the compaction
-        auto batch = make_tx_batch(
-          model::record_batch_type::tx_fence,
-          fence_control_record_version,
-          r.pid,
-          std::move(fence));
-        auto reader = model::make_memory_record_batch_reader(std::move(batch));
-        auto e = co_await _partition->replicate(
-          _term,
-          std::move(reader),
-          raft::replicate_options(raft::consistency_level::quorum_ack));
-
-        if (!e) {
+    auto txseq_it = _tx_data.find(r.pid.get_id());
+    if (txseq_it != _tx_data.end()) {
+        if (r.tx_seq != txseq_it->second.tx_seq) {
             vlog(
-              _ctx_txlog.error,
-              "Error \"{}\" on replicating pid:{} fencing batch",
-              e.error(),
-              r.pid);
+              _ctx_txlog.warn,
+              "can't begin a tx {} with tx_seq {}: a producer id is already "
+              "involved in a tx with tx_seq {}",
+              r.pid,
+              r.tx_seq,
+              txseq_it->second.tx_seq);
             co_return make_begin_tx_reply(
               cluster::tx_errc::unknown_server_error);
         }
-
-        // _fence_pid_epoch may change while the method waits for the
-        //  replicate coroutine to finish so the fence_it may become
-        //  invalidated and we need to grab it again
-        fence_it = _fence_pid_epoch.find(r.pid.get_id());
-        if (fence_it == _fence_pid_epoch.end()) {
-            _fence_pid_epoch.emplace(r.pid.get_id(), r.pid.get_epoch());
-        } else {
-            fence_it->second = r.pid.get_epoch();
+        if (_prepared_txs.contains(r.pid)) {
+            vlog(
+              _ctx_txlog.warn,
+              "can't begin a tx {} with tx_seq {}: it was already begun and it "
+              "accepted writes",
+              r.pid,
+              r.tx_seq);
+            co_return make_begin_tx_reply(
+              cluster::tx_errc::unknown_server_error);
         }
+        co_return cluster::begin_group_tx_reply(_term, cluster::tx_errc::none);
     }
 
-    // TODO: https://app.clubhouse.io/vectorized/story/2194
-    // (auto-abort txes with the the same producer_id but older epoch)
-    auto [_, inserted] = _volatile_txs.try_emplace(
-      r.pid, volatile_tx{.tx_seq = r.tx_seq});
+    std::optional<model::record_batch> batch{};
 
-    if (!inserted) {
-        // TODO: https://app.clubhouse.io/vectorized/story/2194
-        // (auto-abort txes with the the same producer_id but older epoch)
-        co_return make_begin_tx_reply(cluster::tx_errc::request_rejected);
+    if (is_transaction_partitioning()) {
+        group_log_fencing fence{
+          .group_id = id(),
+          .tx_seq = r.tx_seq,
+          .transaction_timeout_ms = r.timeout,
+          .tm_partition = r.tm_partition};
+        batch = make_tx_fence_batch(r.pid, std::move(fence));
+    } else if (is_transaction_ga()) {
+        group_log_fencing_v1 fence{
+          .group_id = id(),
+          .tx_seq = r.tx_seq,
+          .transaction_timeout_ms = r.timeout};
+        batch = make_tx_fence_batch(r.pid, std::move(fence));
+    } else {
+        group_log_fencing_v0 fence{.group_id = id()};
+        batch = make_tx_fence_batch(r.pid, std::move(fence));
     }
+
+    auto reader = model::make_memory_record_batch_reader(
+      std::move(batch.value()));
+    auto e = co_await _partition->raft()->replicate(
+      _term,
+      std::move(reader),
+      raft::replicate_options(raft::consistency_level::quorum_ack));
+
+    if (!e) {
+        vlog(
+          _ctx_txlog.warn,
+          "Error \"{}\" on replicating pid:{} fencing batch",
+          e.error(),
+          r.pid);
+        co_return make_begin_tx_reply(cluster::tx_errc::leader_not_found);
+    }
+
+    _fence_pid_epoch[r.pid.get_id()] = r.pid.get_epoch();
+    _tx_data[r.pid.get_id()] = tx_data{r.tx_seq, r.tm_partition};
+
+    if (!is_transaction_ga()) {
+        _volatile_txs[r.pid] = volatile_tx{.tx_seq = r.tx_seq};
+    }
+
+    auto res = _expiration_info.insert_or_assign(
+      r.pid, expiration_info(r.timeout));
+    try_arm(res.first->second.deadline());
 
     cluster::begin_group_tx_reply reply;
     reply.etag = _term;
@@ -1570,97 +1936,110 @@ group::prepare_tx(cluster::prepare_group_tx_request r) {
         co_return make_prepare_tx_reply(cluster::tx_errc::stale);
     }
 
-    auto prepared_it = _prepared_txs.find(r.pid);
-    if (prepared_it != _prepared_txs.end()) {
-        if (prepared_it->second.tx_seq != r.tx_seq) {
+    auto is_txn_ga = is_transaction_ga();
+    if (!is_txn_ga) {
+        auto tx_it = _volatile_txs.find(r.pid);
+        if (tx_it == _volatile_txs.end()) {
+            // impossible situation, a transaction coordinator tries
+            // to prepare a transaction which wasn't started
+            vlog(
+              _ctx_txlog.error,
+              "Can't prepare pid:{} - unknown session",
+              r.pid);
+            co_return make_prepare_tx_reply(cluster::tx_errc::request_rejected);
+        }
+        if (tx_it->second.tx_seq != r.tx_seq) {
             // current prepare_tx call is stale, rejecting
             co_return make_prepare_tx_reply(cluster::tx_errc::request_rejected);
         }
-        // a tx was already prepared
-        co_return make_prepare_tx_reply(cluster::tx_errc::none);
+        if (r.etag != _term) {
+            co_return make_prepare_tx_reply(cluster::tx_errc::request_rejected);
+        }
     }
 
     // checking fencing
     auto fence_it = _fence_pid_epoch.find(r.pid.get_id());
-    if (fence_it != _fence_pid_epoch.end()) {
-        if (r.pid.get_epoch() < fence_it->second) {
-            vlog(
-              _ctx_txlog.trace,
-              "Can't prepare pid:{} - fenced out by epoch {}",
-              r.pid,
-              fence_it->second);
-            co_return make_prepare_tx_reply(cluster::tx_errc::fenced);
-        }
+    if (fence_it == _fence_pid_epoch.end()) {
+        vlog(
+          _ctx_txlog.warn,
+          "Can't prepare tx: fence with pid {} isn't set",
+          r.pid);
+        co_return make_prepare_tx_reply(cluster::tx_errc::request_rejected);
     }
-
-    if (r.etag != _term) {
+    if (r.pid.get_epoch() != fence_it->second) {
+        vlog(
+          _ctx_txlog.trace,
+          "Can't prepare tx with pid {} - the fence doesn't match {}",
+          r.pid,
+          fence_it->second);
         co_return make_prepare_tx_reply(cluster::tx_errc::request_rejected);
     }
 
-    auto tx_it = _volatile_txs.find(r.pid);
-    if (tx_it == _volatile_txs.end()) {
-        // impossible situation, a transaction coordinator tries
-        // to prepare a transaction which wasn't started
-        vlog(_ctx_txlog.error, "Can't prepare pid:{} - unknown session", r.pid);
+    auto txseq_it = _tx_data.find(r.pid.get_id());
+    if (txseq_it != _tx_data.end() && txseq_it->second.tx_seq != r.tx_seq) {
+        vlog(
+          _ctx_txlog.warn,
+          "Can't prepare pid {}: passed txseq {} doesn't match ongoing {}",
+          r.pid,
+          r.tx_seq,
+          txseq_it->second.tx_seq);
         co_return make_prepare_tx_reply(cluster::tx_errc::request_rejected);
     }
 
-    if (tx_it->second.tx_seq != r.tx_seq) {
-        // current prepare_tx call is stale, rejecting
+    auto prepared_it = _prepared_txs.find(r.pid);
+    if (prepared_it == _prepared_txs.end()) {
+        vlog(
+          _ctx_txlog.warn, "Can't prepare tx with pid {}: unknown tx", r.pid);
+        co_return make_prepare_tx_reply(cluster::tx_errc::request_rejected);
+    }
+    if (prepared_it->second.tx_seq != r.tx_seq) {
+        vlog(
+          _ctx_txlog.warn,
+          "Can't prepare pid {}: passed txseq {} doesn't match known {}",
+          r.pid,
+          r.tx_seq,
+          prepared_it->second.tx_seq);
         co_return make_prepare_tx_reply(cluster::tx_errc::request_rejected);
     }
 
-    auto tx_entry = group_log_prepared_tx{
-      .group_id = r.group_id, .pid = r.pid, .tx_seq = r.tx_seq};
-
-    for (const auto& [tp, offset] : tx_it->second.offsets) {
-        group_log_prepared_tx_offset tx_offset;
-
-        tx_offset.tp = tp;
-        tx_offset.offset = offset.offset;
-        tx_offset.leader_epoch = offset.leader_epoch;
-        tx_offset.metadata = offset.metadata;
-        tx_entry.offsets.push_back(tx_offset);
+    if (!is_txn_ga) {
+        _volatile_txs.erase(r.pid);
     }
 
-    volatile_tx tx = tx_it->second;
-    _volatile_txs.erase(tx_it);
-
-    // TODO: https://app.clubhouse.io/vectorized/story/2200
-    // include producer_id+type into key to make it unique-ish
-    // to prevent being GCed by the compaction
-    auto batch = make_tx_batch(
-      model::record_batch_type::group_prepare_tx,
-      prepared_tx_record_version,
-      r.pid,
-      std::move(tx_entry));
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
-
-    auto e = co_await _partition->replicate(
-      _term,
-      std::move(reader),
-      raft::replicate_options(raft::consistency_level::quorum_ack));
-
-    if (!e) {
-        co_return make_prepare_tx_reply(cluster::tx_errc::unknown_server_error);
+    auto exp_it = _expiration_info.find(r.pid);
+    if (exp_it != _expiration_info.end()) {
+        exp_it->second.update_last_update_time();
     }
 
-    prepared_tx ptx;
-    ptx.tx_seq = r.tx_seq;
-    for (const auto& [tp, offset] : tx.offsets) {
-        offset_metadata md{
-          .log_offset = e.value().last_offset,
-          .offset = offset.offset,
-          .metadata = offset.metadata.value_or(""),
-          .committed_leader_epoch = offset.leader_epoch};
-        ptx.offsets[tp] = md;
-    }
-    _prepared_txs[r.pid] = ptx;
     co_return make_prepare_tx_reply(cluster::tx_errc::none);
 }
 
 cluster::abort_origin group::get_abort_origin(
   const model::producer_identity& pid, model::tx_seq tx_seq) const {
+    if (is_transaction_ga()) {
+        auto it = _tx_data.find(pid.get_id());
+        if (it != _tx_data.end()) {
+            if (tx_seq < it->second.tx_seq) {
+                return cluster::abort_origin::past;
+            }
+            if (it->second.tx_seq < tx_seq) {
+                return cluster::abort_origin::future;
+            }
+        }
+
+        return cluster::abort_origin::present;
+    }
+
+    auto txseq_it = _tx_data.find(pid.get_id());
+    if (txseq_it != _tx_data.end()) {
+        if (tx_seq < txseq_it->second.tx_seq) {
+            return cluster::abort_origin::past;
+        }
+        if (txseq_it->second.tx_seq < tx_seq) {
+            return cluster::abort_origin::future;
+        }
+    }
+
     auto expected_it = _volatile_txs.find(pid);
     if (expected_it != _volatile_txs.end()) {
         if (tx_seq < expected_it->second.tx_seq) {
@@ -1693,10 +2072,69 @@ group::abort_tx(cluster::abort_group_tx_request r) {
         co_return make_abort_tx_reply(cluster::tx_errc::stale);
     }
 
+    auto fence_it = _fence_pid_epoch.find(r.pid.get_id());
+    if (fence_it == _fence_pid_epoch.end()) {
+        vlog(
+          _ctx_txlog.warn,
+          "Can't abort tx: fence with pid {} isn't set",
+          r.pid);
+        co_return make_abort_tx_reply(cluster::tx_errc::request_rejected);
+    }
+    if (r.pid.get_epoch() != fence_it->second) {
+        vlog(
+          _ctx_txlog.trace,
+          "Can't abort tx with pid {} - the fence doesn't match {}",
+          r.pid,
+          fence_it->second);
+        co_return make_abort_tx_reply(cluster::tx_errc::request_rejected);
+    }
+
+    auto txseq_it = _tx_data.find(r.pid.get_id());
+    if (txseq_it == _tx_data.end()) {
+        if (is_transaction_ga()) {
+            vlog(
+              _ctx_txlog.trace,
+              "can't find a tx {}, probably already aborted",
+              r.pid);
+            co_return make_abort_tx_reply(cluster::tx_errc::none);
+        }
+    } else if (txseq_it->second.tx_seq > r.tx_seq) {
+        // rare situation:
+        //   * tm_stm begins (tx_seq+1)
+        //   * request on this group passes but then tm_stm fails and forgets
+        //   about this tx
+        //   * during recovery tm_stm reaborts previous tx (tx_seq)
+        // existence of {pid, tx_seq+1} implies {pid, tx_seq} is aborted
+        vlog(
+          _ctx_txlog.trace,
+          "Already aborted pid:{} tx_seq:{} - a higher tx_seq:{} was observed",
+          r.pid,
+          r.tx_seq,
+          txseq_it->second.tx_seq);
+        co_return make_abort_tx_reply(cluster::tx_errc::none);
+    } else if (txseq_it->second.tx_seq != r.tx_seq) {
+        vlog(
+          _ctx_txlog.warn,
+          "Can't abort pid {}: passed txseq {} doesn't match ongoing {}",
+          r.pid,
+          r.tx_seq,
+          txseq_it->second.tx_seq);
+        co_return make_abort_tx_reply(cluster::tx_errc::request_rejected);
+    }
+
     auto origin = get_abort_origin(r.pid, r.tx_seq);
     if (origin == cluster::abort_origin::past) {
         // rejecting a delayed abort command to prevent aborting
         // a wrong transaction
+        auto it = _expiration_info.find(r.pid);
+        if (it != _expiration_info.end()) {
+            it->second.is_expiration_requested = true;
+        } else {
+            vlog(
+              _ctx_txlog.error,
+              "pid({}) should be inside _expiration_info",
+              r.pid);
+        }
         co_return make_abort_tx_reply(cluster::tx_errc::request_rejected);
     }
     if (origin == cluster::abort_origin::future) {
@@ -1712,66 +2150,136 @@ group::abort_tx(cluster::abort_group_tx_request r) {
         co_return make_abort_tx_reply(cluster::tx_errc::request_rejected);
     }
 
-    // preventing prepare and replicte once we
-    // know we're going to abort tx and abandon pid
-    _volatile_txs.erase(r.pid);
-
-    // TODO: https://app.clubhouse.io/vectorized/story/2197
-    // (check for tx_seq to prevent old abort requests aborting
-    // new transactions in the same session)
-
-    auto tx = group_log_aborted_tx{.group_id = r.group_id, .tx_seq = r.tx_seq};
-
-    // TODO: https://app.clubhouse.io/vectorized/story/2200
-    // include producer_id+type into key to make it unique-ish
-    // to prevent being GCed by the compaction
-    auto batch = make_tx_batch(
-      model::record_batch_type::group_abort_tx,
-      aborted_tx_record_version,
-      r.pid,
-      std::move(tx));
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
-
-    auto e = co_await _partition->replicate(
-      _term,
-      std::move(reader),
-      raft::replicate_options(raft::consistency_level::quorum_ack));
-
-    if (!e) {
-        co_return make_abort_tx_reply(cluster::tx_errc::unknown_server_error);
-    }
-
-    _prepared_txs.erase(r.pid);
-
-    co_return make_abort_tx_reply(cluster::tx_errc::none);
+    co_return co_await do_abort(r.group_id, r.pid, r.tx_seq);
 }
 
 ss::future<txn_offset_commit_response>
 group::store_txn_offsets(txn_offset_commit_request r) {
+    // replaying the log, the term isn't set yet
+    // we should use replay or not a leader error
     if (_partition->term() != _term) {
+        vlog(
+          _ctx_txlog.warn,
+          "Last known term {} doesn't match partition term {}",
+          _term,
+          _partition->term());
         co_return txn_offset_commit_response(
           r, error_code::unknown_server_error);
     }
 
-    model::producer_identity pid{
-      .id = r.data.producer_id, .epoch = r.data.producer_epoch};
+    model::producer_identity pid{r.data.producer_id, r.data.producer_epoch};
 
-    auto tx_it = _volatile_txs.find(pid);
-
-    if (tx_it == _volatile_txs.end()) {
+    // checking fencing
+    auto fence_it = _fence_pid_epoch.find(pid.get_id());
+    if (fence_it == _fence_pid_epoch.end()) {
+        vlog(
+          _ctx_txlog.warn,
+          "Can't store txn offsets: fence with pid {} isn't set",
+          pid);
         co_return txn_offset_commit_response(
-          r, error_code::unknown_server_error);
+          r, error_code::invalid_producer_epoch);
+    }
+    if (r.data.producer_epoch != fence_it->second) {
+        vlog(
+          _ctx_txlog.trace,
+          "Can't store txn offsets with pid {} - the fence doesn't match {}",
+          pid,
+          fence_it->second);
+        co_return txn_offset_commit_response(
+          r, error_code::invalid_producer_epoch);
+    }
+
+    auto txseq_it = _tx_data.find(pid.get_id());
+    if (txseq_it == _tx_data.end()) {
+        vlog(
+          _ctx_txlog.warn,
+          "Can't store txn offsets: current tx with pid {} isn't ongoing",
+          pid);
+        co_return txn_offset_commit_response(
+          r, error_code::invalid_producer_epoch);
+    }
+    auto tx_seq = txseq_it->second.tx_seq;
+
+    if (!is_transaction_ga()) {
+        auto tx_it = _volatile_txs.find(pid);
+        if (tx_it == _volatile_txs.end()) {
+            co_return txn_offset_commit_response(
+              r, error_code::unknown_server_error);
+        }
+    }
+
+    absl::node_hash_map<model::topic_partition, group_log_prepared_tx_offset>
+      offsets;
+
+    auto prepare_it = _prepared_txs.find(pid);
+    if (prepare_it != _prepared_txs.end()) {
+        for (const auto& [tp, offset] : prepare_it->second.offsets) {
+            group_log_prepared_tx_offset md{
+              .tp = tp,
+              .offset = offset.offset,
+              .leader_epoch = offset.committed_leader_epoch,
+              .metadata = offset.metadata};
+            offsets[tp] = md;
+        }
     }
 
     for (const auto& t : r.data.topics) {
         for (const auto& p : t.partitions) {
             model::topic_partition tp(t.name, p.partition_index);
-            volatile_offset md{
+            group_log_prepared_tx_offset md{
+              .tp = tp,
               .offset = p.committed_offset,
               .leader_epoch = p.committed_leader_epoch,
               .metadata = p.committed_metadata};
-            tx_it->second.offsets[tp] = md;
+            offsets[tp] = md;
         }
+    }
+
+    auto tx_entry = group_log_prepared_tx{
+      .group_id = r.data.group_id, .pid = pid, .tx_seq = tx_seq};
+
+    for (const auto& [tp, offset] : offsets) {
+        tx_entry.offsets.push_back(offset);
+    }
+
+    auto batch = make_tx_batch(
+      model::record_batch_type::group_prepare_tx,
+      prepared_tx_record_version,
+      pid,
+      std::move(tx_entry));
+    auto reader = model::make_memory_record_batch_reader(std::move(batch));
+
+    auto e = co_await _partition->raft()->replicate(
+      _term,
+      std::move(reader),
+      raft::replicate_options(raft::consistency_level::quorum_ack));
+
+    if (!e) {
+        co_return txn_offset_commit_response(
+          r, error_code::unknown_server_error);
+    }
+
+    prepared_tx ptx;
+    ptx.tx_seq = tx_seq;
+    const auto now = model::timestamp::now();
+    for (const auto& [tp, offset] : offsets) {
+        offset_metadata md{
+          .log_offset = e.value().last_offset,
+          .offset = offset.offset,
+          .metadata = offset.metadata.value_or(""),
+          .committed_leader_epoch = kafka::leader_epoch(offset.leader_epoch),
+          .commit_timestamp = now,
+          .expiry_timestamp = std::nullopt,
+        };
+        ptx.offsets[tp] = md;
+    }
+    _prepared_txs[pid] = ptx;
+
+    auto it = _expiration_info.find(pid);
+    if (it != _expiration_info.end()) {
+        it->second.update_last_update_time();
+    } else {
+        vlog(_ctx_txlog.warn, "pid {} should be in _expiration_info", pid);
     }
 
     co_return txn_offset_commit_response(r, error_code::none);
@@ -1786,13 +2294,13 @@ kafka::error_code map_store_offset_error_code(std::error_code ec) {
         case raft::errc::shutting_down:
             return error_code::request_timed_out;
         case raft::errc::not_leader:
+        case raft::errc::replicated_entry_truncated:
             return error_code::not_coordinator;
         case raft::errc::disconnected_endpoint:
         case raft::errc::exponential_backoff:
         case raft::errc::non_majority_replication:
         case raft::errc::vote_dispatch_error:
         case raft::errc::append_entries_dispatch_error:
-        case raft::errc::replicated_entry_truncated:
         case raft::errc::leader_flush_failed:
         case raft::errc::leader_append_failed:
         case raft::errc::configuration_change_in_progress:
@@ -1812,6 +2320,34 @@ kafka::error_code map_store_offset_error_code(std::error_code ec) {
     return error_code::unknown_server_error;
 }
 
+void group::update_store_offset_builder(
+  cluster::simple_batch_builder& builder,
+  const model::topic& name,
+  model::partition_id partition,
+  model::offset committed_offset,
+  leader_epoch committed_leader_epoch,
+  const ss::sstring& metadata,
+  model::timestamp commit_timestamp,
+  std::optional<model::timestamp> expiry_timestamp) {
+    offset_metadata_key key{
+      .group_id = _id, .topic = name, .partition = partition};
+
+    offset_metadata_value value{
+      .offset = committed_offset,
+      .leader_epoch = committed_leader_epoch,
+      .metadata = metadata,
+      .commit_timestamp = commit_timestamp,
+    };
+
+    if (expiry_timestamp.has_value()) {
+        value.expiry_timestamp = expiry_timestamp.value();
+    }
+
+    auto kv = _md_serializer.to_kv(
+      offset_metadata_kv{.key = std::move(key), .value = std::move(value)});
+    builder.add_raw_kv(std::move(kv.key), std::move(kv.value));
+}
+
 group::offset_commit_stages group::store_offsets(offset_commit_request&& r) {
     cluster::simple_batch_builder builder(
       model::record_batch_type::raft_data, model::offset(0));
@@ -1819,27 +2355,51 @@ group::offset_commit_stages group::store_offsets(offset_commit_request&& r) {
     std::vector<std::pair<model::topic_partition, offset_metadata>>
       offset_commits;
 
+    const auto expiry_timestamp = [&r]() -> std::optional<model::timestamp> {
+        if (r.data.retention_time_ms == -1) {
+            return std::nullopt;
+        }
+        return model::timestamp(
+          model::timestamp::now().value() + r.data.retention_time_ms);
+    }();
+
+    const auto get_commit_timestamp =
+      [](const offset_commit_request_partition& p) {
+          if (p.commit_timestamp == -1) {
+              return model::timestamp::now();
+          }
+          return model::timestamp(p.commit_timestamp);
+      };
+
     for (const auto& t : r.data.topics) {
         for (const auto& p : t.partitions) {
-            offset_metadata_key key{
-              .group_id = _id, .topic = t.name, .partition = p.partition_index};
-
-            offset_metadata_value value{
-              .offset = p.committed_offset,
-              .leader_epoch = p.committed_leader_epoch,
-              .metadata = p.committed_metadata.value_or(""),
-              .commit_timestamp = model::timestamp(p.commit_timestamp),
-            };
-
-            auto kv = _md_serializer.to_kv(offset_metadata_kv{
-              .key = std::move(key), .value = std::move(value)});
-            builder.add_raw_kv(std::move(kv.key), std::move(kv.value));
+            const auto commit_timestamp = get_commit_timestamp(p);
+            update_store_offset_builder(
+              builder,
+              t.name,
+              p.partition_index,
+              p.committed_offset,
+              p.committed_leader_epoch,
+              p.committed_metadata.value_or(""),
+              commit_timestamp,
+              expiry_timestamp);
 
             model::topic_partition tp(t.name, p.partition_index);
+
+            /*
+             * .non_reclaimable defaults to false and this metadata will end up
+             * replacing the metadata in existing registered offsets. this has
+             * the effect that if a committed offset was recovered as
+             * legacy/pre-v23 and is non-reclaimable that it then becomes
+             * reclaimable, which is the behavior we want. it is effectively no
+             * longer a legacy committed offset.
+             */
             offset_metadata md{
               .offset = p.committed_offset,
               .metadata = p.committed_metadata.value_or(""),
               .committed_leader_epoch = p.committed_leader_epoch,
+              .commit_timestamp = commit_timestamp,
+              .expiry_timestamp = expiry_timestamp,
             };
 
             offset_commits.emplace_back(std::make_pair(tp, md));
@@ -1853,7 +2413,8 @@ group::offset_commit_stages group::store_offsets(offset_commit_request&& r) {
     auto batch = std::move(builder).build();
     auto reader = model::make_memory_record_batch_reader(std::move(batch));
 
-    auto replicate_stages = _partition->replicate_in_stages(
+    auto replicate_stages = _partition->raft()->replicate_in_stages(
+      _term,
       std::move(reader),
       raft::replicate_options(raft::consistency_level::quorum_ack));
 
@@ -1910,6 +2471,31 @@ group::handle_commit_tx(cluster::commit_group_tx_request r) {
     }
 }
 
+error_code
+group::validate_expected_group(const txn_offset_commit_request& r) const {
+    if (r.data.group_instance_id.has_value()) {
+        auto static_member_it = _static_members.find(
+          r.data.group_instance_id.value());
+        if (
+          static_member_it != _static_members.end()
+          && static_member_it->second != r.data.member_id) {
+            return error_code::fenced_instance_id;
+        }
+    }
+
+    if (
+      r.data.member_id != unknown_member_id
+      && !_members.contains(r.data.member_id)) {
+        return error_code::unknown_member_id;
+    }
+
+    if (r.data.generation_id >= 0 && r.data.generation_id != _generation) {
+        return error_code::illegal_generation;
+    }
+
+    return error_code::none;
+}
+
 ss::future<txn_offset_commit_response>
 group::handle_txn_offset_commit(txn_offset_commit_request r) {
     if (in_state(group_state::dead)) {
@@ -1918,6 +2504,11 @@ group::handle_txn_offset_commit(txn_offset_commit_request r) {
     } else if (
       in_state(group_state::empty) || in_state(group_state::stable)
       || in_state(group_state::preparing_rebalance)) {
+        auto check_res = validate_expected_group(r);
+        if (check_res != error_code::none) {
+            co_return txn_offset_commit_response(r, check_res);
+        }
+
         auto id = model::producer_id(r.data.producer_id());
         co_return co_await with_pid_lock(
           id, [this, r = std::move(r)]() mutable {
@@ -2021,9 +2612,10 @@ group::handle_offset_commit(offset_commit_request&& r) {
         // <kafka>The group is only using Kafka to store offsets.</kafka>
         return store_offsets(std::move(r));
 
-    } else if (!contains_member(r.data.member_id)) {
-        return offset_commit_stages(
-          offset_commit_response(r, error_code::unknown_member_id));
+    } else if (auto ec = validate_existing_member(
+                 r.data.member_id, r.data.group_instance_id, "offset-commit");
+               ec != error_code::none) {
+        return offset_commit_stages(offset_commit_response(r, ec));
 
     } else if (r.data.generation_id != generation()) {
         return offset_commit_stages(
@@ -2042,7 +2634,6 @@ group::handle_offset_commit(offset_commit_request&& r) {
           offset_commit_response(r, error_code::rebalance_in_progress));
     } else {
         return offset_commit_stages(
-          ss::now(),
           ss::make_exception_future<offset_commit_response>(std::runtime_error(
             fmt::format("Unexpected group state {} for {}", _state, *this))));
     }
@@ -2067,14 +2658,22 @@ group::handle_offset_fetch(offset_fetch_request&& r) {
         for (const auto& e : _offsets) {
             offset_fetch_response_partition p = {
               .partition_index = e.first.partition,
-              .committed_offset = e.second->metadata.offset,
-              .committed_leader_epoch
-              = e.second->metadata.committed_leader_epoch,
-              .metadata = e.second->metadata.metadata,
+              .committed_offset = model::offset(-1),
+              .metadata = "",
               .error_code = error_code::none,
             };
+
+            if (r.data.require_stable && has_pending_transaction(e.first)) {
+                p.error_code = error_code::unstable_offset_commit;
+            } else {
+                p.committed_offset = e.second->metadata.offset;
+                p.committed_leader_epoch
+                  = e.second->metadata.committed_leader_epoch;
+                p.metadata = e.second->metadata.metadata;
+            }
             tmp[e.first.topic].push_back(std::move(p));
         }
+
         for (auto& e : tmp) {
             resp.data.topics.push_back(
               {.name = e.first, .partitions = std::move(e.second)});
@@ -2089,24 +2688,27 @@ group::handle_offset_fetch(offset_fetch_request&& r) {
         t.name = topic.name;
         for (auto id : topic.partition_indexes) {
             model::topic_partition tp(topic.name, id);
-            auto res = offset(tp);
-            if (res) {
-                offset_fetch_response_partition p = {
-                  .partition_index = id,
-                  .committed_offset = res->offset,
-                  .metadata = res->metadata,
-                  .error_code = error_code::none,
-                };
-                t.partitions.push_back(std::move(p));
+
+            offset_fetch_response_partition p = {
+              .partition_index = id,
+              .committed_offset = model::offset(-1),
+              .metadata = "",
+              .error_code = error_code::none,
+            };
+
+            if (r.data.require_stable && has_pending_transaction(tp)) {
+                p.error_code = error_code::unstable_offset_commit;
             } else {
-                offset_fetch_response_partition p = {
-                  .partition_index = id,
-                  .committed_offset = model::offset(-1),
-                  .metadata = "",
-                  .error_code = error_code::none,
-                };
-                t.partitions.push_back(std::move(p));
+                auto res = offset(tp);
+                if (res) {
+                    p.partition_index = id;
+                    p.committed_offset = res->offset;
+                    p.committed_leader_epoch = res->committed_leader_epoch;
+                    p.metadata = res->metadata;
+                    p.error_code = error_code::none;
+                }
             }
+            t.partitions.push_back(std::move(p));
         }
         resp.data.topics.push_back(std::move(t));
     }
@@ -2147,32 +2749,27 @@ described_group group::describe() const {
     return desc;
 }
 
-namespace {
-void add_offset_tombstone_record(
+void group::add_offset_tombstone_record(
   const kafka::group_id& group,
   const model::topic_partition& tp,
-  group_metadata_serializer& serializer,
   storage::record_batch_builder& builder) {
     offset_metadata_key key{
       .group_id = group,
       .topic = tp.topic,
       .partition = tp.partition,
     };
-    auto kv = serializer.to_kv(offset_metadata_kv{.key = std::move(key)});
-    builder.add_raw_kv(reflection::to_iobuf(std::move(kv.key)), std::nullopt);
+    auto kv = _md_serializer.to_kv(offset_metadata_kv{.key = std::move(key)});
+    builder.add_raw_kv(std::move(kv.key), std::nullopt);
 }
 
-void add_group_tombstone_record(
-  const kafka::group_id& group,
-  group_metadata_serializer& serializer,
-  storage::record_batch_builder& builder) {
+void group::add_group_tombstone_record(
+  const kafka::group_id& group, storage::record_batch_builder& builder) {
     group_metadata_key key{
       .group_id = group,
     };
-    auto kv = serializer.to_kv(group_metadata_kv{.key = std::move(key)});
-    builder.add_raw_kv(reflection::to_iobuf(std::move(kv.key)), std::nullopt);
+    auto kv = _md_serializer.to_kv(group_metadata_kv{.key = std::move(key)});
+    builder.add_raw_kv(std::move(kv.key), std::nullopt);
 }
-} // namespace
 
 ss::future<error_code> group::remove() {
     switch (state()) {
@@ -2192,17 +2789,18 @@ ss::future<error_code> group::remove() {
       model::record_batch_type::raft_data, model::offset(0));
 
     for (auto& offset : _offsets) {
-        add_offset_tombstone_record(_id, offset.first, _md_serializer, builder);
+        add_offset_tombstone_record(_id, offset.first, builder);
     }
 
     // build group tombstone
-    add_group_tombstone_record(_id, _md_serializer, builder);
+    add_group_tombstone_record(_id, builder);
 
     auto batch = std::move(builder).build();
     auto reader = model::make_memory_record_batch_reader(std::move(batch));
 
     try {
-        auto result = co_await _partition->replicate(
+        auto result = co_await _partition->raft()->replicate(
+          _term,
           std::move(reader),
           raft::replicate_options(raft::consistency_level::quorum_ack));
         if (result) {
@@ -2211,11 +2809,17 @@ ss::future<error_code> group::remove() {
               "Replicated group delete record {} at offset {}",
               _id,
               result.value().last_offset);
+        } else if (result.error() == raft::errc::shutting_down) {
+            vlog(
+              klog.debug,
+              "Cannot replicate group {} delete records due to shutdown",
+              _id);
         } else {
             vlog(
               klog.error,
-              "Error occured replicating group {} delete records {}",
+              "Error occured replicating group {} delete records {} ({})",
               _id,
+              result.error().message(),
               result.error());
         }
     } catch (const std::exception& e) {
@@ -2270,19 +2874,20 @@ group::remove_topic_partitions(const std::vector<model::topic_partition>& tps) {
     for (auto& offset : removed) {
         vlog(
           klog.trace, "Removing offset for group {} tp {}", _id, offset.first);
-        add_offset_tombstone_record(_id, offset.first, _md_serializer, builder);
+        add_offset_tombstone_record(_id, offset.first, builder);
     }
 
     // gc the group?
     if (in_state(group_state::dead) && generation() > 0) {
-        add_group_tombstone_record(_id, _md_serializer, builder);
+        add_group_tombstone_record(_id, builder);
     }
 
     auto batch = std::move(builder).build();
     auto reader = model::make_memory_record_batch_reader(std::move(batch));
 
     try {
-        auto result = co_await _partition->replicate(
+        auto result = co_await _partition->raft()->replicate(
+          _term,
           std::move(reader),
           raft::replicate_options(raft::consistency_level::quorum_ack));
         if (result) {
@@ -2291,11 +2896,17 @@ group::remove_topic_partitions(const std::vector<model::topic_partition>& tps) {
               "Replicated group cleanup record {} at offset {}",
               _id,
               result.value().last_offset);
+        } else if (result.error() == raft::errc::shutting_down) {
+            vlog(
+              klog.debug,
+              "Cannot replicate group {} cleanup records due to shutdown",
+              _id);
         } else {
             vlog(
               klog.error,
-              "Error occured replicating group {} cleanup records {}",
+              "Error occured replicating group {} cleanup records {} ({})",
               _id,
+              result.error().message(),
               result.error());
         }
     } catch (const std::exception& e) {
@@ -2305,6 +2916,41 @@ group::remove_topic_partitions(const std::vector<model::topic_partition>& tps) {
           _id,
           e);
     }
+}
+
+ss::future<result<raft::replicate_result>>
+group::store_group(model::record_batch batch) {
+    return _partition->raft()->replicate(
+      _term,
+      model::make_memory_record_batch_reader(std::move(batch)),
+      raft::replicate_options(raft::consistency_level::quorum_ack));
+}
+
+error_code group::validate_existing_member(
+  const member_id& member_id,
+  const std::optional<group_instance_id>& instance_id,
+  const ss::sstring& ctx) const {
+    if (instance_id) {
+        auto it = _static_members.find(*instance_id);
+        if (it == _static_members.end()) {
+            return error_code::unknown_member_id;
+        } else if (it->second != member_id) {
+            vlog(
+              _ctxlog.info,
+              "operation: {} - static member with instance id {} has different "
+              "member_id assigned, current: {}, requested: {}",
+              ctx,
+              *instance_id,
+              it->second,
+              member_id);
+            return error_code::fenced_instance_id;
+        }
+    } else {
+        if (!_members.contains(member_id)) {
+            return error_code::unknown_member_id;
+        }
+    }
+    return error_code::none;
 }
 
 std::ostream& operator<<(std::ostream& o, const group& g) {
@@ -2399,6 +3045,595 @@ void group::add_pending_member(
       member_id);
 
     res.first->second.arm(timeout);
+}
+
+ss::future<cluster::abort_group_tx_reply> group::do_abort(
+  kafka::group_id group_id,
+  model::producer_identity pid,
+  model::tx_seq tx_seq) {
+    // preventing prepare and replicate once we
+    // know we're going to abort tx and abandon pid
+    _volatile_txs.erase(pid);
+
+    auto tx = group_log_aborted_tx{.group_id = group_id, .tx_seq = tx_seq};
+
+    auto batch = make_tx_batch(
+      model::record_batch_type::group_abort_tx,
+      aborted_tx_record_version,
+      pid,
+      std::move(tx));
+    auto reader = model::make_memory_record_batch_reader(std::move(batch));
+
+    auto e = co_await _partition->raft()->replicate(
+      _term,
+      std::move(reader),
+      raft::replicate_options(raft::consistency_level::quorum_ack));
+
+    if (!e) {
+        vlog(
+          _ctx_txlog.warn,
+          "Error \"{}\" on replicating pid:{} abort batch",
+          e.error(),
+          pid);
+        if (
+          _partition->raft()->is_leader()
+          && _partition->raft()->term() == _term) {
+            co_await _partition->raft()->step_down("group do abort failed");
+        }
+        co_return make_abort_tx_reply(cluster::tx_errc::timeout);
+    }
+
+    _prepared_txs.erase(pid);
+    _tx_data.erase(pid.get_id());
+    _expiration_info.erase(pid);
+
+    co_return make_abort_tx_reply(cluster::tx_errc::none);
+}
+
+ss::future<cluster::commit_group_tx_reply>
+group::do_commit(kafka::group_id group_id, model::producer_identity pid) {
+    auto prepare_it = _prepared_txs.find(pid);
+    if (prepare_it == _prepared_txs.end()) {
+        // Impossible situation
+        vlog(_ctx_txlog.error, "Can not find prepared tx for pid: {}", pid);
+        co_return make_commit_tx_reply(cluster::tx_errc::unknown_server_error);
+    }
+
+    // It is fix for https://github.com/redpanda-data/redpanda/issues/5163.
+    // Problem is group_*_tx contains only producer_id in key, so compaction
+    // save only last records for this events. We need only save in logs
+    // consumed offset after commit_txs. For this we can write store_offset
+    // event together with group_commit_tx.
+    //
+    // Problem: this 2 events contains different record batch type. So we can
+    // not put it in one batch and write on disk atomically. But it is not a
+    // problem, because client got ok for commit_request (see
+    // tx_gateway_frontend). So redpanda will eventually finish commit and
+    // complete write for both this events.
+    model::record_batch_reader::data_t batches;
+    batches.reserve(2);
+
+    cluster::simple_batch_builder store_offset_builder(
+      model::record_batch_type::raft_data, model::offset(0));
+    for (const auto& [tp, metadata] : prepare_it->second.offsets) {
+        update_store_offset_builder(
+          store_offset_builder,
+          tp.topic,
+          tp.partition,
+          metadata.offset,
+          metadata.committed_leader_epoch,
+          metadata.metadata,
+          metadata.commit_timestamp,
+          metadata.expiry_timestamp);
+    }
+
+    batches.push_back(std::move(store_offset_builder).build());
+
+    group_log_commit_tx commit_tx;
+    commit_tx.group_id = group_id;
+    auto batch = make_tx_batch(
+      model::record_batch_type::group_commit_tx,
+      commit_tx_record_version,
+      pid,
+      std::move(commit_tx));
+
+    batches.push_back(std::move(batch));
+
+    auto reader = model::make_memory_record_batch_reader(std::move(batches));
+
+    auto e = co_await _partition->raft()->replicate(
+      _term,
+      std::move(reader),
+      raft::replicate_options(raft::consistency_level::quorum_ack));
+
+    if (!e) {
+        vlog(
+          _ctx_txlog.warn,
+          "Error \"{}\" on replicating pid:{} commit batch",
+          e.error(),
+          pid);
+        if (
+          _partition->raft()->is_leader()
+          && _partition->raft()->term() == _term) {
+            co_await _partition->raft()->step_down("group tx commit failed");
+        }
+        co_return make_commit_tx_reply(cluster::tx_errc::timeout);
+    }
+
+    prepare_it = _prepared_txs.find(pid);
+    if (prepare_it == _prepared_txs.end()) {
+        vlog(
+          _ctx_txlog.error,
+          "can't find already observed prepared tx pid:{}",
+          pid);
+        co_return make_commit_tx_reply(cluster::tx_errc::unknown_server_error);
+    }
+
+    for (const auto& [tp, md] : prepare_it->second.offsets) {
+        try_upsert_offset(tp, md);
+    }
+
+    _prepared_txs.erase(prepare_it);
+    _tx_data.erase(pid.get_id());
+    _expiration_info.erase(pid);
+
+    co_return make_commit_tx_reply(cluster::tx_errc::none);
+}
+
+void group::abort_old_txes() {
+    ssx::spawn_with_gate(_gate, [this] {
+        return do_abort_old_txes().finally(
+          [this] { try_arm(clock_type::now() + _abort_interval_ms); });
+    });
+}
+
+void group::maybe_rearm_timer() {
+    std::optional<time_point_type> earliest_deadline;
+    for (auto& [pid, expiration] : _expiration_info) {
+        auto candidate = expiration.deadline();
+        if (earliest_deadline) {
+            earliest_deadline = std::min(earliest_deadline.value(), candidate);
+        } else {
+            earliest_deadline = candidate;
+        }
+    }
+
+    if (earliest_deadline) {
+        auto deadline = std::min(
+          earliest_deadline.value(), clock_type::now() + _abort_interval_ms);
+        try_arm(deadline);
+    }
+}
+
+ss::future<> group::do_abort_old_txes() {
+    std::vector<model::producer_identity> pids;
+    for (auto& [id, _] : _prepared_txs) {
+        pids.push_back(id);
+    }
+    for (auto& [id, _] : _volatile_txs) {
+        pids.push_back(id);
+    }
+    for (auto& [id, _] : _tx_data) {
+        auto it = _fence_pid_epoch.find(id);
+        if (it != _fence_pid_epoch.end()) {
+            pids.push_back(model::producer_identity(id(), it->second));
+        }
+    }
+
+    absl::btree_set<model::producer_identity> expired;
+    for (auto pid : pids) {
+        auto expiration_it = _expiration_info.find(pid);
+        if (expiration_it != _expiration_info.end()) {
+            if (!expiration_it->second.is_expired()) {
+                continue;
+            }
+        }
+        expired.insert(pid);
+    }
+
+    for (auto pid : expired) {
+        co_await try_abort_old_tx(pid);
+    }
+
+    maybe_rearm_timer();
+}
+
+ss::future<> group::try_abort_old_tx(model::producer_identity pid) {
+    return get_tx_lock(pid.get_id())->with([this, pid]() {
+        vlog(_ctx_txlog.trace, "attempting to expire pid:{}", pid);
+
+        auto expiration_it = _expiration_info.find(pid);
+        if (expiration_it != _expiration_info.end()) {
+            if (!expiration_it->second.is_expired()) {
+                vlog(_ctx_txlog.trace, "pid:{} isn't expired, skipping", pid);
+                return ss::now();
+            }
+        }
+
+        return do_try_abort_old_tx(pid).discard_result();
+    });
+}
+
+ss::future<cluster::tx_errc>
+group::do_try_abort_old_tx(model::producer_identity pid) {
+    vlog(_ctx_txlog.trace, "aborting pid:{}", pid);
+
+    auto p_it = _prepared_txs.find(pid);
+    if (p_it != _prepared_txs.end()) {
+        auto tx_seq = p_it->second.tx_seq;
+        auto tx_data = _tx_data.find(pid.get_id());
+        model::partition_id tm = model::legacy_tm_ntp.tp.partition;
+        if (tx_data != _tx_data.end()) {
+            tm = tx_data->second.tm_partition;
+        } else {
+            vlog(
+              _ctxlog.error,
+              "pid {} doesn't exist in current transactions data",
+              pid);
+        }
+        auto r = co_await _tx_frontend.local().try_abort(
+          tm,
+          p_it->second.pid,
+          tx_seq,
+          config::shard_local_cfg().rm_sync_timeout_ms.value());
+        if (r.ec != cluster::tx_errc::none) {
+            co_return r.ec;
+        }
+        if (r.commited) {
+            auto res = co_await do_commit(_id, pid);
+            if (res.ec != cluster::tx_errc::none) {
+                vlog(
+                  _ctxlog.warn,
+                  "commit of prepared tx pid:{} failed with ec:{}",
+                  pid,
+                  res.ec);
+            }
+            co_return res.ec;
+        } else if (r.aborted) {
+            auto res = co_await do_abort(_id, pid, tx_seq);
+            if (res.ec != cluster::tx_errc::none) {
+                vlog(
+                  _ctxlog.warn,
+                  "abort of prepared tx pid:{} failed with ec:{}",
+                  pid,
+                  res.ec);
+            }
+            co_return res.ec;
+        }
+
+        co_return cluster::tx_errc::stale;
+    } else {
+        model::tx_seq tx_seq;
+        if (is_transaction_ga()) {
+            auto txseq_it = _tx_data.find(pid.get_id());
+            if (txseq_it == _tx_data.end()) {
+                vlog(
+                  _ctx_txlog.trace, "skipping pid:{} (can't find tx_seq)", pid);
+                co_return cluster::tx_errc::none;
+            }
+            tx_seq = txseq_it->second.tx_seq;
+        } else {
+            auto v_it = _volatile_txs.find(pid);
+            if (v_it == _volatile_txs.end()) {
+                vlog(
+                  _ctx_txlog.trace,
+                  "skipping pid:{} (can't find volatile)",
+                  pid);
+                co_return cluster::tx_errc::none;
+            }
+            tx_seq = v_it->second.tx_seq;
+        }
+
+        auto res = co_await do_abort(_id, pid, tx_seq);
+        if (res.ec != cluster::tx_errc::none) {
+            vlog(
+              _ctxlog.warn,
+              "abort of pid:{} tx_seq:{} failed with {}",
+              pid,
+              tx_seq,
+              res.ec);
+        }
+        co_return res.ec;
+    }
+}
+
+void group::try_arm(time_point_type deadline) {
+    if (
+      _auto_abort_timer.armed() && _auto_abort_timer.get_timeout() > deadline) {
+        _auto_abort_timer.cancel();
+        _auto_abort_timer.arm(deadline);
+    } else if (!_auto_abort_timer.armed()) {
+        _auto_abort_timer.arm(deadline);
+    }
+}
+
+std::ostream& operator<<(std::ostream& o, const group::offset_metadata& md) {
+    fmt::print(
+      o,
+      "{{log_offset:{}, offset:{}, metadata:{}, committed_leader_epoch:{}}}",
+      md.log_offset,
+      md.offset,
+      md.metadata,
+      md.committed_leader_epoch);
+    return o;
+}
+
+bool group::subscribed(const model::topic& topic) const {
+    if (_subscriptions.has_value()) {
+        return _subscriptions.value().contains(topic);
+    }
+    // answer conservatively
+    return true;
+}
+
+/*
+ * Currently only supports Version 0 which is a prefix version for higher
+ * versions and contains all of the information that we need.
+ */
+absl::node_hash_set<model::topic>
+group::decode_consumer_subscriptions(iobuf data) {
+    constexpr auto max_topic_name_length = 32_KiB;
+
+    protocol::decoder reader(std::move(data));
+
+    /* version intentionally ignored */
+    reader.read_int16();
+
+    const auto count = reader.read_int32();
+    if (count < 0) {
+        throw std::out_of_range(fmt::format(
+          "consumer metadata contains negative topic count {}", count));
+    }
+
+    // a simple heuristic to avoid large allocations
+    if (static_cast<size_t>(count) > reader.bytes_left()) {
+        throw std::out_of_range(fmt::format(
+          "consumer metadata topic count too large {} > {}",
+          count,
+          reader.bytes_left()));
+    }
+
+    absl::node_hash_set<model::topic> topics;
+    topics.reserve(count);
+
+    while (topics.size() != static_cast<size_t>(count)) {
+        const auto len = reader.read_int16();
+        if (len < 0) {
+            throw std::out_of_range(fmt::format(
+              "consumer metadata contains negative topic name length {}", len));
+        } else if (static_cast<size_t>(len) > max_topic_name_length) {
+            throw std::out_of_range(fmt::format(
+              "consumer metadata contains topic name that exceeds maximum size "
+              "{} > {}",
+              len,
+              max_topic_name_length));
+        }
+        auto name = reader.read_string_unchecked(len);
+        topics.insert(model::topic(std::move(name)));
+    }
+
+    // after the topic list is user data bytes, followed by extra bytes for
+    // versions > 0, neither of which are needed.
+
+    return topics;
+}
+
+void group::update_subscriptions() {
+    if (_protocol_type != consumer_group_protocol_type) {
+        _subscriptions.reset();
+        return;
+    }
+
+    if (_members.empty()) {
+        _subscriptions.emplace();
+        return;
+    }
+
+    if (!_protocol.has_value()) {
+        _subscriptions.reset();
+        return;
+    }
+
+    absl::node_hash_set<model::topic> subs;
+    for (auto& member : _members) {
+        try {
+            auto data = bytes_to_iobuf(
+              member.second->get_protocol_metadata(_protocol.value()));
+            subs.merge(decode_consumer_subscriptions(std::move(data)));
+        } catch (const std::out_of_range& e) {
+            vlog(
+              klog.warn,
+              "Parsing consumer:{} data for group {} member {} failed: {}",
+              _protocol.value(),
+              _id,
+              member.first,
+              e);
+            _subscriptions.reset();
+            return;
+        }
+    }
+
+    _subscriptions = std::move(subs);
+}
+
+std::vector<model::topic_partition> group::filter_expired_offsets(
+  std::chrono::seconds retention_period,
+  const std::function<bool(const model::topic&)>& subscribed,
+  const std::function<model::timestamp(const offset_metadata&)>&
+    effective_expires) {
+    /*
+     * default retention duration
+     */
+    const auto retain_for = model::timestamp(
+      std::chrono::duration_cast<std::chrono::milliseconds>(retention_period)
+        .count());
+
+    const auto now = model::timestamp::now();
+    std::vector<model::topic_partition> offsets;
+    for (const auto& offset : _offsets) {
+        if (offset.second->metadata.non_reclaimable) {
+            continue;
+        }
+
+        /*
+         * an offset won't be removed if its topic has an active subscription or
+         * there are pending offset commits for the offset's topic.
+         */
+        if (
+          subscribed(offset.first.topic)
+          || _pending_offset_commits.contains(offset.first)) {
+            continue;
+        }
+
+        if (offset.second->metadata.expiry_timestamp.has_value()) {
+            /*
+             * the old way is explicit expiration time point per offset
+             */
+            const auto& expires
+              = offset.second->metadata.expiry_timestamp.value();
+            if (expires > now) {
+                continue;
+            }
+        } else {
+            /*
+             * the new way is a configurable global retention duration
+             */
+            const auto expires = effective_expires(offset.second->metadata);
+            if (model::timestamp(now() - expires()) < retain_for) {
+                continue;
+            }
+        }
+
+        offsets.push_back(offset.first);
+    }
+
+    return offsets;
+}
+
+std::vector<model::topic_partition>
+group::get_expired_offsets(std::chrono::seconds retention_period) {
+    const auto not_subscribed = [](const auto&) { return false; };
+
+    if (_protocol_type.has_value()) {
+        if (
+          _protocol_type.value() == consumer_group_protocol_type
+          && _subscriptions.has_value() && in_state(group_state::stable)) {
+            /*
+             * policy description from kafka source:
+             *
+             * <kafka>
+             * the group is stable and consumers exist.
+             *
+             * if an offset's topic is subscribed to and retention period has
+             * passed since the last commit timestamp, then expire the offset.
+             * offsets with pending commit are not expired.
+             * </kafka>
+             */
+            return filter_expired_offsets(
+              retention_period,
+              [this](const auto& topic) {
+                  return _subscriptions.value().contains(topic);
+              },
+              [](const offset_metadata& md) { return md.commit_timestamp; });
+
+        } else if (in_state(group_state::empty)) {
+            /*
+             * policy description from kafka source:
+             *
+             * <kafka>
+             * the group contains no consumers.
+             *
+             * if current state timestamp exists and retention period has passed
+             * since group became empty, expire all offsets with no pending
+             * offset commit.
+             *
+             * if there is no current state timestamp (old group metadata
+             * schema) and retention period has passed since the last commit
+             * timestamp, expire the offset
+             * </kafka>
+             */
+            return filter_expired_offsets(
+              retention_period,
+              not_subscribed,
+              [this](const offset_metadata& md) {
+                  if (_state_timestamp.has_value()) {
+                      return _state_timestamp.value();
+                  } else {
+                      return md.commit_timestamp;
+                  }
+              });
+        } else {
+            return {};
+        }
+    } else {
+        /*
+         * policy description from kafka source:
+         *
+         * <kafka>
+         * there is no configured protocol type, so this is a standalone/simple
+         * consumer that Kafka uses for offset storage only.
+         *
+         * expire offsets with no pending offset commits for which the retention
+         * period has passed since their last commit.
+         * </kafka>
+         */
+        return filter_expired_offsets(
+          retention_period, not_subscribed, [](const offset_metadata& md) {
+              return md.commit_timestamp;
+          });
+    }
+}
+
+bool group::has_offsets() const {
+    return !_offsets.empty() || !_pending_offset_commits.empty()
+           || !_volatile_txs.empty() || !_tx_data.empty();
+}
+
+std::vector<model::topic_partition>
+group::delete_expired_offsets(std::chrono::seconds retention_period) {
+    /*
+     * collect and delete expired offsets
+     */
+    auto offsets = get_expired_offsets(retention_period);
+    for (const auto& offset : offsets) {
+        vlog(_ctxlog.debug, "Expiring group offset {}", offset);
+        _offsets.erase(offset);
+    }
+
+    /*
+     * maybe mark the group as dead
+     */
+    if (in_state(group_state::empty) && !has_offsets()) {
+        set_state(group_state::dead);
+    }
+
+    return offsets;
+}
+
+std::vector<model::topic_partition>
+group::delete_offsets(std::vector<model::topic_partition> offsets) {
+    std::vector<model::topic_partition> deleted_offsets;
+    /*
+     * Delete the requested offsets, unless there is at least one active
+     * subscription for an offset.
+     */
+    for (auto& offset : offsets) {
+        if (!subscribed(offset.topic)) {
+            vlog(_ctxlog.debug, "Deleting group offset {}", offset);
+            _offsets.erase(offset);
+            _pending_offset_commits.erase(offset);
+            deleted_offsets.push_back(std::move(offset));
+        }
+    }
+
+    /*
+     * maybe mark the group as dead
+     */
+    if (in_state(group_state::empty) && !has_offsets()) {
+        set_state(group_state::dead);
+    }
+
+    return deleted_offsets;
 }
 
 } // namespace kafka

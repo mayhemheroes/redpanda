@@ -9,8 +9,10 @@
 
 #include "bytes/iobuf.h"
 #include "bytes/iobuf_parser.h"
+#include "bytes/iostream.h"
 #include "http/chunk_encoding.h"
 #include "http/client.h"
+#include "http/logger.h"
 #include "net/dns.h"
 #include "net/transport.h"
 #include "seastarx.h"
@@ -259,7 +261,7 @@ SEASTAR_THREAD_TEST_CASE(test_http_GET_streaming_roundtrip) {
       std::move(header),
       std::nullopt,
       skip_bytes,
-      [skip_bytes](http::client::response_header const& header, iobuf&& body) {
+      [](http::client::response_header const& header, iobuf&& body) {
           BOOST_REQUIRE_EQUAL(header.result(), boost::beast::http::status::ok);
 
           iobuf_parser parser(std::move(body));
@@ -451,7 +453,7 @@ private:
                 ss::sstring body = parser.read_string(parser.bytes_left());
                 if (body.find(_expected_data) != ss::sstring::npos) {
                     _fin.close().get();
-                    return std::move(buffer);
+                    return buffer;
                 }
             }
             ss::sleep(1ms).get();
@@ -848,4 +850,28 @@ SEASTAR_THREAD_TEST_CASE(test_http_reconnect_graceful_shutdown) {
     client.stop().get();
     ss::sleep(10ms).get();
     BOOST_REQUIRE(fut.get() == http::reconnect_result_t::timed_out);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_header_redacted) {
+    ss::logger string_logger("s");
+    http::client::request_header request_header;
+    request_header.set(boost::beast::http::field::authorization, "password");
+    request_header.set("x-amz-content-sha256", "pigeon");
+    request_header.set("x-amz-security-token", "capetown");
+
+    std::stringstream stream;
+    ss::logger::set_ostream(stream);
+    vlog(string_logger.info, "{}", request_header);
+    ss::logger::set_ostream(std::cerr);
+
+    auto s = stream.str();
+    BOOST_REQUIRE(
+      s.find("password") == std::string::npos
+      && s.find("Authorization") != std::string::npos);
+    BOOST_REQUIRE(
+      s.find("pigeon") == std::string::npos
+      && s.find("x-amz-content-sha256") != std::string::npos);
+    BOOST_REQUIRE(
+      s.find("capetown") == std::string::npos
+      && s.find("x-amz-security-token") != std::string::npos);
 }

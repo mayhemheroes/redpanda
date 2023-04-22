@@ -7,21 +7,12 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-# Redpanda Queue configuration file
-
-# organization and cluster_id help Vectorized identify your system.
-organization: ""
-cluster_id: ""
-
-license_key: ""
+# Redpanda configuration file
 
 redpanda:
   # Data directory where all the files will be stored.
   # This directory MUST resides on xfs partion.
   data_directory: "/var/lib/redpanda/data"
-
-  # Node ID - must be unique for each node
-  node_id: 1
 
   # The initial cluster nodes addresses
   seed_servers: []
@@ -45,25 +36,22 @@ redpanda:
   developer_mode: true
 
 # Enable Pandaproxy
-pandaproxy:
+pandaproxy: {}
 
 # Enable Schema Registry
-schema_registry:
+schema_registry: {}
 
 rpk:
   # TLS configuration.
-  tls:
+  #tls:
     # The path to the root CA certificate (PEM)
-    truststore_file: ""
+    #truststore_file: ""
 
     # The path to the client certificate (PEM)
-    cert_file: ""
+    #cert_file: ""
 
     # The path to the client certificate key (PEM)
-    key_file: ""
-
-  # Enables sending environment and resource usage data to Vectorized.
-  enable_usage_stats: true
+    #key_file: ""
 
   # Available tuners
   tune_network: false

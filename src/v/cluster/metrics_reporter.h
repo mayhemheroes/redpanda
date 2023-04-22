@@ -16,6 +16,7 @@
 #include "cluster/members_table.h"
 #include "cluster/topic_table.h"
 #include "cluster/types.h"
+#include "features/fwd.h"
 #include "http/client.h"
 #include "model/metadata.h"
 #include "model/timestamp.h"
@@ -56,6 +57,7 @@ public:
         uint32_t cpu_count;
         bool is_alive;
         ss::sstring version;
+        cluster_version logical_version{invalid_version};
         std::vector<node_disk_space> disks;
         uint64_t uptime_ms;
     };
@@ -68,15 +70,25 @@ public:
         uint32_t topic_count;
         uint32_t partition_count;
 
+        cluster_version active_logical_version{invalid_version};
+        cluster_version original_logical_version{invalid_version};
+
         std::vector<node_metrics> nodes;
+        bool has_kafka_gssapi;
+
+        static constexpr int64_t max_size_for_rp_env = 80;
+        ss::sstring redpanda_environment;
     };
     static constexpr ss::shard_id shard = 0;
 
     metrics_reporter(
       consensus_ptr,
+      ss::sharded<controller_stm>&,
       ss::sharded<members_table>&,
       ss::sharded<topic_table>&,
       ss::sharded<health_monitor_frontend>&,
+      ss::sharded<config_frontend>&,
+      ss::sharded<features::feature_table>&,
       ss::sharded<ss::abort_source>&);
 
     ss::future<> start();
@@ -90,14 +102,16 @@ private:
 
     ss::future<http::client> make_http_client();
     ss::future<> try_initialize_cluster_info();
+    ss::future<> propagate_cluster_id();
 
-    ss::sstring _cluster_uuid;
     consensus_ptr _raft0;
+    metrics_reporter_cluster_info& _cluster_info; // owned by controller_stm
     ss::sharded<members_table>& _members_table;
     ss::sharded<topic_table>& _topics;
     ss::sharded<health_monitor_frontend>& _health_monitor;
+    ss::sharded<config_frontend>& _config_frontend;
+    ss::sharded<features::feature_table>& _feature_table;
     ss::sharded<ss::abort_source>& _as;
-    model::timestamp _creation_timestamp;
     prefix_logger _logger;
     ss::timer<> _tick_timer;
     details::address _address;

@@ -19,16 +19,109 @@
 
 #include <seastar/core/coroutine.hh>
 
+#include <absl/container/flat_hash_set.h>
+#include <confluent/meta.pb.h>
+#include <confluent/types/decimal.pb.h>
 #include <fmt/ostream.h>
+#include <google/protobuf/any.pb.h>
+#include <google/protobuf/api.pb.h>
 #include <google/protobuf/compiler/parser.h>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/descriptor.pb.h>
+#include <google/protobuf/duration.pb.h>
+#include <google/protobuf/empty.pb.h>
+#include <google/protobuf/field_mask.pb.h>
 #include <google/protobuf/io/tokenizer.h>
 #include <google/protobuf/io/zero_copy_stream.h>
+#include <google/protobuf/source_context.pb.h>
+#include <google/protobuf/struct.pb.h>
+#include <google/protobuf/timestamp.pb.h>
+#include <google/protobuf/type.pb.h>
+#include <google/protobuf/util/type_resolver.h>
+#include <google/protobuf/wrappers.pb.h>
+#include <google/type/calendar_period.pb.h>
+#include <google/type/color.pb.h>
+#include <google/type/date.pb.h>
+#include <google/type/datetime.pb.h>
+#include <google/type/dayofweek.pb.h>
+#include <google/type/decimal.pb.h>
+#include <google/type/expr.pb.h>
+#include <google/type/fraction.pb.h>
+#include <google/type/interval.pb.h>
+#include <google/type/latlng.pb.h>
+#include <google/type/localized_text.pb.h>
+#include <google/type/money.pb.h>
+#include <google/type/month.pb.h>
+#include <google/type/phone_number.pb.h>
+#include <google/type/postal_address.pb.h>
+#include <google/type/quaternion.pb.h>
+#include <google/type/timeofday.pb.h>
+
+#include <unordered_set>
 
 namespace pandaproxy::schema_registry {
 
 namespace pb = google::protobuf;
+
+struct descriptor_hasher {
+    using is_transparent = void;
+
+    std::size_t operator()(const pb::FileDescriptor* s) const {
+        return absl::Hash<std::string>()(s->name());
+    }
+    std::size_t operator()(const ss::sstring& s) const {
+        return absl::Hash<ss::sstring>()(s);
+    }
+};
+
+struct descriptor_equal {
+    using is_transparent = void;
+
+    bool operator()(
+      const pb::FileDescriptor* lhs, const pb::FileDescriptor* rhs) const {
+        return lhs->name() == rhs->name();
+    }
+
+    bool
+    operator()(const pb::FileDescriptor* lhs, const ss::sstring& rhs) const {
+        return lhs->name() == rhs;
+    }
+};
+
+using known_types_set = absl::
+  flat_hash_set<const pb::FileDescriptor*, descriptor_hasher, descriptor_equal>;
+static const known_types_set known_types{
+  confluent::Meta::GetDescriptor()->file(),
+  confluent::type::Decimal::GetDescriptor()->file(),
+  google::type::CalendarPeriod_descriptor()->file(),
+  google::type::Color::GetDescriptor()->file(),
+  google::type::Date::GetDescriptor()->file(),
+  google::type::DateTime::GetDescriptor()->file(),
+  google::type::DayOfWeek_descriptor()->file(),
+  google::type::Decimal::GetDescriptor()->file(),
+  google::type::Expr::GetDescriptor()->file(),
+  google::type::Fraction::GetDescriptor()->file(),
+  google::type::Interval::GetDescriptor()->file(),
+  google::type::LatLng::GetDescriptor()->file(),
+  google::type::LocalizedText::GetDescriptor()->file(),
+  google::type::Money::GetDescriptor()->file(),
+  google::type::Month_descriptor()->file(),
+  google::type::PhoneNumber::GetDescriptor()->file(),
+  google::type::PostalAddress::GetDescriptor()->file(),
+  google::type::Quaternion::GetDescriptor()->file(),
+  google::type::TimeOfDay::GetDescriptor()->file(),
+  google::protobuf::SourceContext::GetDescriptor()->file(),
+  google::protobuf::Any::GetDescriptor()->file(),
+  google::protobuf::Option::GetDescriptor()->file(),
+  google::protobuf::DoubleValue::GetDescriptor()->file(),
+  google::protobuf::Type::GetDescriptor()->file(),
+  google::protobuf::Api::GetDescriptor()->file(),
+  google::protobuf::Duration::GetDescriptor()->file(),
+  google::protobuf::Empty::GetDescriptor()->file(),
+  google::protobuf::FieldMask::GetDescriptor()->file(),
+  google::protobuf::Struct::GetDescriptor()->file(),
+  google::protobuf::Timestamp::GetDescriptor()->file(),
+  google::protobuf::FieldDescriptorProto::GetDescriptor()->file()};
 
 class io_error_collector final : public pb::io::ErrorCollector {
     enum class level {
@@ -50,11 +143,7 @@ public:
         _errors.emplace_back(err{level::warn, line, column, message});
     }
 
-    error_info error() const {
-        return error_info{
-          error_code::schema_invalid,
-          fmt::format("{}", fmt::join(_errors, "; "))};
-    }
+    error_info error() const;
 
 private:
     friend struct fmt::formatter<err>;
@@ -83,11 +172,7 @@ public:
           level::warn, filename, element_name, descriptor, location, message});
     }
 
-    error_info error() const {
-        return error_info{
-          error_code::schema_invalid,
-          fmt::format("{}", fmt::join(_errors, "; "))};
-    }
+    error_info error() const;
 
 private:
     enum class level {
@@ -166,6 +251,15 @@ private:
 const pb::FileDescriptor*
 build_file(pb::DescriptorPool& dp, const pb::FileDescriptorProto& fdp) {
     dp_error_collector dp_ec;
+    for (const auto& dep : fdp.dependency()) {
+        if (!dp.FindFileByName(dep)) {
+            if (auto it = known_types.find(dep); it != known_types.end()) {
+                google::protobuf::FileDescriptorProto p;
+                (*it)->CopyTo(&p);
+                build_file(dp, p);
+            }
+        }
+    }
     if (auto fd = dp.BuildFileCollectingErrors(fdp, &dp_ec); fd) {
         return fd;
     }
@@ -179,6 +273,9 @@ build_file(pb::DescriptorPool& dp, const pb::FileDescriptorProto& fdp) {
 ss::future<const pb::FileDescriptor*> build_file_with_refs(
   pb::DescriptorPool& dp, sharded_store& store, canonical_schema schema) {
     for (const auto& ref : schema.refs()) {
+        if (dp.FindFileByName(ref.name)) {
+            continue;
+        }
         auto dep = co_await store.get_subject_schema(
           ref.sub, ref.version, include_deleted::no);
         co_await build_file_with_refs(
@@ -244,6 +341,7 @@ validate_protobuf_schema(sharded_store& store, canonical_schema schema) {
 
 ss::future<canonical_schema>
 make_canonical_protobuf_schema(sharded_store& store, unparsed_schema schema) {
+    // NOLINTBEGIN(bugprone-use-after-move)
     canonical_schema temp{
       std::move(schema).sub(),
       {canonical_schema_definition::raw_string{schema.def().raw()()},
@@ -253,6 +351,7 @@ make_canonical_protobuf_schema(sharded_store& store, unparsed_schema schema) {
     auto validated = co_await validate_protobuf_schema(store, temp);
     co_return canonical_schema{
       std::move(temp).sub(), std::move(validated), std::move(temp).refs()};
+    // NOLINTEND(bugprone-use-after-move)
 }
 
 namespace {
@@ -317,6 +416,9 @@ struct compatibility_checker {
 
     bool check_compatible(
       const pb::Descriptor* reader, const pb::Descriptor* writer) {
+        if (!_seen_descriptors.insert(reader).second) {
+            return true;
+        }
         for (int i = 0; i < writer->field_count(); ++i) {
             if (reader->IsReservedNumber(i) || writer->IsReservedNumber(i)) {
                 continue;
@@ -372,6 +474,7 @@ struct compatibility_checker {
 
     const protobuf_schema_definition::impl& _reader;
     const protobuf_schema_definition::impl& _writer;
+    std::unordered_set<const pb::Descriptor*> _seen_descriptors;
 };
 
 } // namespace
@@ -392,7 +495,7 @@ struct fmt::formatter<pandaproxy::schema_registry::io_error_collector::err> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
 
     template<typename FormatContext>
-    auto format(const type::err& e, FormatContext& ctx) {
+    auto format(const type::err& e, FormatContext& ctx) const {
         return format_to(
           ctx.out(),
           "{}: line: '{}', col: '{}', msg: '{}'",
@@ -410,7 +513,7 @@ struct fmt::formatter<pandaproxy::schema_registry::dp_error_collector::err> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
 
     template<typename FormatContext>
-    auto format(const type::err& e, FormatContext& ctx) {
+    auto format(const type::err& e, FormatContext& ctx) const {
         return format_to(
           ctx.out(),
           "{}: subject: '{}', element_name: '{}', descriptor: '{}', location: "
@@ -423,3 +526,17 @@ struct fmt::formatter<pandaproxy::schema_registry::dp_error_collector::err> {
           e.message);
     }
 };
+
+namespace pandaproxy::schema_registry {
+
+error_info io_error_collector::error() const {
+    return error_info{
+      error_code::schema_invalid, fmt::format("{}", fmt::join(_errors, "; "))};
+}
+
+error_info dp_error_collector::error() const {
+    return error_info{
+      error_code::schema_invalid, fmt::format("{}", fmt::join(_errors, "; "))};
+}
+
+} // namespace pandaproxy::schema_registry

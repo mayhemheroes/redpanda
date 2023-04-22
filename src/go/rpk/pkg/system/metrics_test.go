@@ -30,25 +30,25 @@ func TestGatherMetrics(t *testing.T) {
 		before: func(fs afero.Fs) error {
 			return afero.WriteFile(
 				fs,
-				config.Default().PIDFile(),
+				config.DevDefault().PIDFile(),
 				// Usual /proc/sys/kernel/pid_max value
 				[]byte("4194304"),
-				0755,
+				0o755,
 			)
 		},
 		expectedErrMsg: "/proc/4194304/stat",
 	}, {
 		name:           "it should fail if the PID file doesn't exist",
-		expectedErrMsg: "the local redpanda process isn't running.",
+		expectedErrMsg: "the local redpanda process isn't running",
 	}, {
 		name: "it should fail if the CPU utime can't be parsed",
 		before: func(fs afero.Fs) error {
 			err := afero.WriteFile(
 				fs,
-				config.Default().PIDFile(),
+				config.DevDefault().PIDFile(),
 				// Usual /proc/sys/kernel/pid_max value
 				[]byte("4194304"),
-				0755,
+				0o755,
 			)
 			if err != nil {
 				return err
@@ -58,7 +58,7 @@ func TestGatherMetrics(t *testing.T) {
 				fs,
 				"/proc/4194304/stat",
 				[]byte(content),
-				0755,
+				0o755,
 			)
 		},
 		expectedErrMsg: `parsing "invalid-utime": invalid syntax`,
@@ -67,10 +67,10 @@ func TestGatherMetrics(t *testing.T) {
 		before: func(fs afero.Fs) error {
 			err := afero.WriteFile(
 				fs,
-				config.Default().PIDFile(),
+				config.DevDefault().PIDFile(),
 				// Usual /proc/sys/kernel/pid_max value
 				[]byte("4194304"),
-				0755,
+				0o755,
 			)
 			if err != nil {
 				return err
@@ -80,7 +80,7 @@ func TestGatherMetrics(t *testing.T) {
 				fs,
 				"/proc/4194304/stat",
 				[]byte(content),
-				0755,
+				0o755,
 			)
 		},
 		expectedErrMsg: `parsing "invalid-stime": invalid syntax`,
@@ -89,7 +89,7 @@ func TestGatherMetrics(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(st *testing.T) {
 			fs := afero.NewMemMapFs()
-			conf := config.Default()
+			conf := config.DevDefault()
 			if tt.conf != nil {
 				conf = tt.conf()
 			}

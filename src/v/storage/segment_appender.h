@@ -16,6 +16,7 @@
 #include "likely.h"
 #include "seastarx.h"
 #include "storage/segment_appender_chunk.h"
+#include "storage/storage_resources.h"
 #include "utils/intrusive_list_helpers.h"
 
 #include <seastar/core/file.hh>
@@ -42,14 +43,21 @@ public:
         options(
           ss::io_priority_class p,
           size_t chunks_no,
-          config::binding<size_t> falloc_step)
+          std::optional<uint64_t> s,
+          storage_resources& r)
           : priority(p)
           , number_of_chunks(chunks_no)
-          , falloc_step(falloc_step) {}
+          , segment_size(s)
+          , resources(r) {}
 
         ss::io_priority_class priority;
         size_t number_of_chunks;
-        config::binding<size_t> falloc_step;
+        // Generally a segment appender doesn't need to know the target size
+        // of the segment it's appending to, but this is used as an input
+        // to the dynamic fallocation size algorithm, to avoid falloc'ing
+        // more space than a segment would ever need.
+        std::optional<uint64_t> segment_size;
+        storage_resources& resources;
     };
 
     segment_appender(ss::file f, options opts);
@@ -72,6 +80,7 @@ public:
     ss::future<> flush();
 
     struct callbacks {
+        virtual ~callbacks() = default;
         virtual void committed_physical_offset(size_t) = 0;
     };
 
@@ -89,6 +98,10 @@ public:
         } else {
             return std::nullopt;
         }
+    }
+
+    constexpr ss::io_priority_class get_priority_class() const {
+        return _opts.priority;
     }
 
 private:
@@ -118,9 +131,9 @@ private:
     size_t _committed_offset{0};
     size_t _fallocation_offset{0};
     size_t _bytes_flush_pending{0};
-    ss::semaphore _concurrent_flushes;
+    ssx::semaphore _concurrent_flushes;
     ss::lw_shared_ptr<chunk> _head;
-    ss::lw_shared_ptr<ss::semaphore> _prev_head_write;
+    ss::lw_shared_ptr<ssx::semaphore> _prev_head_write;
 
     struct flush_op {
         explicit flush_op(size_t offset)

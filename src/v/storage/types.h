@@ -16,6 +16,7 @@
 #include "model/record.h"
 #include "model/timeout_clock.h"
 #include "model/timestamp.h"
+#include "resource_mgmt/storage.h"
 #include "storage/fwd.h"
 #include "tristate.h"
 
@@ -30,23 +31,33 @@
 namespace storage {
 using log_clock = ss::lowres_clock;
 using debug_sanitize_files = ss::bool_class<struct debug_sanitize_files_tag>;
+using jitter_percents = named_type<int, struct jitter_percents_tag>;
 
-enum class disk_space_alert { ok = 0, low_space = 1, degraded = 2 };
-struct disk {
+struct disk
+  : serde::envelope<disk, serde::version<1>, serde::compat_version<0>> {
     static constexpr int8_t current_version = 0;
 
     ss::sstring path;
-    uint64_t free;
-    uint64_t total;
+    uint64_t free{0};
+    uint64_t total{0};
+    disk_space_alert alert{disk_space_alert::ok};
+
+    auto serde_fields() { return std::tie(path, free, total, alert); }
 
     friend std::ostream& operator<<(std::ostream&, const disk&);
     friend bool operator==(const disk&, const disk&) = default;
 };
 
-std::ostream& operator<<(std::ostream& o, const storage::disk_space_alert d);
+// Helps to identify transactional stms in the registered list of stms.
+// Avoids an ugly dynamic cast to the base class.
+enum class stm_type : int8_t { transactional = 0, non_transactional = 1 };
 
 class snapshotable_stm {
 public:
+    virtual ~snapshotable_stm() = default;
+
+    virtual stm_type type() { return stm_type::non_transactional; }
+
     // create a snapshot at given offset unless a snapshot with given or newer
     // offset already exists
     virtual ss::future<> ensure_snapshot_exists(model::offset) = 0;
@@ -55,6 +66,18 @@ public:
     // lets the stm control snapshotting and log eviction by limiting
     // log eviction attempts to offsets not greater than this.
     virtual model::offset max_collectible_offset() = 0;
+
+    virtual const ss::sstring& name() = 0;
+
+    // Only valid for state machines maintaining transactional state.
+    // Returns aborted transactions in range [from, to] offsets.
+    virtual ss::future<fragmented_vector<model::tx_range>>
+      aborted_tx_ranges(model::offset, model::offset) = 0;
+
+    virtual model::control_record_type
+    parse_tx_control_batch(const model::record_batch&) {
+        return model::control_record_type::unknown;
+    }
 };
 
 /**
@@ -85,7 +108,13 @@ public:
  */
 class stm_manager {
 public:
-    void add_stm(ss::shared_ptr<snapshotable_stm> stm) { _stms.push_back(stm); }
+    void add_stm(ss::shared_ptr<snapshotable_stm> stm) {
+        if (stm->type() == stm_type::transactional) {
+            vassert(!_tx_stm, "Multiple transactional stms not allowed.");
+            _tx_stm = stm;
+        }
+        _stms.push_back(stm);
+    }
 
     ss::future<> ensure_snapshot_exists(model::offset offset) {
         auto f = ss::now();
@@ -102,15 +131,29 @@ public:
         }
     }
 
-    model::offset max_collectible_offset() {
-        model::offset result = model::offset::max();
-        for (const auto& stm : _stms) {
-            result = std::min(result, stm->max_collectible_offset());
+    model::offset max_collectible_offset();
+
+    ss::future<fragmented_vector<model::tx_range>>
+    aborted_tx_ranges(model::offset to, model::offset from) {
+        fragmented_vector<model::tx_range> r;
+        if (_tx_stm) {
+            r = co_await _tx_stm->aborted_tx_ranges(to, from);
         }
-        return result;
+        co_return r;
     }
 
+    model::control_record_type
+    parse_tx_control_batch(const model::record_batch& b) {
+        if (!_tx_stm) {
+            return model::control_record_type::unknown;
+        }
+        return _tx_stm->parse_tx_control_batch(b);
+    }
+
+    bool has_tx_stm() { return _tx_stm.get(); }
+
 private:
+    ss::shared_ptr<snapshotable_stm> _tx_stm;
     std::vector<ss::shared_ptr<snapshotable_stm>> _stms;
 };
 
@@ -299,11 +342,13 @@ struct compaction_config {
     explicit compaction_config(
       model::timestamp upper,
       std::optional<size_t> max_bytes_in_log,
+      model::offset max_collect_offset,
       ss::io_priority_class p,
       ss::abort_source& as,
       debug_sanitize_files should_sanitize = debug_sanitize_files::no)
       : eviction_time(upper)
       , max_bytes(max_bytes_in_log)
+      , max_collectible_offset(max_collect_offset)
       , iopc(p)
       , sanitize(should_sanitize)
       , asrc(&as) {}
@@ -312,6 +357,9 @@ struct compaction_config {
     model::timestamp eviction_time;
     // remove one segment if log is > max_bytes
     std::optional<size_t> max_bytes;
+    // Cannot delete or compact past this offset (i.e. for unresolved txn
+    // records): that is, only offsets <= this may be compacted.
+    model::offset max_collectible_offset;
     // priority for all IO in compaction
     ss::io_priority_class iopc;
     // use proxy fileops with assertions
@@ -345,4 +393,54 @@ struct compaction_result {
     size_t size_after;
     friend std::ostream& operator<<(std::ostream&, const compaction_result&);
 };
+
+/*
+ * Report number of bytes available for reclaim under different scenarios.
+ *
+ * retention: number of bytes that would be reclaimed by applying
+ *            the log's retention policy.
+ *
+ * available: number of bytes that could be safely reclaimed if the
+ *            retention policy was ignored. for example reclaiming
+ *            past the retention limits if the data being reclaimed
+ *            has been uploaded to cloud storage.
+ */
+struct reclaim_size_limits {
+    size_t retention{0};
+    size_t available{0};
+};
+
+/*
+ * disk usage
+ *
+ * data: segment data
+ * index: offset/time index
+ * compaction: compaction index
+ */
+struct usage {
+    size_t data{0};
+    size_t index{0};
+    size_t compaction{0};
+
+    size_t total() const { return data + index + compaction; }
+
+    friend usage operator+(usage lhs, const usage& rhs) {
+        lhs.data += rhs.data;
+        lhs.index += rhs.index;
+        lhs.compaction += rhs.compaction;
+        return lhs;
+    }
+};
+
+/*
+ * disk usage report
+ *
+ * usage: disk usage summary for log.
+ * reclaim: disk uage reclaim summary for log.
+ */
+struct usage_report {
+    usage usage;
+    reclaim_size_limits reclaim;
+};
+
 } // namespace storage

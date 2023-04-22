@@ -5,6 +5,8 @@ v_cc_library(
     logger.cc
     probe.cc
     server.cc
+    kafka_client_cache.cc
+    config_utils.cc
   DEPS
     v::pandaproxy_parsing
     v::pandaproxy_json
@@ -15,7 +17,7 @@ v_cc_library(
     v::utils
   )
 
-
+add_subdirectory(test)
 add_subdirectory(rest)
 add_subdirectory(schema_registry)
 add_subdirectory(json)

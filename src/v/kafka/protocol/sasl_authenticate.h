@@ -19,16 +19,6 @@
 
 namespace kafka {
 
-struct sasl_authenticate_response;
-
-class sasl_authenticate_api final {
-public:
-    using response_type = sasl_authenticate_response;
-
-    static constexpr const char* name = "sasl authenticate";
-    static constexpr api_key key = api_key(36);
-};
-
 struct sasl_authenticate_request final {
     using api_type = sasl_authenticate_api;
 
@@ -36,19 +26,19 @@ struct sasl_authenticate_request final {
 
     sasl_authenticate_request() = default;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const sasl_authenticate_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const sasl_authenticate_request& r) {
+        return os << r.data;
+    }
+};
 
 struct sasl_authenticate_response final {
     using api_type = sasl_authenticate_api;
@@ -60,18 +50,18 @@ struct sasl_authenticate_response final {
     explicit sasl_authenticate_response(sasl_authenticate_response_data data)
       : data(std::move(data)) {}
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const sasl_authenticate_response& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const sasl_authenticate_response& r) {
+        return os << r.data;
+    }
+};
 
 } // namespace kafka

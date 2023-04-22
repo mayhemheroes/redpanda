@@ -19,7 +19,6 @@
 #include "json/writer.h"
 #include "pandaproxy/json/exceptions.h"
 #include "pandaproxy/json/types.h"
-#include "utils/concepts-enabled.h"
 
 #include <seastar/core/sstring.hh>
 
@@ -45,13 +44,13 @@ struct rjson_serialize_fmt_impl {
 
     serialization_format fmt;
     template<typename T>
-    void operator()(T&& t) {
-        rjson_serialize_impl<std::remove_reference_t<T>>{fmt}(
+    bool operator()(T&& t) {
+        return rjson_serialize_impl<std::remove_reference_t<T>>{fmt}(
           std::forward<T>(t));
     }
     template<typename T>
-    void operator()(::json::Writer<::json::StringBuffer>& w, T&& t) {
-        rjson_serialize_impl<std::remove_reference_t<T>>{fmt}(
+    bool operator()(::json::Writer<::json::StringBuffer>& w, T&& t) {
+        return rjson_serialize_impl<std::remove_reference_t<T>>{fmt}(
           w, std::forward<T>(t));
     }
 };
@@ -61,11 +60,11 @@ inline rjson_serialize_fmt_impl rjson_serialize_fmt(serialization_format fmt) {
 }
 
 template<typename Handler>
-CONCEPT(requires std::is_same_v<
-        decltype(std::declval<Handler>().result),
-        typename Handler::rjson_parse_result>)
+requires std::is_same_v<
+  decltype(std::declval<Handler>().result),
+  typename Handler::rjson_parse_result>
 typename Handler::rjson_parse_result
-  rjson_parse(const char* const s, Handler&& handler) {
+rjson_parse(const char* const s, Handler&& handler) {
     ::json::Reader reader;
     ::json::StringStream ss(s);
     if (!reader.Parse(ss, handler)) {

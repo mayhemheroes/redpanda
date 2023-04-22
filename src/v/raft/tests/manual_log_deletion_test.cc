@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "config/configuration.h"
 #include "finjector/hbadger.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -18,33 +19,32 @@
 #include "random/generators.h"
 #include "storage/record_batch_builder.h"
 #include "storage/tests/utils/disk_log_builder.h"
-#include "storage/tests/utils/random_batch.h"
 #include "test_utils/async.h"
 
 #include <seastar/core/abort_source.hh>
 
 #include <filesystem>
+#include <optional>
 #include <system_error>
 #include <vector>
 
 struct manual_deletion_fixture : public raft_test_fixture {
     manual_deletion_fixture()
       : gr(
-        raft::group_id(0),
-        3,
-        storage::log_config::storage_type::disk,
-        model::cleanup_policy_bitflags::deletion,
-        1_KiB) {
+        raft::group_id(0), 3, model::cleanup_policy_bitflags::deletion, 1_KiB) {
+        config::shard_local_cfg().log_segment_size_min.set_value(
+          std::optional<uint64_t>());
         gr.enable_all();
     }
 
     void prepare_raft_group() {
-        auto leader_id = wait_for_group_leader(gr);
+        wait_for_group_leader(gr);
         ss::abort_source as;
 
         auto first_ts = model::timestamp::now();
         // append some entries
-        bool res = replicate_compactible_batches(gr, first_ts).get0();
+        [[maybe_unused]] bool res
+          = replicate_compactible_batches(gr, first_ts).get0();
         auto second_ts = model::timestamp(first_ts() + 200000);
         // append some more entries
         res = replicate_compactible_batches(gr, second_ts).get0();
@@ -61,6 +61,7 @@ struct manual_deletion_fixture : public raft_test_fixture {
                     ->compact(storage::compaction_config(
                       retention_timestamp,
                       100_MiB,
+                      model::offset::max(),
                       ss::default_priority_class(),
                       as,
                       storage::debug_sanitize_files::yes))

@@ -15,6 +15,7 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/record.h"
+#include "model/timeout_clock.h"
 #include "reflection/adl.h"
 #include "tristate.h"
 
@@ -23,6 +24,21 @@
 #include <seastar/net/socket_defs.hh>
 
 namespace reflection {
+
+template<>
+struct adl<model::timeout_clock::duration> {
+    using duration = model::timeout_clock::duration;
+
+    void to(iobuf& out, duration dur) {
+        adl<std::chrono::milliseconds>{}.to(
+          out, std::chrono::duration_cast<std::chrono::milliseconds>(dur));
+    }
+
+    model::timeout_clock::duration from(iobuf_parser& in) {
+        return std::chrono::duration_cast<duration>(
+          adl<std::chrono::milliseconds>{}.from(in));
+    }
+};
 
 template<>
 struct adl<model::topic> {
@@ -140,7 +156,7 @@ struct adl<tristate<T>> {
             adl<int8_t>{}.to(out, -1);
             return;
         }
-        if (!t.has_value()) {
+        if (!t.has_optional_value()) {
             adl<int8_t>{}.to(out, 0);
             return;
         }
@@ -162,6 +178,12 @@ struct adl<tristate<T>> {
 
         return tristate<T>(adl<T>{}.from(buf));
     }
+};
+
+template<>
+struct adl<model::producer_identity> {
+    void to(iobuf& out, model::producer_identity&& md);
+    model::producer_identity from(iobuf_parser& in);
 };
 
 template<typename Parser>

@@ -4,7 +4,6 @@ v_cc_library(
   SRCS
     segment_reader.cc
     log_manager.cc
-    mem_log_impl.cc
     disk_log_impl.cc
     disk_log_appender.cc
     parser.cc
@@ -19,6 +18,7 @@ v_cc_library(
     segment.cc
     segment_index.cc
     segment_appender_utils.cc
+    storage_resources.cc
     batch_cache.cc
     index_state.cc
     lock_manager.cc
@@ -33,6 +33,8 @@ v_cc_library(
     readers_cache.cc
     backlog_controller.cc
     compaction_controller.cc
+    offset_to_filepos.cc
+    fs_utils.cc
   DEPS
     Seastar::seastar
     v::bytes
@@ -43,6 +45,7 @@ v_cc_library(
     v::syschecks
     v::compression
     v::rprandom
+    v::resource_mgmt
     absl::flat_hash_map
     absl::btree
     Roaring::roaring

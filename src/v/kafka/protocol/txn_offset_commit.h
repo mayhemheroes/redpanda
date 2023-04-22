@@ -24,15 +24,6 @@
 
 namespace kafka {
 
-struct txn_offset_commit_response;
-
-struct txn_offset_commit_api final {
-    using response_type = txn_offset_commit_response;
-
-    static constexpr const char* name = "txn offset commit";
-    static constexpr api_key key = api_key(28);
-};
-
 struct txn_offset_commit_request final {
     using api_type = txn_offset_commit_api;
 
@@ -41,19 +32,19 @@ struct txn_offset_commit_request final {
     // set during request processing after mapping group to ntp
     model::ntp ntp;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const txn_offset_commit_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const txn_offset_commit_request& r) {
+        return os << r.data;
+    }
+};
 
 struct txn_offset_commit_response final {
     using api_type = txn_offset_commit_api;
@@ -76,18 +67,18 @@ struct txn_offset_commit_response final {
         }
     }
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const txn_offset_commit_response& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const txn_offset_commit_response& r) {
+        return os << r.data;
+    }
+};
 
 } // namespace kafka

@@ -43,13 +43,18 @@ struct bootstrap_fixture : raft::simple_record_fixture {
         },
         []() {
             return storage::log_config(
-              storage::log_config::storage_type::disk,
               "test.dir",
               1_GiB,
               storage::debug_sanitize_files::yes,
               ss::default_priority_class(),
               storage::with_cache::no);
-        }) {
+        },
+        _feature_table) {
+        _feature_table.start().get();
+        _feature_table
+          .invoke_on_all(
+            [](features::feature_table& f) { f.testing_activate_all(); })
+          .get();
         _storage.start().get();
         // ignore the get_log()
         (void)_storage.log_mgr()
@@ -74,7 +79,12 @@ struct bootstrap_fixture : raft::simple_record_fixture {
     }
     storage::log get_log() { return _storage.log_mgr().get(_ntp).value(); }
 
-    ~bootstrap_fixture() { _storage.stop().get(); }
+    ~bootstrap_fixture() {
+        _storage.stop().get();
+        _feature_table.stop().get();
+    }
+
+    ss::sharded<features::feature_table> _feature_table;
     storage::api _storage;
     ss::abort_source _as;
 };

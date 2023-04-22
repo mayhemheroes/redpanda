@@ -10,8 +10,7 @@
  */
 
 #pragma once
-#include "cluster/controller.h"
-#include "cluster/partition_manager.h"
+#include "cluster/fwd.h"
 #include "cluster/tests/utils.h"
 #include "config/seed_server.h"
 #include "model/metadata.h"
@@ -29,7 +28,7 @@
 #include <absl/container/flat_hash_map.h>
 
 template<typename Pred>
-CONCEPT(requires std::predicate<Pred>)
+requires std::predicate<Pred>
 void wait_for(model::timeout_clock::duration timeout, Pred&& p) {
     with_timeout(
       model::timeout_clock::now() + timeout,
@@ -54,7 +53,12 @@ public:
       : _sgroups(create_scheduling_groups())
       , _group_deleter([this] { _sgroups.destroy_groups().get(); })
       , _base_dir("cluster_test." + random_generators::gen_alphanum_string(6)) {
+        // Disable all metrics to guard against double_registration errors
+        // thrown by seastar. These are simulated nodes which use the same
+        // internal metrics implementation, so the usual metrics registration
+        // process won't work.
         set_configuration("disable_metrics", true);
+        set_configuration("disable_public_metrics", true);
     }
 
     virtual ~cluster_test_fixture() {
@@ -68,7 +72,10 @@ public:
       int16_t proxy_port,
       int16_t schema_reg_port,
       int16_t coproc_supervisor_port,
-      std::vector<config::seed_server> seeds) {
+      std::vector<config::seed_server> seeds,
+      configure_node_id use_node_id = configure_node_id::yes,
+      empty_seed_starts_cluster empty_seed_starts_cluster_val
+      = empty_seed_starts_cluster::yes) {
         _instances.emplace(
           node_id,
           std::make_unique<redpanda_thread_fixture>(
@@ -81,7 +88,12 @@ public:
             seeds,
             ssx::sformat("{}.{}", _base_dir, node_id()),
             _sgroups,
-            false));
+            false,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            use_node_id,
+            empty_seed_starts_cluster_val));
     }
 
     application* get_node_application(model::node_id id) {
@@ -103,25 +115,46 @@ public:
 
     application* create_node_application(
       model::node_id node_id,
-      int kafka_port = 9092,
-      int rpc_port = 11000,
-      int proxy_port = 8082,
-      int schema_reg_port = 8081,
-      int coproc_supervisor_port = 43189) {
+      int kafka_port_base = 9092,
+      int rpc_port_base = 11000,
+      int proxy_port_base = 8082,
+      int schema_reg_port_base = 8081,
+      int coproc_supervisor_port_base = 43189,
+      configure_node_id use_node_id = configure_node_id::yes,
+      empty_seed_starts_cluster empty_seed_starts_cluster_val
+      = empty_seed_starts_cluster::yes) {
         std::vector<config::seed_server> seeds = {};
-        if (node_id != 0) {
+        if (!empty_seed_starts_cluster_val || node_id != 0) {
             seeds.push_back(
               {.addr = net::unresolved_address("127.0.0.1", 11000)});
         }
         add_node(
           node_id,
-          kafka_port + node_id(),
-          rpc_port + node_id(),
-          proxy_port + node_id(),
-          schema_reg_port + node_id(),
-          coproc_supervisor_port + node_id(),
-          std::move(seeds));
+          kafka_port_base + node_id(),
+          rpc_port_base + node_id(),
+          proxy_port_base + node_id(),
+          schema_reg_port_base + node_id(),
+          coproc_supervisor_port_base + node_id(),
+          std::move(seeds),
+          use_node_id,
+          empty_seed_starts_cluster_val);
         return get_node_application(node_id);
+    }
+
+    application* create_node_application(
+      model::node_id node_id,
+      configure_node_id use_node_id,
+      empty_seed_starts_cluster empty_seed_starts_cluster_val
+      = empty_seed_starts_cluster::yes) {
+        return create_node_application(
+          node_id,
+          9092,
+          11000,
+          8082,
+          8081,
+          43189,
+          use_node_id,
+          empty_seed_starts_cluster_val);
     }
 
     void remove_node_application(model::node_id node_id) {
@@ -132,9 +165,7 @@ public:
         return tests::cooperative_spin_wait_with_timeout(timeout, [this] {
             return std::all_of(
               _instances.begin(), _instances.end(), [this](auto& p) {
-                  return p.second->app.metadata_cache.local()
-                           .all_brokers()
-                           .size()
+                  return p.second->app.metadata_cache.local().node_count()
                          == _instances.size();
               });
         });

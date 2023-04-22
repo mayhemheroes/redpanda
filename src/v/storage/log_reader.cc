@@ -12,11 +12,13 @@
 #include "bytes/iobuf.h"
 #include "model/record.h"
 #include "storage/logger.h"
+#include "storage/parser_errc.h"
 #include "vassert.h"
 #include "vlog.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/circular_buffer.hh>
+#include <seastar/core/coroutine.hh>
 
 #include <fmt/ostream.h>
 
@@ -61,9 +63,9 @@ batch_consumer::consume_result skipping_consumer::accept_batch_start(
         _reader._config.start_offset = header.last_offset() + model::offset(1);
         return batch_consumer::consume_result::skip_batch;
     }
-    if (_reader._config.first_timestamp > header.first_timestamp) {
-        // kakfa needs to guarantee that the returned record is >=
-        // first_timestamp
+    if (_reader._config.first_timestamp > header.max_timestamp) {
+        // kakfa requires that we return messages >= the timestamp, it is
+        // permitted to include a few earlier
         _reader._config.start_offset = header.last_offset() + model::offset(1);
         return batch_consumer::consume_result::skip_batch;
     }
@@ -128,11 +130,13 @@ log_segment_batch_reader::log_segment_batch_reader(
   , _config(config)
   , _probe(p) {}
 
-std::unique_ptr<continuous_batch_parser> log_segment_batch_reader::initialize(
+ss::future<std::unique_ptr<continuous_batch_parser>>
+log_segment_batch_reader::initialize(
   model::timeout_clock::time_point timeout,
   std::optional<model::offset> next_cached_batch) {
-    auto input = _seg.offset_data_stream(_config.start_offset, _config.prio);
-    return std::make_unique<continuous_batch_parser>(
+    auto input = co_await _seg.offset_data_stream(
+      _config.start_offset, _config.prio);
+    co_return std::make_unique<continuous_batch_parser>(
       std::make_unique<skipping_consumer>(*this, timeout, next_cached_batch),
       std::move(input));
 }
@@ -141,6 +145,7 @@ ss::future<> log_segment_batch_reader::close() {
     if (_iterator) {
         return _iterator->close();
     }
+
     return ss::make_ready_future<>();
 }
 
@@ -181,8 +186,7 @@ log_segment_batch_reader::read_some(model::timeout_clock::time_point timeout) {
         _probe.add_bytes_read(cache_read.memory_usage);
         _probe.add_cached_bytes_read(cache_read.memory_usage);
         _probe.add_cached_batches_read(cache_read.batches.size());
-        return ss::make_ready_future<result<records_t>>(
-          std::move(cache_read.batches));
+        co_return result<records_t>(std::move(cache_read.batches));
     }
 
     /*
@@ -192,21 +196,30 @@ log_segment_batch_reader::read_some(model::timeout_clock::time_point timeout) {
      * on disk reads which is bound by the stable offset.
      */
     if (_config.start_offset > _seg.offsets().stable_offset) {
-        return ss::make_ready_future<result<records_t>>(records_t{});
+        co_return result<records_t>(records_t{});
     }
 
     if (!_iterator) {
-        _iterator = initialize(timeout, cache_read.next_cached_batch);
+        _iterator = co_await initialize(timeout, cache_read.next_cached_batch);
     }
     auto ptr = _iterator.get();
-    return ptr->consume().then(
-      [this](result<size_t> bytes_consumed) -> result<records_t> {
+    co_return co_await ptr->consume()
+      .then([this](result<size_t> bytes_consumed) -> result<records_t> {
           if (!bytes_consumed) {
               return bytes_consumed.error();
           }
           auto tmp = std::exchange(_state, {});
           return result<records_t>(std::move(tmp.buffer));
-      });
+      })
+      .handle_exception_type(
+        [](const std::system_error& ec) -> ss::future<result<records_t>> {
+            if (ec.code().value() == EIO) {
+                vassert(false, "I/O error during read!  Disk failure?");
+            } else {
+                return ss::make_exception_future<result<records_t>>(
+                  std::current_exception());
+            }
+        });
 }
 
 log_reader::log_reader(
@@ -296,10 +309,33 @@ log_reader::do_load_slice(model::timeout_clock::time_point timeout) {
       .then([this, timeout](result<records_t> recs) -> ss::future<storage_t> {
           if (!recs) {
               set_end_of_stream();
-              vlog(
-                stlog.info,
-                "stopped reading stream: {}",
-                recs.error().message());
+
+              if (!_lease->range.empty()) {
+                  // Readers do not know their ntp directly: discover
+                  // it by checking the segments in our lease
+                  auto seg_ptr = *(_lease->range.begin());
+                  vlog(
+                    stlog.info,
+                    "stopped reading stream[{}]: {}",
+                    seg_ptr->path().get_ntp(),
+                    recs.error().message());
+              } else {
+                  // Leases should always have a segment, but this is
+                  // not a strict invariant at present, so handle the
+                  // empty case.
+                  vlog(
+                    stlog.info,
+                    "stopped reading stream: {}",
+                    recs.error().message());
+              }
+
+              auto const batch_parse_err
+                = recs.error() == parser_errc::header_only_crc_missmatch
+                  || recs.error() == parser_errc::input_stream_not_enough_bytes;
+
+              if (batch_parse_err) {
+                  _probe.batch_parse_error();
+              }
               return _iterator.close().then(
                 [] { return ss::make_ready_future<storage_t>(); });
           }
@@ -340,6 +376,34 @@ static inline bool is_finished_offset(segment_set& s, model::offset o) {
 bool log_reader::is_done() {
     return is_end_of_stream()
            || is_finished_offset(_lease->range, _config.start_offset);
+}
+
+timequery_result
+batch_timequery(const model::record_batch& b, model::timestamp t) {
+    // If the timestamp matches something mid-batch, then
+    // parse into the batch far enough to find it: this
+    // happens when we had CreateTime input, such that
+    // records in the batch have different timestamps.
+    model::offset result_o = b.base_offset();
+    model::timestamp result_t = b.header().first_timestamp;
+    if (b.header().first_timestamp < t && !b.compressed()) {
+        b.for_each_record(
+          [&result_o, &result_t, t, &b](
+            const model::record& r) -> ss::stop_iteration {
+              auto record_t = model::timestamp(
+                b.header().first_timestamp() + r.timestamp_delta());
+              if (record_t >= t) {
+                  auto record_o = model::offset{r.offset_delta()}
+                                  + b.base_offset();
+                  result_o = record_o;
+                  result_t = record_t;
+                  return ss::stop_iteration::yes;
+              } else {
+                  return ss::stop_iteration::no;
+              }
+          });
+    }
+    return {result_o, result_t};
 }
 
 } // namespace storage

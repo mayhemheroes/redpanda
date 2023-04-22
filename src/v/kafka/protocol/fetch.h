@@ -11,15 +11,9 @@
 
 #pragma once
 
-#include "cluster/partition.h"
-#include "cluster/rm_stm.h"
 #include "kafka/protocol/batch_reader.h"
 #include "kafka/protocol/schemata/fetch_request.h"
 #include "kafka/protocol/schemata/fetch_response.h"
-#include "kafka/server/fetch_session.h"
-#include "kafka/server/partition_proxy.h"
-#include "kafka/server/request_context.h"
-#include "kafka/server/response.h"
 #include "kafka/types.h"
 #include "likely.h"
 #include "model/fundamental.h"
@@ -31,15 +25,6 @@
 
 namespace kafka {
 
-struct fetch_response;
-
-struct fetch_api final {
-    using response_type = fetch_response;
-
-    static constexpr const char* name = "fetch";
-    static constexpr api_key key = api_key(1);
-};
-
 struct fetch_request final {
     using api_type = fetch_api;
     using partition = fetch_partition;
@@ -48,11 +33,11 @@ struct fetch_request final {
 
     fetch_request_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
 
@@ -182,11 +167,11 @@ struct fetch_request final {
     const_iterator cend() const {
         return const_iterator(data.topics.cend(), data.topics.cend());
     }
-};
 
-inline std::ostream& operator<<(std::ostream& os, const fetch_request& r) {
-    return os << r.data;
-}
+    friend std::ostream& operator<<(std::ostream& os, const fetch_request& r) {
+        return os << r.data;
+    }
+};
 
 struct fetch_response final {
     using api_type = fetch_api;
@@ -196,7 +181,10 @@ struct fetch_response final {
 
     fetch_response_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    // Used for usage/metering to relay this value back to the connection layer
+    size_t internal_topic_bytes{0};
+
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
@@ -316,10 +304,10 @@ struct fetch_response final {
     }
 
     iterator end() { return iterator(data.topics.end(), data.topics.end()); }
-};
 
-inline std::ostream& operator<<(std::ostream& os, const fetch_response& r) {
-    return os << r.data;
-}
+    friend std::ostream& operator<<(std::ostream& os, const fetch_response& r) {
+        return os << r.data;
+    }
+};
 
 } // namespace kafka

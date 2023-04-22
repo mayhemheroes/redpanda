@@ -16,18 +16,12 @@
 #include "bytes/details/io_iterator_consumer.h"
 #include "bytes/details/io_placeholder.h"
 #include "bytes/details/out_of_range.h"
+#include "bytes/oncore.h"
 #include "likely.h"
-#include "oncore.h"
 #include "seastarx.h"
 #include "utils/intrusive_list_helpers.h"
-#include "vassert.h"
 
-#include <seastar/core/iostream.hh>
-#include <seastar/core/scattered_message.hh>
-#include <seastar/core/smp.hh>
 #include <seastar/core/temporary_buffer.hh>
-
-#include <boost/container_hash/hash.hpp> // hash_combine
 
 #include <cstddef>
 #include <iosfwd>
@@ -136,9 +130,15 @@ public:
     void append(ss::temporary_buffer<char>);
     /// appends the contents of buffer; might pack values into existing space
     void append(iobuf);
-    /// appends all fragments from given buffer directly to current buffer
-    /// fragments list
+
+    /*
+     * appends all fragments from the iobuf parameter. be careful when appending
+     * fragments from a shared iobuf. sharing in a zero-copy operation and iobuf
+     * does not perform copy-on-write. therefore changes will be visible to all
+     * iobufs that share the backing fragments.
+     */
     void append_fragments(iobuf);
+
     /// \brief trims the back, and appends direct.
     void append_take_ownership(fragment*);
     /// prepends the _the buffer_ as iobuf::details::io_fragment::full{}
@@ -170,6 +170,8 @@ public:
     const_iterator end() const;
     const_iterator cbegin() const;
     const_iterator cend() const;
+
+    std::string hexdump(size_t) const;
 
 private:
     /// \brief trims the back, and appends direct.
@@ -203,7 +205,7 @@ inline bool iobuf::operator!=(const iobuf& o) const { return !(*this == o); }
 inline bool iobuf::operator!=(std::string_view o) const {
     return !(*this == o);
 }
-inline bool iobuf::empty() const { return _frags.empty(); }
+inline bool iobuf::empty() const { return _size == 0; }
 inline size_t iobuf::size_bytes() const { return _size; }
 
 inline size_t iobuf::available_bytes() const {
@@ -238,16 +240,6 @@ inline void iobuf::create_new_fragment(size_t sz) {
     auto asz = details::io_allocation_size::next_allocation_size(chunk_max);
     auto f = new fragment(ss::temporary_buffer<char>(asz), fragment::empty{});
     append_take_ownership(f);
-}
-inline iobuf::placeholder iobuf::reserve(size_t sz) {
-    oncore_debug_verify(_verify_shard);
-    vassert(sz, "zero length reservations are unsupported");
-    reserve_memory(sz);
-    _size += sz;
-    auto it = std::prev(_frags.end());
-    placeholder p(it, it->size(), sz);
-    it->reserve(sz);
-    return p;
 }
 /// only ensures that a segment of at least reservation is avaible
 /// as an empty details::io_fragment
@@ -286,11 +278,8 @@ inline void iobuf::reserve_memory(size_t reservation) {
 }
 
 [[gnu::always_inline]] void inline iobuf::append(const char* ptr, size_t size) {
-    if (unlikely(!size)) {
-        return;
-    }
     oncore_debug_verify(_verify_shard);
-    if (size == 0) {
+    if (unlikely(size == 0)) {
         return;
     }
     if (likely(size <= available_bytes())) {
@@ -391,34 +380,4 @@ inline void iobuf::trim_back(size_t n) {
     }
 }
 
-/// \brief wraps an iobuf so it can be used as an input stream data source
-ss::input_stream<char> make_iobuf_input_stream(iobuf io);
-
-/// \brief wraps the iobuf to be used as an output stream sink
-ss::output_stream<char> make_iobuf_ref_output_stream(iobuf& io);
-
-/// \brief exactly like input_stream<char>::read_exactly but returns iobuf
-ss::future<iobuf> read_iobuf_exactly(ss::input_stream<char>& in, size_t n);
-
-/// \brief keeps the iobuf in the deferred destructor of scattered_msg<char>
-/// and wraps each details::io_fragment as a scattered_message<char>::static()
-/// const char*
-ss::scattered_message<char> iobuf_as_scattered(iobuf b);
-
-ss::future<> write_iobuf_to_output_stream(iobuf, ss::output_stream<char>&);
-
 iobuf iobuf_copy(iobuf::iterator_consumer& in, size_t len);
-namespace std {
-template<>
-struct hash<::iobuf> {
-    size_t operator()(const ::iobuf& b) const {
-        size_t h = 0;
-        for (auto& f : b) {
-            boost::hash_combine(
-              h, std::hash<std::string_view>{}({f.get(), f.size()}));
-        }
-        return h;
-    }
-};
-
-} // namespace std

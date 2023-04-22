@@ -11,6 +11,7 @@
 
 #include "bytes/iobuf.h"
 #include "bytes/iobuf_parser.h"
+#include "bytes/iostream.h"
 #include "bytes/utils.h"
 #include "likely.h"
 #include "model/record.h"
@@ -77,23 +78,36 @@ static model::record_batch_header header_from_iobuf(iobuf b) {
     hdr.ctx.owner_shard = ss::this_shard_id();
     return hdr;
 }
-
+// make sure that `msg` parameter is a static string or it is not removed before
+// this function finishes
 static ss::future<result<iobuf>> verify_read_iobuf(
-  ss::input_stream<char>& in, size_t expected, ss::sstring msg) {
-    return read_iobuf_exactly(in, expected)
-      .then([msg = std::move(msg), expected](iobuf b) {
-          if (likely(b.size_bytes() == expected)) {
-              return ss::make_ready_future<result<iobuf>>(std::move(b));
-          }
-          stlog.error(
-            "Cannot continue parsing. recived size:{} bytes, expected:{} "
-            "bytes. context:{}",
-            b.size_bytes(),
-            expected,
-            msg);
-          return ss::make_ready_future<result<iobuf>>(
-            parser_errc::input_stream_not_enough_bytes);
-      });
+  ss::input_stream<char>& in,
+  size_t expected,
+  const char* msg,
+  bool recover = false) {
+    auto b = co_await read_iobuf_exactly(in, expected);
+
+    if (likely(b.size_bytes() == expected)) {
+        co_return b;
+    }
+    if (!recover) {
+        vlog(
+          stlog.error,
+          "Stopping parser, short read. Expected to read {} bytes, but read {} "
+          "bytes. context: {}",
+          expected,
+          b.size_bytes(),
+          msg);
+    } else {
+        vlog(
+          stlog.debug,
+          "Recovery ended with short read. Expected to read {} bytes, but read "
+          "{} bytes. context: {}",
+          expected,
+          b.size_bytes(),
+          msg);
+    }
+    co_return parser_errc::input_stream_not_enough_bytes;
 }
 
 ss::future<result<stop_parser>> continuous_batch_parser::consume_header() {
@@ -125,7 +139,7 @@ ss::future<result<stop_parser>> continuous_batch_parser::consume_header() {
             auto remaining = _header->size_bytes
                              - model::packed_record_batch_header_size;
             auto b = co_await verify_read_iobuf(
-              _input, remaining, "parser::skip_batch");
+              get_stream(), remaining, "parser::skip_batch", _recovery);
 
             if (!b) {
                 co_return b.error();
@@ -139,8 +153,10 @@ ss::future<result<stop_parser>> continuous_batch_parser::consume_header() {
 }
 
 template<class Consumer>
-static ss::future<result<model::record_batch_header>>
-read_header_impl(ss::input_stream<char>& input, const Consumer& consumer) {
+static ss::future<result<model::record_batch_header>> read_header_impl(
+  ss::input_stream<char>& input,
+  const Consumer& consumer,
+  bool recovery = false) {
     auto b = co_await read_iobuf_exactly(
       input, model::packed_record_batch_header_size);
 
@@ -149,11 +165,20 @@ read_header_impl(ss::input_stream<char>& input, const Consumer& consumer) {
         co_return parser_errc::end_of_stream;
     }
     if (b.size_bytes() != model::packed_record_batch_header_size) {
-        stlog.error(
-          "Could not parse header. Expected:{}, but Got:{}. consumer:{}",
-          model::packed_record_batch_header_size,
-          b.size_bytes(),
-          consumer);
+        if (!recovery) {
+            stlog.error(
+              "Could not parse header. Expected:{}, but Got:{}. consumer:{}",
+              model::packed_record_batch_header_size,
+              b.size_bytes(),
+              consumer);
+        } else {
+            stlog.debug(
+              "End of recovery with parse error. Expected:{}, but Got:{}. "
+              "consumer:{})",
+              model::packed_record_batch_header_size,
+              b.size_bytes(),
+              consumer);
+        }
         co_return parser_errc::input_stream_not_enough_bytes;
     }
     // check if iobuf is filled is zeros, this means that we are reading
@@ -166,14 +191,25 @@ read_header_impl(ss::input_stream<char>& input, const Consumer& consumer) {
 
     if (auto computed_crc = model::internal_header_only_crc(header);
         unlikely(header.header_crc != computed_crc)) {
-        vlog(
-          stlog.error,
-          "detected header corruption. stopping parser. Expected CRC of "
-          "{}, but got header CRC: {} - {}. consumer:{}",
-          computed_crc,
-          header.header_crc,
-          header,
-          consumer);
+        if (!recovery) {
+            vlog(
+              stlog.error,
+              "detected header corruption. stopping parser. Expected CRC of "
+              "{}, but got header CRC: {} - {}. consumer:{}",
+              computed_crc,
+              header.header_crc,
+              header,
+              consumer);
+        } else {
+            vlog(
+              stlog.debug,
+              "End of recovery with CRC mismatch. Expected CRC of "
+              "{}, but got header CRC: {} - {}. consumer:{}",
+              computed_crc,
+              header.header_crc,
+              header,
+              consumer);
+        }
         co_return parser_errc::header_only_crc_missmatch;
     }
     co_return header;
@@ -181,7 +217,7 @@ read_header_impl(ss::input_stream<char>& input, const Consumer& consumer) {
 
 ss::future<result<model::record_batch_header>>
 continuous_batch_parser::read_header() {
-    return read_header_impl(_input, *_consumer);
+    return read_header_impl(get_stream(), *_consumer, _recovery);
 }
 
 ss::future<result<stop_parser>> continuous_batch_parser::consume_one() {
@@ -209,7 +245,8 @@ void continuous_batch_parser::add_bytes_and_reset() {
 }
 ss::future<result<stop_parser>> continuous_batch_parser::consume_records() {
     auto sz = _header->size_bytes - model::packed_record_batch_header_size;
-    return verify_read_iobuf(_input, sz, "parser::consume_records")
+    return verify_read_iobuf(
+             get_stream(), sz, "parser::consume_records", _recovery)
       .then([this](result<iobuf> record) -> result<stop_parser> {
           if (!record) {
               return record.error();
@@ -219,8 +256,16 @@ ss::future<result<stop_parser>> continuous_batch_parser::consume_records() {
       });
 }
 
+static constexpr std::array<parser_errc, 3> benign_error_codes{
+  {parser_errc::none,
+   parser_errc::end_of_stream,
+   parser_errc::fallocated_file_read_zero_bytes_for_header}};
+
 ss::future<result<size_t>> continuous_batch_parser::consume() {
-    if (unlikely(_err != parser_errc::none)) {
+    if (unlikely(!std::any_of(
+          benign_error_codes.begin(),
+          benign_error_codes.end(),
+          [v = _err](parser_errc e) { return e == v; }))) {
         return ss::make_ready_future<result<size_t>>(_err);
     }
     return ss::repeat([this] {
@@ -229,7 +274,7 @@ ss::future<result<size_t>> continuous_batch_parser::consume() {
                        _err = parser_errc(s.error().value());
                        return ss::stop_iteration::yes;
                    }
-                   if (_input.eof()) {
+                   if (get_stream().eof()) {
                        return ss::stop_iteration::yes;
                    }
                    if (s.value() == stop_parser::yes) {
@@ -243,10 +288,6 @@ ss::future<result<size_t>> continuous_batch_parser::consume() {
               // support partial reads
               return result<size_t>(_bytes_consumed);
           }
-          constexpr std::array<parser_errc, 3> benign_error_codes{
-            {parser_errc::none,
-             parser_errc::end_of_stream,
-             parser_errc::fallocated_file_read_zero_bytes_for_header}};
           if (std::any_of(
                 benign_error_codes.begin(),
                 benign_error_codes.end(),
@@ -262,10 +303,12 @@ public:
     explicit copy_helper(
       ss::input_stream<char> input,
       ss::output_stream<char> output,
-      record_batch_transform_predicate pred)
+      record_batch_transform_predicate pred,
+      opt_abort_source_t as)
       : _input(std::move(input))
       , _output(std::move(output))
-      , _pred(std::move(pred)) {}
+      , _pred(std::move(pred))
+      , _as(as) {}
 
     ss::future<result<model::record_batch_header>> read_header() {
         return read_header_impl(_input, ss::sstring("copy_helper"));
@@ -276,7 +319,8 @@ public:
     ss::future<result<size_t>> run() {
         size_t consumed = 0;
         bool stop = false;
-        while (!stop) {
+        while (!stop
+               && (!_as.has_value() || !_as.value().get().abort_requested())) {
             auto r = co_await read_header();
             if (!r) {
                 if (r.error() == parser_errc::end_of_stream) {
@@ -350,13 +394,15 @@ public:
     ss::output_stream<char> _output;
     record_batch_transform_predicate _pred;
     model::record_batch_header _header{};
+    opt_abort_source_t _as;
 };
 
 ss::future<result<size_t>> transform_stream(
   ss::input_stream<char> in,
   ss::output_stream<char> out,
-  record_batch_transform_predicate pred) {
-    copy_helper helper(std::move(in), std::move(out), std::move(pred));
+  record_batch_transform_predicate pred,
+  opt_abort_source_t as) {
+    copy_helper helper(std::move(in), std::move(out), std::move(pred), as);
     co_return co_await helper.run().finally(
       [&helper] { return helper.close(); });
 }

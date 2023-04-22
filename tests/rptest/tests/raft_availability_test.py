@@ -13,6 +13,7 @@ import re
 import random
 import ducktape.errors
 from typing import Optional
+import requests
 
 from ducktape.mark import parametrize
 from ducktape.utils.util import wait_until
@@ -20,6 +21,7 @@ from ducktape.utils.util import wait_until
 from rptest.clients.kafka_cat import KafkaCat
 from rptest.clients.rpk import RpkTool, RpkException
 from rptest.clients.types import TopicSpec
+from rptest.clients.ping_pong import PingPong
 from rptest.services.failure_injector import FailureInjector, FailureSpec
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.services.rpk_producer import RpkProducer
@@ -34,7 +36,7 @@ ELECTION_TIMEOUT = 10
 # Logs that may appear when a node is network-isolated
 ISOLATION_LOG_ALLOW_LIST = [
     # rpc - server.cc:91 - vectorized internal rpc protocol - Error[shutting down] remote address: 10.89.0.16:60960 - std::__1::system_error (error system:32, sendmsg: Broken pipe)
-    "rpc - .*Broken pipe",
+    "(kafka|rpc) - .*Broken pipe",
 ]
 
 
@@ -95,26 +97,15 @@ class RaftAvailabilityTest(RedpandaTest):
         assert result[0] is not None
         return result[0]
 
-    def _ping_pong(self, timeout=5):
-        kc = KafkaCat(self.redpanda)
-        rpk = RpkTool(self.redpanda)
+    def ping_pong(self):
+        return PingPong(self.redpanda.brokers_list(), self.topic, 0,
+                        self.logger)
 
-        payload = str(random.randint(0, 1000))
-        start = time.time()
-        offset = rpk.produce(self.topic, "tkey", payload, timeout=timeout)
-        consumed = kc.consume_one(self.topic, 0, offset)
-        latency = time.time() - start
-        self.logger.info(
-            f"_ping_pong produced '{payload}' consumed '{consumed}' in {(latency)*1000.0:.2f} ms"
-        )
-        if consumed['payload'] != payload:
-            raise RuntimeError(f"expected '{payload}' got '{consumed}'")
-
-    def _is_available(self, timeout=5):
+    def _is_available(self, timeout_s=5):
         try:
             # Should fail
-            self._ping_pong(timeout)
-        except RpkException:
+            self.ping_pong().ping_pong(timeout_s)
+        except:
             return False
         else:
             return True
@@ -122,52 +113,59 @@ class RaftAvailabilityTest(RedpandaTest):
     def _expect_unavailable(self):
         try:
             # Should fail
-            self._ping_pong()
-        except RpkException:
-            self.logger.info("Cluster is unavailable as expected")
+            self.ping_pong().ping_pong()
+        except:
+            self.logger.exception("Cluster is unavailable as expected")
         else:
             assert False, "ping_pong should not have worked "
 
     def _expect_available(self):
-        self._ping_pong()
+        self.ping_pong().ping_pong()
         self.logger.info("Cluster is available as expected")
 
     def _transfer_leadership(self, admin: Admin, namespace: str, topic: str,
-                             target_node_id: int) -> None:
+                             target_id: int) -> None:
 
-        last_log_msg = ""  # avoid spamming log
-
-        def leader_predicate(l: Optional[int]) -> bool:
-            nonlocal last_log_msg, target_node_id
-            if not l:
-                return False
-            if l != target_node_id:  # type: ignore
-                log_msg = f'Still waiting for leader {target_node_id}, got {l}'
-                if log_msg != last_log_msg:  # type: ignore # "unbound"
-                    self.logger.info(log_msg)
-                    last_log_msg = log_msg
-                return False
-            return True
-
-        retry_once = True
+        count = 0
         while True:
-            self.logger.info(f"Starting transfer to {target_node_id}")
-            admin.partition_transfer_leadership("kafka", topic, 0,
-                                                target_node_id)
-            try:
-                self._wait_for_leader(leader_predicate,
-                                      timeout=ELECTION_TIMEOUT * 2)
-            except ducktape.errors.TimeoutError as e:
-                if retry_once:
-                    self.logger.info(
-                        f'Failed to get desired leader, retrying once.')
-                    retry_once = False
-                    continue
-                else:
-                    raise e
-            break  # no exception -> success, we can return now
+            count += 1
+            self.logger.info(f"Waiting for a leader")
+            leader_id = admin.await_stable_leader(topic,
+                                                  partition=0,
+                                                  namespace=namespace,
+                                                  timeout_s=30,
+                                                  backoff_s=2)
+            self.logger.info(f"Current leader {leader_id}")
 
-        self.logger.info(f"Completed transfer to {target_node_id}")
+            if leader_id == target_id:
+                return
+
+            self.logger.info(f"Starting transfer to {target_id}")
+            requests.exceptions.HTTPError
+            try:
+                admin.transfer_leadership_to(topic=topic,
+                                             namespace=namespace,
+                                             partition=0,
+                                             target_id=target_id,
+                                             leader_id=leader_id)
+            except requests.exceptions.HTTPError as e:
+                if count <= 10 and e.response.status_code == 503:
+                    self.logger.info(
+                        f"Got 503: {leader_id}'s metadata hasn't been updated yet"
+                    )
+                    time.sleep(1)
+                    continue
+                raise
+            break
+
+        admin.await_stable_leader(topic,
+                                  partition=0,
+                                  namespace=namespace,
+                                  timeout_s=ELECTION_TIMEOUT * 4,
+                                  backoff_s=2,
+                                  check=lambda node_id: node_id != leader_id)
+
+        self.logger.info(f"Completed transfer to {target_id}")
 
     @cluster(num_nodes=3)
     def test_one_node_down(self):
@@ -276,7 +274,7 @@ class RaftAvailabilityTest(RedpandaTest):
         # Find which node is the leader
         initial_leader_id, replicas = self._wait_for_leader()
 
-        self._ping_pong()
+        self.ping_pong().ping_pong()
 
         leader_node = self.redpanda.get_node(initial_leader_id)
         other_node_id = (set(replicas) - {initial_leader_id}).pop()
@@ -414,7 +412,7 @@ class RaftAvailabilityTest(RedpandaTest):
         # is tripping up the cluster when we have so many leadership transfers.
         # https://github.com/redpanda-data/redpanda/issues/2623
 
-        admin = Admin(self.redpanda)
+        admin = Admin(self.redpanda, retry_codes=[])
 
         initial_leader_id = leader_node_id
         for n in range(0, transfer_count):
@@ -423,6 +421,18 @@ class RaftAvailabilityTest(RedpandaTest):
 
             self._transfer_leadership(admin, "kafka", self.topic,
                                       target_node_id)
+
+            # Wait til we can see producer progressing, to avoid a situation where
+            # we do leadership transfers so quickly that we stall the producer
+            # and time out the SSH session to it.  This is generally very
+            # quick, but can take as long as it takes a client to time out
+            # and refresh metadata.
+            output_count = producer.output_line_count
+            wait_until(
+                lambda: producer.output_line_count > output_count,
+                timeout_sec=20,
+                # Fast poll because it's local state
+                backoff_sec=0.1)
 
         self.logger.info(f"Completed {transfer_count} transfers successfully")
 
@@ -474,8 +484,10 @@ class RaftAvailabilityTest(RedpandaTest):
                             self.redpanda.get_node(follower)))
 
             # expect messages to be produced and consumed without a timeout
-            for i in range(0, 128):
-                self._ping_pong(ELECTION_TIMEOUT * 6)
+            connection = self.ping_pong()
+            connection.ping_pong(timeout_s=10, retries=10)
+            for i in range(0, 127):
+                connection.ping_pong()
 
     @cluster(num_nodes=3, log_allow_list=RESTART_LOG_ALLOW_LIST)
     def test_id_allocator_leader_isolation(self):
@@ -505,8 +517,10 @@ class RaftAvailabilityTest(RedpandaTest):
                             self.redpanda.get_node(initial_leader_id)))
 
             # expect messages to be produced and consumed without a timeout
-            for i in range(0, 128):
-                self._ping_pong(ELECTION_TIMEOUT * 6)
+            connection = self.ping_pong()
+            connection.ping_pong(timeout_s=10, retries=10)
+            for i in range(0, 127):
+                connection.ping_pong()
 
     @cluster(num_nodes=3)
     def test_initial_leader_stability(self):
@@ -580,5 +594,7 @@ class RaftAvailabilityTest(RedpandaTest):
                     hosts=hosts,
                     check=lambda node_id: node_id != controller_id)
 
-        for i in range(0, 128):
-            self._ping_pong()
+        connection = self.ping_pong()
+        connection.ping_pong(timeout_s=10, retries=10)
+        for i in range(0, 127):
+            connection.ping_pong()

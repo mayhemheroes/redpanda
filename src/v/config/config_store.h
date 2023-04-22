@@ -115,6 +115,7 @@ public:
      */
     void to_json(
       json::Writer<json::StringBuffer>& w,
+      redact_secrets redact,
       std::optional<std::function<bool(base_property&)>> filter
       = std::nullopt) const {
         w.StartObject();
@@ -129,7 +130,37 @@ public:
             }
 
             w.Key(name.data(), name.size());
-            property->to_json(w);
+            property->to_json(w, redact);
+        }
+
+        w.EndObject();
+    }
+
+    void to_json_for_metrics(json::Writer<json::StringBuffer>& w) {
+        w.StartObject();
+
+        for (const auto& [name, property] : _properties) {
+            if (property->get_visibility() == visibility::deprecated) {
+                continue;
+            }
+
+            if (property->type_name() == "boolean") {
+                w.Key(name.data(), name.size());
+                property->to_json(w, redact_secrets::yes);
+                continue;
+            }
+
+            if (property->is_nullable()) {
+                w.Key(name.data(), name.size());
+                w.String(property->is_default() ? "default" : "[value]");
+                continue;
+            }
+
+            if (!property->enum_values().empty()) {
+                w.Key(name.data(), name.size());
+                property->to_json(w, redact_secrets::yes);
+                continue;
+            }
         }
 
         w.EndObject();
@@ -144,6 +175,20 @@ public:
         return result;
     }
 
+    friend std::ostream&
+    operator<<(std::ostream& o, const config::config_store& c) {
+        o << "{ ";
+        c.for_each([&o](const auto& property) { o << property << " "; });
+        o << "}";
+        return o;
+    }
+
+    void notify_original_version(legacy_version ov) {
+        for (const auto& [name, property] : _properties) {
+            property->notify_original_version(ov);
+        }
+    }
+
     virtual ~config_store() noexcept = default;
 
 private:
@@ -151,20 +196,10 @@ private:
     std::unordered_map<std::string_view, base_property*> _properties;
 };
 
-inline YAML::Node to_yaml(const config_store& cfg) {
+inline YAML::Node to_yaml(const config_store& cfg, redact_secrets redact) {
     json::StringBuffer buf;
     json::Writer<json::StringBuffer> writer(buf);
-    cfg.to_json(writer);
+    cfg.to_json(writer, redact);
     return YAML::Load(buf.GetString());
 }
 }; // namespace config
-
-namespace std {
-template<typename... Types>
-static inline ostream& operator<<(ostream& o, const config::config_store& c) {
-    o << "{ ";
-    c.for_each([&o](const auto& property) { o << property << " "; });
-    o << "}";
-    return o;
-}
-} // namespace std

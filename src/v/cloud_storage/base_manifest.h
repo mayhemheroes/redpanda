@@ -11,7 +11,6 @@
 #pragma once
 
 #include "cloud_storage/types.h"
-#include "cluster/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "seastarx.h"
@@ -27,6 +26,7 @@ struct serialized_json_stream {
 enum class manifest_type {
     topic,
     partition,
+    tx_range,
 };
 
 class base_manifest {
@@ -39,7 +39,7 @@ public:
     /// Serialize manifest object
     ///
     /// \return asynchronous input_stream with the serialized json
-    virtual serialized_json_stream serialize() const = 0;
+    virtual ss::future<serialized_json_stream> serialize() const = 0;
 
     /// Manifest object name in S3
     virtual remote_manifest_path get_manifest_path() const = 0;

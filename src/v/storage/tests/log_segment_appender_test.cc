@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0
 
 #include "bytes/iobuf.h"
+#include "bytes/iostream.h"
 #include "random/generators.h"
 #include "seastarx.h"
 #include "storage/segment_appender.h"
@@ -35,13 +36,12 @@ ss::file open_file(std::string_view filename) {
       .get0();
 }
 
-segment_appender make_segment_appender(ss::file file, size_t fallocate_size) {
+segment_appender
+make_segment_appender(ss::file file, storage::storage_resources& resources) {
     return segment_appender(
       std::move(file),
       segment_appender::options(
-        ss::default_priority_class(),
-        1,
-        config::mock_binding(std::move(fallocate_size))));
+        ss::default_priority_class(), 1, std::nullopt, resources));
 }
 
 iobuf make_random_data(size_t len) {
@@ -53,7 +53,9 @@ iobuf make_random_data(size_t len) {
 static void run_test_can_append_multiple_flushes(size_t fallocate_size) {
     std::cout.setf(std::ios::unitbuf);
     auto f = open_file("test.segment_appender_random.log");
-    auto appender = make_segment_appender(f, fallocate_size);
+    storage::storage_resources resources(
+      config::mock_binding<size_t>(std::move(fallocate_size)));
+    auto appender = make_segment_appender(f, resources);
 
     iobuf expected;
     ss::sstring data = "123456789\n";
@@ -88,7 +90,9 @@ SEASTAR_THREAD_TEST_CASE(test_can_append_multiple_flushes) {
 
 static void run_test_can_append_mixed(size_t fallocate_size) {
     auto f = open_file("test_log_segment_mixed.log");
-    auto appender = make_segment_appender(f, fallocate_size);
+    storage::storage_resources resources(
+      config::mock_binding<size_t>(std::move(fallocate_size)));
+    auto appender = make_segment_appender(f, resources);
     auto alignment = f.disk_write_dma_alignment();
     for (size_t i = 0, acc = 0; i < 100; ++i) {
         iobuf original;
@@ -149,7 +153,9 @@ SEASTAR_THREAD_TEST_CASE(test_can_append_mixed) {
 
 static void run_test_can_append_10MB(size_t fallocate_size) {
     auto f = open_file("test_segment_appender.log");
-    auto appender = make_segment_appender(f, fallocate_size);
+    storage::storage_resources resources(
+      config::mock_binding<size_t>(std::move(fallocate_size)));
+    auto appender = make_segment_appender(f, resources);
 
     for (size_t i = 0; i < 10; ++i) {
         constexpr size_t one_meg = 1024 * 1024;
@@ -173,7 +179,9 @@ SEASTAR_THREAD_TEST_CASE(test_can_append_10MB) {
 static void run_test_can_append_10MB_sequential_write_sequential_read(
   size_t fallocate_size) {
     auto f = open_file("test_segment_appender_sequential.log");
-    auto appender = make_segment_appender(f, fallocate_size);
+    storage::storage_resources resources(
+      config::mock_binding<size_t>(std::move(fallocate_size)));
+    auto appender = make_segment_appender(f, resources);
 
     // write sequential. then read all
     constexpr size_t one_meg = 1024 * 1024;
@@ -203,7 +211,9 @@ SEASTAR_THREAD_TEST_CASE(
 
 static void run_test_can_append_little_data(size_t fallocate_size) {
     auto f = open_file("test_segment_appender_little.log");
-    auto appender = make_segment_appender(f, fallocate_size);
+    storage::storage_resources resources(
+      config::mock_binding<size_t>(std::move(fallocate_size)));
+    auto appender = make_segment_appender(f, resources);
     auto alignment = f.disk_write_dma_alignment();
     // at least 1 page and some 20 bytes to test boundary conditions
     const auto data = random_generators::gen_alphanum_string(alignment + 20);
@@ -242,7 +252,9 @@ SEASTAR_THREAD_TEST_CASE(test_can_append_little_data) {
 
 static void run_test_fallocate_size(size_t fallocate_size) {
     auto f = open_file("test_segment_appender.log");
-    auto appender = make_segment_appender(f, fallocate_size);
+    storage::storage_resources resources(
+      config::mock_binding<size_t>(std::move(fallocate_size)));
+    auto appender = make_segment_appender(f, resources);
 
     for (size_t i = 0; i < 10; ++i) {
         iobuf original;

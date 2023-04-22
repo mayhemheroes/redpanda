@@ -1,4 +1,4 @@
-# Copyright 2020 Redpanda Data, Inc.
+# Copyright 2022 Redpanda Data, Inc.
 #
 # Use of this software is governed by the Business Source License
 # included in the file licenses/BSL.md
@@ -9,32 +9,32 @@
 
 import random
 import time
+import signal
 import requests
 
 from rptest.services.cluster import cluster
 from ducktape.utils.util import wait_until
 from rptest.clients.kafka_cat import KafkaCat
-from ducktape.mark import ok_to_fail
+from ducktape.mark import ignore, matrix
 
+from rptest.utils.mode_checks import skip_debug_mode
 from rptest.clients.types import TopicSpec
 from rptest.clients.rpk import RpkTool
 from rptest.tests.end_to_end import EndToEndTest
 from rptest.services.admin import Admin
+from rptest.services.redpanda_installer import InstallOptions, RedpandaInstaller
 from rptest.tests.partition_movement import PartitionMovementMixin
+from rptest.util import wait_until_result
 from rptest.services.honey_badger import HoneyBadger
 from rptest.services.rpk_producer import RpkProducer
 from rptest.services.kaf_producer import KafProducer
 from rptest.services.rpk_consumer import RpkConsumer
-from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST
+from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST, PREV_VERSION_LOG_ALLOW_LIST, CloudStorageType, SISettings, get_cloud_storage_type
 
 # Errors we should tolerate when moving partitions around
 PARTITION_MOVEMENT_LOG_ERRORS = [
-    # e.g.  raft - [follower: {id: {1}, revision: {10}}] [group_id:3, {kafka/topic/2}] - recovery_stm.cc:422 - recovery append entries error: raft group does not exists on target broker
-    "raft - .*raft group does not exist on target broker",
-    # e.g.  raft - [group_id:3, {kafka/topic/2}] consensus.cc:2317 - unable to replicate updated configuration: raft::errc::replicated_entry_truncated
-    "raft - .*unable to replicate updated configuration: .*",
-    # e.g. recovery_stm.cc:432 - recovery append entries error: rpc::errc::client_request_timeout"
-    "raft - .*recovery append entries error.*client_request_timeout"
+    # e.g.  raft - [follower: {id: {1}, revision: {10}}] [group_id:3, {kafka/topic/2}] - recovery_stm.cc:422 - recovery append entries error: raft group does not exist on target broker
+    "raft - .*raft group does not exist on target broker"
 ]
 
 
@@ -61,12 +61,20 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
             **kwargs)
         self._ctx = ctx
 
-    @cluster(num_nodes=3)
-    def test_moving_not_fully_initialized_partition(self):
+    @cluster(num_nodes=3,
+             log_allow_list=PREV_VERSION_LOG_ALLOW_LIST + ["FailureInjector"])
+    @matrix(num_to_upgrade=[0, 2])
+    def test_moving_not_fully_initialized_partition(self, num_to_upgrade):
         """
         Move partition before first leader is elected
         """
-        self.start_redpanda(num_nodes=3)
+        # NOTE: num_to_upgrade=0 indicates that we're just testing HEAD without
+        # any mixed versions.
+        test_mixed_versions = num_to_upgrade > 0
+        install_opts = InstallOptions(
+            install_previous_version=test_mixed_versions,
+            num_to_upgrade=num_to_upgrade)
+        self.start_redpanda(num_nodes=3, install_opts=install_opts)
 
         hb = HoneyBadger()
         # if failure injector is not enabled simply skip this test
@@ -122,12 +130,17 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
 
         wait_until(derived_done, timeout_sec=60, backoff_sec=2)
 
-    @cluster(num_nodes=3)
-    def test_empty(self):
+    @cluster(num_nodes=3, log_allow_list=PREV_VERSION_LOG_ALLOW_LIST)
+    @matrix(num_to_upgrade=[0, 2])
+    def test_empty(self, num_to_upgrade):
         """
         Move empty partitions.
         """
-        self.start_redpanda(num_nodes=3)
+        test_mixed_versions = num_to_upgrade > 0
+        install_opts = InstallOptions(
+            install_previous_version=test_mixed_versions,
+            num_to_upgrade=num_to_upgrade)
+        self.start_redpanda(num_nodes=3, install_opts=install_opts)
 
         topics = []
         for partition_count in range(1, 5):
@@ -144,13 +157,20 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
         for _ in range(25):
             self._move_and_verify()
 
-    @cluster(num_nodes=4, log_allow_list=PARTITION_MOVEMENT_LOG_ERRORS)
-    def test_static(self):
+    @cluster(num_nodes=4,
+             log_allow_list=PARTITION_MOVEMENT_LOG_ERRORS +
+             PREV_VERSION_LOG_ALLOW_LIST)
+    @matrix(num_to_upgrade=[0, 2])
+    def test_static(self, num_to_upgrade):
         """
         Move partitions with data, but no active producers or consumers.
         """
         self.logger.info(f"Starting redpanda...")
-        self.start_redpanda(num_nodes=3)
+        test_mixed_versions = num_to_upgrade > 0
+        install_opts = InstallOptions(
+            install_previous_version=test_mixed_versions,
+            num_to_upgrade=num_to_upgrade)
+        self.start_redpanda(num_nodes=3, install_opts=install_opts)
 
         topics = []
         for partition_count in range(1, 5):
@@ -234,14 +254,22 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
 
         return throughput, records, moves
 
-    @cluster(num_nodes=5, log_allow_list=PARTITION_MOVEMENT_LOG_ERRORS)
-    def test_dynamic(self):
+    @cluster(num_nodes=5,
+             log_allow_list=PARTITION_MOVEMENT_LOG_ERRORS +
+             PREV_VERSION_LOG_ALLOW_LIST)
+    @matrix(num_to_upgrade=[0, 2])
+    def test_dynamic(self, num_to_upgrade):
         """
         Move partitions with active consumer / producer
         """
         throughput, records, moves = self._get_scale_params()
 
+        test_mixed_versions = num_to_upgrade > 0
+        install_opts = InstallOptions(
+            install_previous_version=test_mixed_versions,
+            num_to_upgrade=num_to_upgrade)
         self.start_redpanda(num_nodes=3,
+                            install_opts=install_opts,
                             extra_rp_conf={"default_topic_replications": 3})
         spec = TopicSpec(name="topic", partition_count=3, replication_factor=3)
         self.client().create_topic(spec)
@@ -256,8 +284,11 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
                             consumer_timeout_sec=45,
                             min_records=records)
 
-    @cluster(num_nodes=5, log_allow_list=PARTITION_MOVEMENT_LOG_ERRORS)
-    def test_move_consumer_offsets_intranode(self):
+    @cluster(num_nodes=5,
+             log_allow_list=PARTITION_MOVEMENT_LOG_ERRORS +
+             PREV_VERSION_LOG_ALLOW_LIST)
+    @matrix(num_to_upgrade=[0, 2])
+    def test_move_consumer_offsets_intranode(self, num_to_upgrade):
         """
         Exercise moving the consumer_offsets/0 partition between shards
         within the same nodes.  This reproduces certain bugs in the special
@@ -265,8 +296,16 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
         """
         throughput, records, moves = self._get_scale_params()
 
+        test_mixed_versions = num_to_upgrade > 0
+        install_opts = InstallOptions()
+        if test_mixed_versions:
+            # Start at a version that supports consumer groups.
+            install_opts = InstallOptions(install_previous_version=True,
+                                          num_to_upgrade=num_to_upgrade)
         self.start_redpanda(num_nodes=3,
+                            install_opts=install_opts,
                             extra_rp_conf={"default_topic_replications": 3})
+
         spec = TopicSpec(name="topic", partition_count=3, replication_factor=3)
         self.client().create_topic(spec)
         self.topic = spec.name
@@ -292,12 +331,17 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
 
     @cluster(num_nodes=5,
              log_allow_list=PARTITION_MOVEMENT_LOG_ERRORS +
-             RESTART_LOG_ALLOW_LIST)
-    def test_bootstrapping_after_move(self):
+             RESTART_LOG_ALLOW_LIST + PREV_VERSION_LOG_ALLOW_LIST)
+    @matrix(num_to_upgrade=[0, 2])
+    def test_bootstrapping_after_move(self, num_to_upgrade):
         """
         Move partitions with active consumer / producer
         """
-        self.start_redpanda(num_nodes=3)
+        test_mixed_versions = num_to_upgrade > 0
+        install_opts = InstallOptions(
+            install_previous_version=test_mixed_versions,
+            num_to_upgrade=num_to_upgrade)
+        self.start_redpanda(num_nodes=3, install_opts=install_opts)
         spec = TopicSpec(name="topic", partition_count=3, replication_factor=3)
         self.client().create_topic(spec)
         self.topic = spec.name
@@ -310,7 +354,17 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
 
         # snapshot offsets
         rpk = RpkTool(self.redpanda)
-        partitions = rpk.describe_topic(spec.name)
+
+        def has_offsets_for_all_partitions():
+            # NOTE: partitions may not be returned if their fields can't be
+            # populated, e.g. during leadership changes.
+            partitions = list(rpk.describe_topic(spec.name))
+            if len(partitions) == 3:
+                return (True, partitions)
+            return (False, None)
+
+        partitions = wait_until_result(has_offsets_for_all_partitions, 30, 2)
+
         offset_map = {}
         for p in partitions:
             offset_map[p.id] = p.high_watermark
@@ -319,21 +373,27 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
         self.redpanda.restart_nodes(self.redpanda.nodes)
 
         def offsets_are_recovered():
-
+            partitions_after = list(rpk.describe_topic(spec.name))
+            if len(partitions_after) != 3:
+                return False
             return all([
-                offset_map[p.id] == p.high_watermark
-                for p in rpk.describe_topic(spec.name)
+                offset_map[p.id] == p.high_watermark for p in partitions_after
             ])
 
         wait_until(offsets_are_recovered, 30, 2)
 
-    @cluster(num_nodes=3)
-    def test_invalid_destination(self):
+    @cluster(num_nodes=3, log_allow_list=PREV_VERSION_LOG_ALLOW_LIST)
+    @matrix(num_to_upgrade=[0, 2])
+    def test_invalid_destination(self, num_to_upgrade):
         """
         Check that requuests to move to non-existent locations are properly rejected.
         """
 
-        self.start_redpanda(num_nodes=3)
+        test_mixed_versions = num_to_upgrade > 0
+        install_opts = InstallOptions(
+            install_previous_version=test_mixed_versions,
+            num_to_upgrade=num_to_upgrade)
+        self.start_redpanda(num_nodes=3, install_opts=install_opts)
         spec = TopicSpec(name="topic", partition_count=1, replication_factor=1)
         self.client().create_topic(spec)
         topic = spec.name
@@ -409,14 +469,24 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
         r = admin.set_partition_replicas(topic, partition, assignments)
         assert r.status_code == 200
 
-    @cluster(num_nodes=5)
-    def test_overlapping_changes(self):
+    @cluster(num_nodes=5, log_allow_list=PREV_VERSION_LOG_ALLOW_LIST)
+    @matrix(num_to_upgrade=[0, 2])
+    def test_overlapping_changes(self, num_to_upgrade):
         """
         Check that while a movement is in flight, rules about
         overlapping operations are properly enforced.
         """
 
-        self.start_redpanda(num_nodes=4)
+        test_mixed_versions = num_to_upgrade > 0
+        install_opts = InstallOptions()
+        if test_mixed_versions:
+            # Start at a version that supports the RpkProducer workload.
+            # TODO: use 'install_previous_version' once it becomes the prior
+            # feature version.
+            install_opts = InstallOptions(
+                install_previous_version=test_mixed_versions)
+        self.start_redpanda(num_nodes=4, install_opts=install_opts)
+
         node_ids = {1, 2, 3, 4}
 
         # Create topic with enough data that inter-node movement
@@ -498,19 +568,23 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
         rpk.delete_topic(name)
         assert name not in rpk.list_topics()
 
-    @cluster(num_nodes=4)
-    def test_deletion_stops_move(self):
+    @cluster(num_nodes=4, log_allow_list=PREV_VERSION_LOG_ALLOW_LIST)
+    @matrix(num_to_upgrade=[0, 2])
+    def test_deletion_stops_move(self, num_to_upgrade):
         """
-        Delete topic which partitions are being moved and check status after 
-        topic is created again, old move 
+        Delete topic which partitions are being moved and check status after
+        topic is created again, old move
         opeartions should not influcence newly created topic
         """
-        self.start_redpanda(num_nodes=3)
+        test_mixed_versions = num_to_upgrade > 0
+        install_opts = InstallOptions(
+            install_previous_version=test_mixed_versions,
+            num_to_upgrade=num_to_upgrade)
+        self.start_redpanda(num_nodes=3, install_opts=install_opts)
 
         # create a single topic with replication factor of 1
         topic = 'test-topic'
-        rpk = RpkTool(self.redpanda)
-        rpk.create_topic(topic, 1, 1)
+        self.rpk_client().create_topic(topic, 1, 1)
         partition = 0
         num_records = 1000
 
@@ -541,12 +615,38 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
         # shutdown target node to make sure that move will never complete
         node = self.redpanda.get_node(replacement['node_id'])
         self.redpanda.stop_node(node)
-        admin.set_partition_replicas(topic, partition, target_assignment)
+
+        # checking that a controller has leader (just in case
+        # the stopped node happened to be previous leader)
+        alive_hosts = [
+            n.account.hostname for n in self.redpanda.nodes if n != node
+        ]
+        controller_leader = admin.await_stable_leader(
+            topic="controller",
+            partition=0,
+            namespace="redpanda",
+            hosts=alive_hosts,
+            check=lambda node_id: node_id != self.redpanda.idx(node),
+            timeout_s=30)
+        controller_leader = self.redpanda.get_node(controller_leader)
+
+        admin.set_partition_replicas(topic,
+                                     partition,
+                                     target_assignment,
+                                     node=controller_leader)
 
         # check that the status is in progress
 
         def get_status():
-            partition_info = admin.get_partitions(topic, partition)
+            try:
+                partition_info = admin.get_partitions(topic, partition)
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 404:
+                    self.logger.info(
+                        f"topic {topic}/{partition} not found, retrying")
+                    return None
+                else:
+                    raise e
             self.logger.info(
                 f"current assignments for {topic}-{partition}: {partition_info}"
             )
@@ -554,9 +654,348 @@ class PartitionMovementTest(PartitionMovementMixin, EndToEndTest):
 
         wait_until(lambda: get_status() == 'in_progress', 10, 1)
         # delete the topic
-        rpk.delete_topic(topic)
+        self.rpk_client().delete_topic(topic)
+
         # start the node back up
         self.redpanda.start_node(node)
         # create topic again
-        rpk.create_topic(topic, 1, 1)
+        self.rpk_client().create_topic(topic, 1, 1)
         wait_until(lambda: get_status() == 'done', 10, 1)
+
+    @cluster(num_nodes=5)
+    def test_down_replicate(self):
+        """
+        Test changing replication factor from 3 -> 1
+        """
+        throughput, records, _ = self._get_scale_params()
+        partition_count = 5
+        self.start_redpanda(num_nodes=3)
+        admin = Admin(self.redpanda)
+
+        spec = TopicSpec(partition_count=partition_count, replication_factor=3)
+        self.client().create_topic(spec)
+        self.topic = spec.name
+        self.start_producer(1, throughput=throughput)
+        self.start_consumer(1)
+        self.await_startup()
+
+        for partition in range(0, partition_count):
+            assignments = self._get_assignments(admin, self.topic, partition)
+            new_assignment = [assignments[0]]
+            admin.set_partition_replicas(self.topic, partition, new_assignment)
+            self._wait_post_move(self.topic, partition, new_assignment, 60)
+
+        self.run_validation(enable_idempotence=False,
+                            consumer_timeout_sec=45,
+                            min_records=records)
+
+    @cluster(num_nodes=6, log_allow_list=RESTART_LOG_ALLOW_LIST)
+    def test_availability_when_one_node_down(self):
+        """
+        Test availability during partition reconfiguration.
+
+        The test validates if a partition is available when one of its replicas
+        is down during reconfiguration.
+        """
+        throughput, records, _ = self._get_scale_params()
+        partition_count = 1
+        self.start_redpanda(num_nodes=4)
+        admin = Admin(self.redpanda)
+        spec = TopicSpec(partition_count=partition_count, replication_factor=3)
+        self.client().create_topic(spec)
+        self.topic = spec.name
+        partition_id = random.randint(0, partition_count - 1)
+
+        self.start_producer(1, throughput=throughput)
+        self.start_consumer(1)
+        self.await_startup()
+
+        assignments = self._get_assignments(admin, self.topic, partition_id)
+        self.logger.info(
+            f"current assignment for {self.topic}/{partition_id}: {assignments}"
+        )
+        current_replicas = set()
+        for a in assignments:
+            current_replicas.add(a['node_id'])
+        # replace single replica
+        brokers = admin.get_brokers()
+        to_select = [
+            b for b in brokers if b['node_id'] not in current_replicas
+        ]
+        selected = random.choice(to_select)
+        # replace one of the assignments
+        assignments[0] = {'node_id': selected['node_id'], 'core': 0}
+        self.logger.info(
+            f"new assignment for {self.topic}/{partition_id}: {assignments}")
+
+        to_stop = assignments[1]['node_id']
+        # stop one of the not replaced nodes
+        self.logger.info(f"stopping node: {to_stop}")
+        self.redpanda.stop_node(self.redpanda.get_node(to_stop))
+
+        def new_controller_available():
+            controller_id = admin.get_partition_leader(namespace="redpanda",
+                                                       topic="controller",
+                                                       partition=0)
+            self.logger.debug(
+                f"current controller: {controller_id}, stopped node: {to_stop}"
+            )
+            return controller_id != -1 and controller_id != to_stop
+
+        wait_until(new_controller_available, 30, 1)
+        # ask partition to move
+        admin.set_partition_replicas(self.topic, partition_id, assignments)
+
+        def status_done():
+            info = admin.get_partitions(self.topic, partition_id)
+            self.logger.info(
+                f"current assignments for {self.topic}/{partition_id}: {info}")
+            converged = self._equal_assignments(info["replicas"], assignments)
+            return converged and info["status"] == "done"
+
+        # wait until redpanda reports complete
+        wait_until(status_done, timeout_sec=40, backoff_sec=2)
+
+        self.run_validation(enable_idempotence=False,
+                            consumer_timeout_sec=45,
+                            min_records=records)
+
+    @cluster(num_nodes=4)
+    @matrix(enable_controller_snapshots=[False, True])
+    def test_stale_node(self, enable_controller_snapshots):
+        """
+        Test that a stale node rejoining the cluster can correctly restore info about
+        in-progress partition movements and finish them.
+        """
+
+        partition_count = 1
+        self.start_redpanda(num_nodes=4)
+
+        admin = Admin(self.redpanda)
+
+        if enable_controller_snapshots:
+            self.redpanda.set_cluster_config(
+                {"controller_snapshot_max_age_sec": 1})
+            admin.put_feature("controller_snapshots", {"state": "active"})
+
+        spec = TopicSpec(partition_count=partition_count, replication_factor=3)
+        self.client().create_topic(spec)
+        self.topic = spec.name
+        partition_id = 0
+
+        assignments = self._get_assignments(admin, self.topic, partition_id)
+        self.logger.info(
+            f"current assignment for {self.topic}/{partition_id}: {assignments}"
+        )
+        current_replicas = set()
+        for a in assignments:
+            current_replicas.add(a['node_id'])
+        # replace single replica
+        brokers = admin.get_brokers()
+        to_select = [
+            b for b in brokers if b['node_id'] not in current_replicas
+        ]
+        selected = random.choice(to_select)
+        # replace one of the assignments
+        replaced = assignments[0]['node_id']
+        assignments[0] = {'node_id': selected['node_id'], 'core': 0}
+        self.logger.info(
+            f"target assignment for {self.topic}/{partition_id}: {assignments}"
+        )
+
+        # stop the replaced node
+        self.logger.info(f"stopping node: {replaced}")
+        self.redpanda.signal_redpanda(self.redpanda.get_node(replaced),
+                                      signal=signal.SIGSTOP)
+
+        def new_controller_available():
+            controller_id = admin.get_partition_leader(namespace="redpanda",
+                                                       topic="controller",
+                                                       partition=0)
+            self.logger.debug(
+                f"current controller: {controller_id}, stopped node: {replaced}"
+            )
+            return controller_id != -1 and controller_id != replaced
+
+        wait_until(new_controller_available, 30, 1)
+
+        # ask partition to move
+        admin.set_partition_replicas(self.topic, partition_id, assignments)
+
+        def status_done():
+            info = admin.get_partitions(self.topic, partition_id)
+            self.logger.info(
+                f"current assignments for {self.topic}/{partition_id}: {info}")
+            converged = self._equal_assignments(info["replicas"], assignments)
+            return converged and info["status"] == "done"
+
+        # wait until redpanda reports complete
+        wait_until(status_done, timeout_sec=40, backoff_sec=2)
+
+        self.logger.info(
+            "first movement done, scheduling second movement back")
+
+        # bring replaced node back
+        assignments[0] = {'node_id': replaced, 'core': 0}
+        admin.set_partition_replicas(self.topic, partition_id, assignments)
+
+        time.sleep(5)
+        self.logger.info(f"unfreezing node: {replaced} again")
+        self.redpanda.signal_redpanda(self.redpanda.get_node(replaced),
+                                      signal=signal.SIGCONT)
+
+        wait_until(status_done, timeout_sec=40, backoff_sec=2)
+
+
+class SIPartitionMovementTest(PartitionMovementMixin, EndToEndTest):
+    """
+    Run partition movement tests with shadow indexing enabled
+    """
+    def __init__(self, ctx, *args, **kwargs):
+        # Force shadow indexing to be used by most reads
+        # in one test
+        si_settings = SISettings(
+            ctx,
+            cloud_storage_max_connections=5,
+            log_segment_size=10240,  # 10KiB
+            cloud_storage_enable_remote_read=True,
+            cloud_storage_enable_remote_write=True,
+        )
+        super(SIPartitionMovementTest, self).__init__(
+            ctx,
+            *args,
+            extra_rp_conf={
+                # Disable leader balancer, as this test is doing its own
+                # partition movement and the balancer would interfere
+                'enable_leader_balancer': False,
+                'delete_retention_ms': 1000,
+            },
+            si_settings=si_settings,
+            **kwargs)
+        self._ctx = ctx
+
+    def _get_scale_params(self):
+        """
+        Helper for reducing traffic generation parameters
+        when running on a slower debug build of redpanda.
+        """
+        throughput = 100 if self.debug_mode else 1000
+        records = 500 if self.debug_mode else 5000
+        moves = 5 if self.debug_mode else 25
+        partitions = 1 if self.debug_mode else 10
+        return throughput, records, moves, partitions
+
+    def _partial_upgrade(self, num_to_upgrade: int):
+        nodes = self.redpanda.nodes[0:num_to_upgrade]
+        self.logger.info(f"Upgrading nodes: {[node.name for node in nodes]}")
+
+        self.redpanda._installer.install(nodes, RedpandaInstaller.HEAD)
+        self.redpanda.rolling_restart_nodes(nodes,
+                                            start_timeout=90,
+                                            stop_timeout=90)
+
+    def _finish_upgrade(self, num_upgraded_already: int):
+        nodes = self.redpanda.nodes[num_upgraded_already:]
+        self.logger.info(f"Upgrading nodes: {[node.name for node in nodes]}")
+
+        self.redpanda._installer.install(nodes, RedpandaInstaller.HEAD)
+        self.redpanda.rolling_restart_nodes(nodes,
+                                            start_timeout=90,
+                                            stop_timeout=90)
+
+    @cluster(num_nodes=5, log_allow_list=PREV_VERSION_LOG_ALLOW_LIST)
+    @matrix(num_to_upgrade=[0, 2], cloud_storage_type=get_cloud_storage_type())
+    @skip_debug_mode  # rolling restarts require more reliable recovery that a slow debug mode cluster can provide
+    def test_shadow_indexing(self, num_to_upgrade, cloud_storage_type):
+        """
+        Test interaction between the shadow indexing and the partition movement.
+        Partition movement generate partitions with different revision-ids and the
+        archival/shadow-indexing subsystem is using revision to generate unique object
+        keys inside the remote storage.
+        """
+        throughput, records, moves, partitions = self._get_scale_params()
+
+        test_mixed_versions = num_to_upgrade > 0
+        install_opts = InstallOptions(
+            install_previous_version=test_mixed_versions)
+        self.start_redpanda(num_nodes=3, install_opts=install_opts)
+
+        spec = TopicSpec(name="topic",
+                         partition_count=partitions,
+                         replication_factor=3)
+        self.client().create_topic(spec)
+        self.topic = spec.name
+        self.start_producer(1, throughput=throughput)
+        self.start_consumer(1)
+        self.await_startup()
+
+        # We will start an upgrade halfway through the test: this ensures
+        # that a single-version cluster existed for long enough to actually
+        # upload some data to S3, before the upgrade potentially pauses
+        # PUTs, as it does in a format-changing step like a 22.2->22.3 upgrade
+        upgrade_at_step = moves // 2
+
+        for i in range(moves):
+            if i == upgrade_at_step and test_mixed_versions:
+                self._partial_upgrade(num_to_upgrade)
+
+            self._move_and_verify()
+
+        self.run_validation(enable_idempotence=False,
+                            consumer_timeout_sec=45,
+                            min_records=records)
+
+        self._finish_upgrade(num_to_upgrade)
+
+    @cluster(num_nodes=5, log_allow_list=PREV_VERSION_LOG_ALLOW_LIST)
+    # Redpandas before v23.1 did not have support for ABS.
+    @matrix(num_to_upgrade=[0, 2], cloud_storage_type=get_cloud_storage_type())
+    @skip_debug_mode  # rolling restarts require more reliable recovery that a slow debug mode cluster can provide
+    def test_cross_shard(self, num_to_upgrade, cloud_storage_type):
+        """
+        Test interaction between the shadow indexing and the partition movement.
+        Move partitions with SI enabled between shards.
+        """
+
+        throughput, records, moves, partitions = self._get_scale_params()
+
+        test_mixed_versions = num_to_upgrade > 0
+        install_opts = InstallOptions(
+            install_previous_version=test_mixed_versions)
+        self.start_redpanda(num_nodes=3, install_opts=install_opts)
+
+        spec = TopicSpec(name="topic",
+                         partition_count=partitions,
+                         replication_factor=3)
+        self.client().create_topic(spec)
+        self.topic = spec.name
+        self.start_producer(1, throughput=throughput)
+        self.start_consumer(1)
+        self.await_startup()
+
+        admin = Admin(self.redpanda)
+        topic = self.topic
+        partition = 0
+
+        # We will start an upgrade halfway through the test: this ensures
+        # that a single-version cluster existed for long enough to actually
+        # upload some data to S3, before the upgrade potentially pauses
+        # PUTs, as it does in a format-changing step like a 22.2->22.3 upgrade
+        upgrade_at_step = moves // 2
+
+        for i in range(moves):
+            if i == upgrade_at_step and test_mixed_versions:
+                self._partial_upgrade(num_to_upgrade)
+
+            assignments = self._get_assignments(admin, topic, partition)
+            for a in assignments:
+                # Bounce between core 0 and 1
+                a['core'] = (a['core'] + 1) % 2
+            admin.set_partition_replicas(topic, partition, assignments)
+            self._wait_post_move(topic, partition, assignments, 360)
+
+        self.run_validation(enable_idempotence=False,
+                            consumer_timeout_sec=45,
+                            min_records=records)
+
+        self._finish_upgrade(num_to_upgrade)

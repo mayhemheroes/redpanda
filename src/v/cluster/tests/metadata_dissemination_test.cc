@@ -33,21 +33,24 @@ wait_for_leaders_updates(int id, cluster::metadata_cache& cache) {
     std::vector<model::node_id> leaders;
     tests::cooperative_spin_wait_with_timeout(
       std::chrono::seconds(10),
-      [&cache, &leaders, id] {
+      [&cache, &leaders] {
           leaders.clear();
-          auto tp_md = cache.get_topic_metadata(model::topic_namespace(
-            model::ns("default"), model::topic("test_1")));
+          const model::topic_namespace tn(
+            model::ns("default"), model::topic("test_1"));
+          auto tp_md = cache.get_topic_metadata(tn);
+
           if (!tp_md) {
               return false;
           }
-          if (tp_md->partitions.size() != 3) {
+          if (tp_md->get_assignments().size() != 3) {
               return false;
           }
-          for (auto& p_md : tp_md->partitions) {
-              if (!p_md.leader_node) {
+          for (auto& p_md : tp_md->get_assignments()) {
+              auto leader_id = cache.get_leader_id(tn, p_md.id);
+              if (!leader_id) {
                   return false;
               }
-              leaders.push_back(*p_md.leader_node);
+              leaders.push_back(*leader_id);
           }
           return true;
       })
@@ -61,8 +64,8 @@ FIXTURE_TEST(
     model::node_id n_2(1);
     model::node_id n_3(2);
     auto cntrl_0 = create_node_application(n_1);
-    auto cntrl_1 = create_node_application(n_2);
-    auto cntrl_2 = create_node_application(n_3);
+    create_node_application(n_2);
+    create_node_application(n_3);
 
     auto& cache_0 = get_local_cache(n_1);
     auto& cache_1 = get_local_cache(n_2);
@@ -71,15 +74,14 @@ FIXTURE_TEST(
     tests::cooperative_spin_wait_with_timeout(
       std::chrono::seconds(10),
       [&cache_1, &cache_2] {
-          return cache_1.all_brokers().size() == 3
-                 && cache_2.all_brokers().size() == 3;
+          return cache_1.node_count() == 3 && cache_2.node_count() == 3;
       })
       .get0();
 
     // Make sure we have 3 working nodes
-    BOOST_REQUIRE_EQUAL(cache_0.all_brokers().size(), 3);
-    BOOST_REQUIRE_EQUAL(cache_1.all_brokers().size(), 3);
-    BOOST_REQUIRE_EQUAL(cache_2.all_brokers().size(), 3);
+    BOOST_REQUIRE_EQUAL(cache_0.node_count(), 3);
+    BOOST_REQUIRE_EQUAL(cache_1.node_count(), 3);
+    BOOST_REQUIRE_EQUAL(cache_2.node_count(), 3);
 
     // Create topic with replication factor 1
     std::vector<cluster::topic_configuration> topics;
@@ -103,18 +105,18 @@ FIXTURE_TEST(test_metadata_dissemination_joining_node, cluster_test_fixture) {
     model::node_id n_1(0);
     model::node_id n_2(1);
     auto cntrl_0 = create_node_application(n_1);
-    auto cntrl_1 = create_node_application(n_2);
+    create_node_application(n_2);
 
     auto& cache_0 = get_local_cache(n_1);
     auto& cache_1 = get_local_cache(n_2);
 
     tests::cooperative_spin_wait_with_timeout(
       std::chrono::seconds(10),
-      [&cache_1] { return cache_1.all_brokers().size() == 2; })
+      [&cache_1] { return cache_1.node_count() == 2; })
       .get0();
     // Make sure we have 2 working nodes
-    BOOST_REQUIRE_EQUAL(cache_0.all_brokers().size(), 2);
-    BOOST_REQUIRE_EQUAL(cache_1.all_brokers().size(), 2);
+    BOOST_REQUIRE_EQUAL(cache_0.node_count(), 2);
+    BOOST_REQUIRE_EQUAL(cache_1.node_count(), 2);
 
     // Create topic with replication factor 1
     std::vector<cluster::topic_configuration> topics;
@@ -127,14 +129,13 @@ FIXTURE_TEST(test_metadata_dissemination_joining_node, cluster_test_fixture) {
       .get0();
 
     // Add new now to the cluster
-    auto cntrl_2 = create_node_application(model::node_id{2});
+    create_node_application(model::node_id{2});
     auto& cache_2 = get_local_cache(model::node_id{2});
     // Wait for node to join the cluster
     tests::cooperative_spin_wait_with_timeout(
       std::chrono::seconds(10),
       [&cache_1, &cache_2] {
-          return cache_1.all_brokers().size() == 3
-                 && cache_2.all_brokers().size() == 3;
+          return cache_1.node_count() == 3 && cache_2.node_count() == 3;
       })
       .get0();
 

@@ -12,16 +12,17 @@
 #pragma once
 
 #include "seastarx.h"
+#include "ssx/semaphore.h"
 #include "utils/gate_guard.h"
 #include "vassert.h"
 
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/iostream.hh>
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
 
@@ -35,7 +36,7 @@ template<class Ch>
 class input_stream_fanout final {
     struct data_item {
         ss::temporary_buffer<Ch> buf;
-        ss::semaphore_units<> units;
+        ssx::semaphore_units units;
         unsigned mask;
     };
     using ring_buffer = ss::circular_buffer<data_item>;
@@ -58,7 +59,7 @@ public:
       , _bitmask(0)
       , _max_size(max_size ? *max_size / read_ahead : 0)
       , _in(std::move(i))
-      , _sem(read_ahead) {
+      , _sem(read_ahead, "stream-fanout") {
         vassert(
           num_clients <= 10 && num_clients >= 2,
           "input_stream_fanout can have up to 10 clients, {} were given",
@@ -79,6 +80,7 @@ public:
     ss::future<> stop() {
         _pcond.broadcast();
         co_await _gate.close();
+        co_await _in.close();
     }
 
     /// Detach client with 'index' from the fanout
@@ -92,10 +94,25 @@ public:
             // This is the last client, call stop
             co_await stop();
         }
+
         // update all in-flight buffers
-        for (auto& it : _buffer) {
-            it.mask |= m;
+        auto all_bits = (1U << _num_clients) - 1;
+        auto cleanup_mark = _buffer.begin();
+        for (auto it = _buffer.begin(); it != _buffer.end(); ++it) {
+            it->mask |= m;
+            if (unlikely(it->mask == all_bits)) {
+                vassert(
+                  it == cleanup_mark,
+                  "there are non contiguous buffers eligible for cleanup: {}",
+                  std::distance(cleanup_mark, it));
+                cleanup_mark++;
+            }
         }
+
+        // Erase all elements from the buffer which have all bits set before we
+        // start scanning it. This will usually happen if some clients have read
+        // the buffers and others exited early, resulting in a mask of all_bits.
+        _buffer.erase(_buffer.begin(), cleanup_mark);
     }
 
     /// Get next buffer from original input stream
@@ -106,6 +123,9 @@ public:
         gate_guard g(_gate);
         while (!_gate.is_closed()) {
             auto gen = _cnt;
+            if (_producer_error) {
+                std::rethrow_exception(_producer_error);
+            }
             if (auto ob = maybe_get(index); ob.has_value()) {
                 co_return std::move(ob.value());
             }
@@ -114,7 +134,8 @@ public:
             // - There is not data in the buffer because consumers are faster
             // then the producer.
             try {
-                co_await _pcond.wait([this, gen] { return _cnt != gen; });
+                co_await _pcond.wait(
+                  [this, gen] { return _cnt != gen || _producer_error; });
             } catch (const ss::broken_condition_variable&) {
             }
         }
@@ -133,6 +154,7 @@ private:
           _num_clients);
         unsigned mask = 1U << index;
         std::optional<ss::temporary_buffer<Ch>> buf = std::nullopt;
+
         auto next = _buffer.end();
         for (auto it = _buffer.begin(); it != _buffer.end(); it++) {
             if ((it->mask & mask) == 0) {
@@ -141,8 +163,9 @@ private:
                 break;
             }
         }
+
+        auto all_bits = (1U << _num_clients) - 1;
         if (next != _buffer.end()) {
-            auto all_bits = (1U << _num_clients) - 1;
             if (next->mask == all_bits) {
                 // The item is consumed by all clients
                 buf = std::move(next->buf);
@@ -161,20 +184,25 @@ private:
     /// the resulting buffers to clients
     ss::future<> produce() {
         gate_guard g(_gate);
-        while (!_in.eof() && !_gate.is_closed()) {
-            auto units = co_await ss::get_units(_sem, 1);
-            ss::temporary_buffer<Ch> buf;
-            if (_max_size == 0) {
-                buf = co_await _in.read();
-            } else {
-                buf = co_await _in.read_up_to(_max_size);
+        try {
+            while (!_in.eof() && !_gate.is_closed()) {
+                auto units = co_await ss::get_units(_sem, 1);
+                ss::temporary_buffer<Ch> buf;
+                if (_max_size == 0) {
+                    buf = co_await _in.read();
+                } else {
+                    buf = co_await _in.read_up_to(_max_size);
+                }
+                ++_cnt;
+                _buffer.push_back(data_item{
+                  .buf = std::move(buf),
+                  .units = std::move(units),
+                  .mask = _bitmask});
+                _pcond.broadcast();
             }
-            ++_cnt;
-            _buffer.push_back(data_item{
-              .buf = std::move(buf),
-              .units = std::move(units),
-              .mask = _bitmask});
-            _pcond.broadcast();
+        } catch (...) {
+            _producer_error = std::current_exception();
+            _pcond.broken();
         }
     }
 
@@ -182,11 +210,12 @@ private:
     unsigned _bitmask;
     const size_t _max_size;
     ss::input_stream<Ch> _in;
-    ss::semaphore _sem;
+    ssx::semaphore _sem;
     ss::condition_variable _pcond;
     ring_buffer _buffer;
     ss::gate _gate;
     uint64_t _cnt{0};
+    std::exception_ptr _producer_error{nullptr};
 };
 
 template<class Ch>

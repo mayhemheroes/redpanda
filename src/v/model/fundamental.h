@@ -11,9 +11,12 @@
 
 #pragma once
 
+#include "bytes/iobuf.h"
 #include "seastarx.h"
+#include "serde/serde.h"
 #include "ssx/sformat.h"
 #include "utils/named_type.h"
+#include "utils/uuid.h"
 #include "vassert.h"
 
 #include <seastar/core/sstring.hh>
@@ -27,7 +30,29 @@
 #include <string_view>
 #include <type_traits>
 
+namespace kafka {
+
+using offset = named_type<int64_t, struct kafka_offset_type>;
+
+inline offset next_offset(offset p) {
+    if (p < offset{0}) {
+        return offset{0};
+    }
+    return p + offset{1};
+}
+
+} // namespace kafka
+
+namespace cloud_storage_clients {
+
+using bucket_name = named_type<ss::sstring, struct s3_bucket_name>;
+
+} // namespace cloud_storage_clients
+
 namespace model {
+
+using node_uuid = named_type<uuid_t, struct node_uuid_type>;
+using cluster_uuid = named_type<uuid_t, struct cluster_uuid_type>;
 
 // Named after Kafka cleanup.policy topic property
 enum class cleanup_policy_bitflags : uint8_t {
@@ -89,6 +114,17 @@ public:
     topic(model::topic_view view) // NOLINT - see topic_view_tests.cc
       : named_type<ss::sstring, struct model_topic_type>(ss::sstring(view())) {}
 
+    friend void
+    read_nested(iobuf_parser& in, topic& t, size_t const bytes_left_limit) {
+        using serde::read_nested;
+        return read_nested(in, t._value, bytes_left_limit);
+    }
+
+    friend void write(iobuf& out, topic t) {
+        using serde::write;
+        return write(out, std::move(t._value));
+    }
+
     operator topic_view() { return topic_view(_value); }
 
     operator topic_view() const { return topic_view(_value); }
@@ -98,6 +134,75 @@ public:
 using ns = named_type<ss::sstring, struct model_ns_type>;
 
 using offset = named_type<int64_t, struct model_offset_type>;
+
+/// Delta between redpanda and kafka offsets. It supposed to be used
+/// by offset translation facilities.
+using offset_delta = named_type<int64_t, struct model_offset_delta_type>;
+
+/// \brief conversion from kafka offset to redpanda offset
+inline constexpr model::offset
+operator+(kafka::offset o, model::offset_delta d) {
+    return model::offset{o() + d()};
+}
+
+/// \brief conversion from redpanda offset to kafka offset
+inline constexpr kafka::offset
+operator-(model::offset o, model::offset_delta d) {
+    return kafka::offset{o() - d()};
+}
+
+/// \brief get offset delta from pair of offsets
+inline constexpr model::offset_delta
+operator-(model::offset r, kafka::offset k) {
+    return model::offset_delta{r() - k()};
+}
+
+/// \brief cast to model::offset
+///
+/// The purpose of this function is to mark every place where we converting
+/// from offset-delta to model::offset. This is done in places where the delta
+/// is represetnted as an instance of the model::offset. Once we convert every
+/// delta offset to model::delta_offset we will be able to depricate and remove
+/// this function.
+inline constexpr model::offset offset_cast(model::offset_delta d) {
+    return model::offset{d()};
+}
+
+/// \brief cast to kafka::offset
+///
+/// This function is used when we have a field which is incorrectly represented
+/// as model::offset instead of kafka::offset and we need to convert it to
+/// proper type.
+inline constexpr kafka::offset offset_cast(model::offset r) {
+    return kafka::offset{r()};
+}
+
+/// \brief cast to model::offset_delta
+///
+/// This function is used when we have a field which is incorrectly represented
+/// as model::offset instead of model::offset_delta and we need to convert it to
+/// proper type.
+inline constexpr model::offset_delta offset_delta_cast(model::offset r) {
+    return model::offset_delta{r()};
+}
+
+inline constexpr model::offset next_offset(model::offset o) {
+    if (o < model::offset{0}) {
+        return model::offset{0};
+    }
+    return o + model::offset{1};
+}
+
+inline constexpr model::offset prev_offset(model::offset o) {
+    if (o <= model::offset{0}) {
+        return model::offset{};
+    }
+    return o - model::offset{1};
+}
+
+// An invalid offset indicating that actual LSO is not yet ready to be returned.
+// Follows the policy that LSO is the next offset of the decided offset.
+static constexpr model::offset invalid_lso{next_offset(model::offset::min())};
 
 struct topic_partition_view {
     topic_partition_view(model::topic_view tp, model::partition_id p)
@@ -146,13 +251,25 @@ struct topic_partition {
 
     friend std::ostream& operator<<(std::ostream&, const topic_partition&);
 
+    friend void read_nested(
+      iobuf_parser& in, topic_partition& tp, size_t const bytes_left_limit) {
+        using serde::read_nested;
+
+        read_nested(in, tp.topic, bytes_left_limit);
+        read_nested(in, tp.partition, bytes_left_limit);
+    }
+
+    friend void write(iobuf& out, topic_partition tp) {
+        using serde::write;
+
+        write(out, std::move(tp.topic));
+        write(out, tp.partition);
+    }
     template<typename H>
     friend H AbslHashValue(H h, const topic_partition& tp) {
         return H::combine(std::move(h), tp.topic, tp.partition);
     }
 };
-
-std::ostream& operator<<(std::ostream&, const topic_partition&);
 
 struct ntp {
     ntp() = default;
@@ -176,6 +293,21 @@ struct ntp {
 
     bool operator<(const ntp& other) const {
         return ns < other.ns || (ns == other.ns && tp < other.tp);
+    }
+
+    friend void
+    read_nested(iobuf_parser& in, ntp& ntp, size_t const bytes_left_limit) {
+        using serde::read_nested;
+
+        read_nested(in, ntp.ns, bytes_left_limit);
+        read_nested(in, ntp.tp, bytes_left_limit);
+    }
+
+    friend void write(iobuf& out, ntp ntp) {
+        using serde::write;
+
+        write(out, std::move(ntp.ns));
+        write(out, std::move(ntp.tp));
     }
 
     ss::sstring path() const;
@@ -217,7 +349,7 @@ enum class shadow_indexing_mode : uint8_t {
     drop_archival = 0xfe,
     // Remove fetch flag (used for incremental updates)
     drop_fetch = 0xfd,
-    // Remove both fetch and archival falgs
+    // Remove both fetch and archival flags
     drop_full = 0xfc,
 };
 
@@ -284,6 +416,21 @@ static_assert(
 std::ostream& operator<<(std::ostream&, const shadow_indexing_mode&);
 
 } // namespace model
+
+namespace kafka {
+
+/// \brief cast to model::offset
+///
+/// The purpose of this function is to mark every place where we converting
+/// from kafka offset to model::offset. This is done in places where the kafka
+/// offset is represetnted as an instance of the model::offset. Once we convert
+/// every such field to kafka::delta_offset we will be able to depricate and
+/// remove this function.
+inline constexpr model::offset offset_cast(kafka::offset k) {
+    return model::offset{k()};
+}
+
+} // namespace kafka
 
 namespace std {
 template<>

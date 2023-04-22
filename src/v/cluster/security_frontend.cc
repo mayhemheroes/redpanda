@@ -13,8 +13,10 @@
 
 #include "cluster/cluster_utils.h"
 #include "cluster/commands.h"
+#include "cluster/controller_service.h"
 #include "cluster/controller_stm.h"
 #include "cluster/errc.h"
+#include "cluster/fwd.h"
 #include "cluster/logger.h"
 #include "cluster/partition_leaders_table.h"
 #include "cluster/types.h"
@@ -28,6 +30,7 @@
 #include "rpc/errc.h"
 #include "rpc/types.h"
 #include "security/authorizer.h"
+#include "security/scram_algorithm.h"
 
 #include <seastar/core/coroutine.hh>
 
@@ -75,12 +78,14 @@ security_frontend::security_frontend(
   ss::sharded<controller_stm>& s,
   ss::sharded<rpc::connection_cache>& connections,
   ss::sharded<partition_leaders_table>& leaders,
+  ss::sharded<features::feature_table>& features,
   ss::sharded<ss::abort_source>& as,
   ss::sharded<security::authorizer>& authorizer)
   : _self(self)
   , _stm(s)
   , _connections(connections)
   , _leaders(leaders)
+  , _features(features)
   , _as(as)
   , _authorizer(authorizer) {}
 
@@ -89,13 +94,13 @@ ss::future<std::error_code> security_frontend::create_user(
   security::scram_credential credential,
   model::timeout_clock::time_point tout) {
     create_user_cmd cmd(std::move(username), std::move(credential));
-    return replicate_and_wait(_stm, _as, std::move(cmd), tout);
+    return replicate_and_wait(_stm, _features, _as, std::move(cmd), tout);
 }
 
 ss::future<std::error_code> security_frontend::delete_user(
   security::credential_user username, model::timeout_clock::time_point tout) {
     delete_user_cmd cmd(std::move(username), 0 /* unused */);
-    return replicate_and_wait(_stm, _as, std::move(cmd), tout);
+    return replicate_and_wait(_stm, _features, _as, std::move(cmd), tout);
 }
 
 ss::future<std::error_code> security_frontend::update_user(
@@ -103,7 +108,7 @@ ss::future<std::error_code> security_frontend::update_user(
   security::scram_credential credential,
   model::timeout_clock::time_point tout) {
     update_user_cmd cmd(std::move(username), std::move(credential));
-    return replicate_and_wait(_stm, _as, std::move(cmd), tout);
+    return replicate_and_wait(_stm, _features, _as, std::move(cmd), tout);
 }
 
 ss::future<std::vector<errc>> security_frontend::create_acls(
@@ -169,7 +174,11 @@ ss::future<std::vector<errc>> security_frontend::do_create_acls(
     errc err;
     try {
         auto ec = co_await replicate_and_wait(
-          _stm, _as, std::move(cmd), model::timeout_clock::now() + timeout);
+          _stm,
+          _features,
+          _as,
+          std::move(cmd),
+          model::timeout_clock::now() + timeout);
         err = map_errc(ec);
     } catch (const std::exception& e) {
         vlog(clusterlog.warn, "Unable to create ACLs: {}", e);
@@ -207,7 +216,11 @@ ss::future<std::vector<delete_acls_result>> security_frontend::do_delete_acls(
     errc err;
     try {
         auto ec = co_await replicate_and_wait(
-          _stm, _as, std::move(cmd), model::timeout_clock::now() + timeout);
+          _stm,
+          _features,
+          _as,
+          std::move(cmd),
+          model::timeout_clock::now() + timeout);
         err = map_errc(ec);
     } catch (const std::exception& e) {
         vlog(clusterlog.warn, "Unable to delete ACLs: {}", e);
@@ -294,6 +307,36 @@ security_frontend::dispatch_delete_acls_to_leader(
           }
           return std::move(r.value().results);
       });
+}
+
+static const ss::sstring bootstrap_user_env_key{"RP_BOOTSTRAP_USER"};
+
+/*static*/ std::optional<user_and_credential>
+security_frontend::get_bootstrap_user_creds_from_env() {
+    auto creds_str_ptr = std::getenv(bootstrap_user_env_key.c_str());
+    if (creds_str_ptr == nullptr) {
+        // Environment variable is not set
+        return {};
+    }
+
+    ss::sstring creds_str = creds_str_ptr;
+    auto colon = creds_str.find(":");
+    if (colon == ss::sstring::npos || colon == creds_str.size() - 1) {
+        // Malformed value.  Do not log the value, it may be malformed
+        // but it is still a secret.
+        vlog(
+          clusterlog.warn,
+          "Invalid value of {} (expected \"username:password\")",
+          bootstrap_user_env_key);
+        return {};
+    }
+
+    auto username = security::credential_user{creds_str.substr(0, colon)};
+    auto password = creds_str.substr(colon + 1);
+    auto credentials = security::scram_sha256::make_credentials(
+      password, security::scram_sha256::min_iterations);
+    return std::optional<user_and_credential>(
+      std::in_place, std::move(username), std::move(credentials));
 }
 
 } // namespace cluster

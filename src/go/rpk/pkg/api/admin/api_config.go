@@ -10,6 +10,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -23,9 +24,14 @@ type Config map[string]interface{}
 
 // Config returns a single admin endpoint's configuration. This errors if
 // multiple URLs are configured.
-func (a *AdminAPI) Config() (Config, error) {
+//
+// If includeDefaults is true, all properties are returned, including those
+// that are simply reporting their defaults.  Otherwise, only properties with
+// non-default values are included (i.e. those which have been set at some
+// point).
+func (a *AdminAPI) Config(ctx context.Context, includeDefaults bool) (Config, error) {
 	var rawResp []byte
-	err := a.sendAny(http.MethodGet, "/v1/config", nil, &rawResp)
+	err := a.sendAny(ctx, http.MethodGet, fmt.Sprintf("/v1/cluster_config?include_defaults=%t", includeDefaults), nil, &rawResp)
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +48,7 @@ func (a *AdminAPI) Config() (Config, error) {
 //
 // Expiry configures how long the log level override will persist. If zero,
 // Redpanda will persist the override until it shuts down.
-func (a *AdminAPI) SetLogLevel(name, level string, expirySeconds int) error {
+func (a *AdminAPI) SetLogLevel(ctx context.Context, name, level string, expirySeconds int) error {
 	if expirySeconds < 0 {
 		return fmt.Errorf("invalid negative expiry of %ds", expirySeconds)
 	}
@@ -57,7 +63,7 @@ func (a *AdminAPI) SetLogLevel(name, level string, expirySeconds int) error {
 	}
 
 	path := fmt.Sprintf("/v1/config/log_level/%s?level=%s&expires=%d", url.PathEscape(name), level, expirySeconds)
-	return a.sendOne(http.MethodPut, path, nil, nil, false)
+	return a.sendOne(ctx, http.MethodPut, path, nil, nil, false)
 }
 
 type ConfigPropertyItems struct {
@@ -69,6 +75,7 @@ type ConfigPropertyMetadata struct {
 	Description  string              `json:"description"`           // One liner human readable string
 	Nullable     bool                `json:"nullable"`              // If true, may be null
 	NeedsRestart bool                `json:"needs_restart"`         // If true, won't take effect until restart
+	IsSecret     bool                `json:"is_secret"`             // If true, the field should be redacted.
 	Visibility   string              `json:"visibility"`            // One of 'user', 'deprecated', 'tunable'
 	Units        string              `json:"units,omitempty"`       // A unit like 'ms', or empty.
 	Example      string              `json:"example,omitempty"`     // A non-default value for use in docs or tests
@@ -82,9 +89,9 @@ type ConfigSchemaResponse struct {
 	Properties ConfigSchema `json:"properties"`
 }
 
-func (a *AdminAPI) ClusterConfigSchema() (ConfigSchema, error) {
+func (a *AdminAPI) ClusterConfigSchema(ctx context.Context) (ConfigSchema, error) {
 	var response ConfigSchemaResponse
-	err := a.sendAny(http.MethodGet, "/v1/cluster_config/schema", nil, &response)
+	err := a.sendAny(ctx, http.MethodGet, "/v1/cluster_config/schema", nil, &response)
 	if err != nil {
 		return nil, err
 	}
@@ -97,16 +104,15 @@ type ClusterConfigWriteResult struct {
 }
 
 func (a *AdminAPI) PatchClusterConfig(
-	upsert map[string]interface{}, remove []string,
+	ctx context.Context, upsert map[string]interface{}, remove []string,
 ) (ClusterConfigWriteResult, error) {
-
 	body := map[string]interface{}{
 		"upsert": upsert,
 		"remove": remove,
 	}
 
 	var result ClusterConfigWriteResult
-	err := a.sendAny(http.MethodPut, "/v1/cluster_config", body, &result)
+	err := a.sendToLeader(ctx, http.MethodPut, "/v1/cluster_config", body, &result)
 	if err != nil {
 		return result, err
 	}
@@ -115,7 +121,7 @@ func (a *AdminAPI) PatchClusterConfig(
 }
 
 type ConfigStatus struct {
-	NodeId        int64    `json:"node_id"`
+	NodeID        int64    `json:"node_id"`
 	Restart       bool     `json:"restart"`
 	ConfigVersion int64    `json:"config_version"`
 	Invalid       []string `json:"invalid"`
@@ -124,9 +130,15 @@ type ConfigStatus struct {
 
 type ConfigStatusResponse []ConfigStatus
 
-func (a *AdminAPI) ClusterConfigStatus() (ConfigStatusResponse, error) {
+func (a *AdminAPI) ClusterConfigStatus(ctx context.Context, sendToLeader bool) (ConfigStatusResponse, error) {
 	var result ConfigStatusResponse
-	err := a.sendAny(http.MethodGet, "/v1/cluster_config/status", nil, &result)
+	var err error
+	path := "/v1/cluster_config/status"
+	if sendToLeader {
+		err = a.sendToLeader(ctx, http.MethodGet, path, nil, &result)
+	} else {
+		err = a.sendAny(ctx, http.MethodGet, path, nil, &result)
+	}
 	if err != nil {
 		return nil, err
 	}

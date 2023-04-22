@@ -20,10 +20,15 @@
 
 namespace cloud_storage {
 
+class materialized_segments;
+
 /// Cloud storage endpoint level probe
 class remote_probe {
 public:
-    explicit remote_probe(remote_metrics_disabled disabled);
+    explicit remote_probe(
+      remote_metrics_disabled disabled,
+      remote_metrics_disabled public_disabled,
+      materialized_segments&);
 
     /// Register topic manifest upload
     void topic_manifest_upload() { _cnt_topic_manifest_uploads++; }
@@ -55,6 +60,22 @@ public:
     /// Get manifest download
     uint64_t get_partition_manifest_downloads() const {
         return _cnt_partition_manifest_downloads;
+    }
+
+    /// Register manifest (re)upload
+    void txrange_manifest_upload() { _cnt_tx_manifest_uploads++; }
+
+    /// Get manifest (re)upload
+    uint64_t get_txrange_manifest_uploads() const {
+        return _cnt_tx_manifest_uploads;
+    }
+
+    /// Register manifest download
+    void txrange_manifest_download() { _cnt_tx_manifest_downloads++; }
+
+    /// Get manifest download
+    uint64_t get_txrange_manifest_downloads() const {
+        return _cnt_tx_manifest_downloads;
     }
 
     /// Register backof invocation during manifest upload
@@ -131,6 +152,26 @@ public:
 
     void register_download_size(size_t n) { _cnt_bytes_received += n; }
 
+    uint64_t get_failed_index_uploads() const {
+        return _cnt_failed_index_uploads;
+    }
+
+    uint64_t get_failed_index_downloads() const {
+        return _cnt_failed_index_downloads;
+    }
+
+    uint64_t get_index_uploads() const { return _cnt_index_uploads; }
+
+    uint64_t get_index_downloads() const { return _cnt_index_downloads; }
+
+    void failed_index_upload() { ++_cnt_failed_index_uploads; }
+
+    void failed_index_download() { ++_cnt_failed_index_downloads; }
+
+    void index_upload() { ++_cnt_index_uploads; }
+
+    void index_download() { ++_cnt_index_downloads; }
+
 private:
     /// Number of topic manifest uploads
     uint64_t _cnt_topic_manifest_uploads{0};
@@ -164,8 +205,21 @@ private:
     uint64_t _cnt_bytes_sent{0};
     /// Number of bytes being successfully received from S3
     uint64_t _cnt_bytes_received{0};
+    /// Number of tx-range manifest uploads
+    uint64_t _cnt_tx_manifest_uploads{0};
+    /// Number of tx-range manifest downloads
+    uint64_t _cnt_tx_manifest_downloads{0};
+    /// Number of index uploads
+    uint64_t _cnt_index_uploads{0};
+    /// Number of index downloads
+    uint64_t _cnt_index_downloads{0};
+    /// Number of failed index uploads
+    uint64_t _cnt_failed_index_uploads{0};
+    /// Number of failed index downloads
+    uint64_t _cnt_failed_index_downloads{0};
 
     ss::metrics::metric_groups _metrics;
+    ss::metrics::metric_groups _public_metrics;
 };
 
 } // namespace cloud_storage

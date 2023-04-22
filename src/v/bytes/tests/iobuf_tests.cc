@@ -13,6 +13,8 @@
 #include "bytes/iobuf_istreambuf.h"
 #include "bytes/iobuf_ostreambuf.h"
 #include "bytes/iobuf_parser.h"
+#include "bytes/iostream.h"
+#include "bytes/scattered_message.h"
 #include "bytes/tests/utils.h"
 #include "bytes/utils.h"
 
@@ -23,6 +25,20 @@
 #include <boost/test/tools/old/interface.hpp>
 #include <boost/test/unit_test.hpp>
 #include <fmt/format.h>
+
+SEASTAR_THREAD_TEST_CASE(test_copy_equal) {
+    iobuf buf;
+    buf.reserve_memory(10000000);
+
+    {
+        iobuf tmp;
+        tmp.append("abcd", 4);
+        buf.append_fragments(std::move(tmp));
+    }
+
+    auto copy = buf.copy();
+    BOOST_CHECK_EQUAL(buf, copy);
+}
 
 SEASTAR_THREAD_TEST_CASE(test_appended_data_is_retained) {
     iobuf buf;

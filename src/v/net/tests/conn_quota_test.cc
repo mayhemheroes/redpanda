@@ -10,6 +10,8 @@
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/later.hh>
 
+#include <boost/range/irange.hpp>
+
 static ss::logger logger("test");
 
 using namespace net;
@@ -93,24 +95,25 @@ struct conn_quota_fixture {
         scq
           .invoke_on(
             shard,
-            [shard, this, take_units, addr](conn_quota& cq) -> ss::future<> {
-                for (unsigned int j = 0; j < take_units; ++j) {
-                    auto u = co_await cq.get(addr);
-                    BOOST_TEST_REQUIRE(u.live());
-                    shard_units[shard].push_back(std::move(u));
-                }
+            [shard, this, take_units, addr](conn_quota& cq) {
+                auto range = boost::irange(0u, take_units);
+                return ss::do_for_each(range, [this, shard, addr, &cq](auto) {
+                    return cq.get(addr).then([this, shard](auto u) {
+                        BOOST_TEST_REQUIRE(u.live());
+                        shard_units[shard].push_back(std::move(u));
+                    });
+                });
             })
           .get();
     }
 
-    void drop_on_shard(
-      ss::shard_id shard, ss::net::inet_address addr, uint32_t take_units) {
+    void drop_on_shard(ss::shard_id shard, uint32_t take_units) {
         assert(shard_units[shard].size() >= take_units);
 
         scq
           .invoke_on(
             shard,
-            [shard, this, take_units, addr](conn_quota& cq) {
+            [shard, this, take_units](conn_quota& cq) {
                 for (size_t i = 0; i < take_units; ++i) {
                     shard_units[shard].pop_back();
                 }
@@ -214,12 +217,14 @@ void conn_quota_fixture::test_borrows(
         scq
           .invoke_on(
             i,
-            [i, take_each, this](conn_quota& cq) -> ss::future<> {
-                for (unsigned int j = 0; j < take_each; ++j) {
-                    auto u = co_await cq.get(addr1);
-                    BOOST_TEST_REQUIRE(u.live());
-                    shard_units[i].push_back(std::move(u));
-                }
+            [i, take_each, this](conn_quota& cq) {
+                auto range = boost::irange(0u, take_each);
+                return ss::do_for_each(range, [this, i, &cq](auto) {
+                    return cq.get(addr1).then([this, i](auto u) {
+                        BOOST_TEST_REQUIRE(u.live());
+                        shard_units[i].push_back(std::move(u));
+                    });
+                });
             })
           .get();
     }
@@ -240,10 +245,11 @@ void conn_quota_fixture::test_borrows(
     scq
       .invoke_on(
         2,
-        [this, i = 2](conn_quota& cq) -> ss::future<> {
-            auto u = co_await cq.get(addr1);
-            BOOST_TEST_REQUIRE(u.live());
-            shard_units[i].push_back(std::move(u));
+        [this, i = 2](conn_quota& cq) {
+            return cq.get(addr1).then([this, i](auto u) {
+                BOOST_TEST_REQUIRE(u.live());
+                shard_units[i].push_back(std::move(u));
+            });
         })
       .get();
 
@@ -254,7 +260,7 @@ void conn_quota_fixture::test_borrows(
     // Now that all units are released, we should find that reclaim
     // flag is switched off everywhere.
     vlog(logger.debug, "Checking reclaim status");
-    ss::thread::yield(); // give the backgrounded part of reclaim_to a chance
+    tests::flush_tasks(); // Let background reclaim advancer
     cooperative_spin_wait_with_timeout(5s, [core_count, this]() {
         bool any_in_reclaim = false;
 
@@ -304,11 +310,13 @@ FIXTURE_TEST(test_change_limits, conn_quota_fixture) {
           .invoke_on(
             i,
             [i, this](conn_quota& cq) -> ss::future<> {
-                for (unsigned int j = 0; j < 3; ++j) {
-                    auto u = co_await cq.get(addr1);
-                    BOOST_TEST_REQUIRE(u.live());
-                    shard_units[i].push_back(std::move(u));
-                }
+                auto range = boost::irange(0, 3);
+                return ss::do_for_each(range, [this, i, &cq](auto) {
+                    return cq.get(addr1).then([this, i](auto u) {
+                        BOOST_TEST_REQUIRE(u.live());
+                        shard_units[i].push_back(std::move(u));
+                    });
+                });
             })
           .get();
     }
@@ -367,9 +375,7 @@ FIXTURE_TEST(test_decrease_limit, conn_quota_fixture) {
     drop_shard_units();
 
     // Drain futures for background cross-core releases
-    for (uint32_t i = 0; i < initial_limit; ++i) {
-        ss::thread::yield();
-    }
+    tests::flush_tasks();
 
     vlog(logger.debug, "Taking 1st unit");
     auto u = take_units(addr1, 1);
@@ -574,7 +580,7 @@ FIXTURE_TEST(test_overlaps, conn_quota_fixture) {
     // First take all the tokens on shard 1 and drop them
     // again, this puts all the borrowed tokens here
     take_on_shard(1, addr1, 10);
-    drop_on_shard(1, addr1, 10);
+    drop_on_shard(1, 10);
 
     // Now take tokens from each shard
     for (int i = 0; i < 5; ++i) {

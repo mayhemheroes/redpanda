@@ -15,9 +15,10 @@
 #include "pandaproxy/schema_registry/configuration.h"
 #include "pandaproxy/schema_registry/seq_writer.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
-#include "pandaproxy/schema_registry/util.h"
 #include "pandaproxy/server.h"
+#include "pandaproxy/util.h"
 #include "seastarx.h"
+#include "utils/request_auth.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
@@ -26,9 +27,13 @@
 
 #include <vector>
 
+namespace cluster {
+class controller;
+}
+
 namespace pandaproxy::schema_registry {
 
-class service {
+class service : public ss::peering_sharded_service<service> {
 public:
     service(
       const YAML::Node& config,
@@ -36,7 +41,8 @@ public:
       size_t max_memory,
       ss::sharded<kafka::client::client>& client,
       sharded_store& store,
-      ss::sharded<seq_writer>& sequencer);
+      ss::sharded<seq_writer>& sequencer,
+      std::unique_ptr<cluster::controller>&);
 
     ss::future<> start();
     ss::future<> stop();
@@ -46,21 +52,30 @@ public:
     ss::sharded<kafka::client::client>& client() { return _client; }
     seq_writer& writer() { return _writer.local(); }
     sharded_store& schema_store() { return _store; }
+    request_authenticator& authenticator() { return _auth; }
+    ss::future<> mitigate_error(std::exception_ptr);
 
 private:
     ss::future<> do_start();
+    ss::future<> configure();
+    ss::future<> inform(model::node_id);
+    ss::future<> do_inform(model::node_id);
     ss::future<> create_internal_topic();
     ss::future<> fetch_internal_topic();
     configuration _config;
-    ss::semaphore _mem_sem;
+    ssx::semaphore _mem_sem;
     ss::gate _gate;
     ss::sharded<kafka::client::client>& _client;
     ctx_server<service>::context_t _ctx;
     ctx_server<service> _server;
     sharded_store& _store;
     ss::sharded<seq_writer>& _writer;
+    std::unique_ptr<cluster::controller>& _controller;
 
     one_shot _ensure_started;
+    request_authenticator _auth;
+    bool _has_ephemeral_credentials{false};
+    bool _is_started{false};
 };
 
 } // namespace pandaproxy::schema_registry

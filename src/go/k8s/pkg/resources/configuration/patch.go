@@ -36,8 +36,8 @@ type CentralConfigurationPatch struct {
 // String gives a concise representation of the patch
 func (p CentralConfigurationPatch) String() string {
 	upsert := make([]string, 0, len(p.Upsert))
-	for k, v := range p.Upsert {
-		upsert = append(upsert, fmt.Sprintf("%s=%v", k, v))
+	for k := range p.Upsert {
+		upsert = append(upsert, fmt.Sprintf("+%s", k))
 	}
 	remove := make([]string, 0, len(p.Remove))
 	for _, r := range p.Remove {
@@ -97,7 +97,8 @@ func ThreeWayMerge(
 
 // PropertiesEqual tries to compare two property values using metadata information about the schema,
 // falling back to loose comparison in case of missing data (e.g. it happens with unknown properties).
-// nolint:gocritic // code more readable
+//
+//nolint:gocritic // code more readable
 func PropertiesEqual(
 	log logr.Logger, v1, v2 interface{}, metadata admin.ConfigPropertyMetadata,
 ) bool {

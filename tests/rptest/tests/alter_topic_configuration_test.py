@@ -9,10 +9,13 @@
 
 import random
 import string
+import subprocess
+from rptest.clients.kcl import RawKCL
 
 from rptest.services.cluster import cluster
 from ducktape.mark import parametrize
 from rptest.clients.kafka_cli_tools import KafkaCliTools
+from rptest.clients.rpk import RpkTool
 
 from rptest.clients.types import TopicSpec
 from rptest.tests.redpanda_test import RedpandaTest
@@ -50,18 +53,37 @@ class AlterTopicConfiguration(RedpandaTest):
         assert getattr(spec, attr_name, None) == value
 
     @cluster(num_nodes=3)
+    def test_alter_config_does_not_change_replication_factor(self):
+        topic = self.topics[0].name
+        # change default replication factor
+        self.redpanda.set_cluster_config(
+            {"default_topic_replications": str(5)})
+        kcl = RawKCL(self.redpanda)
+        kcl.raw_alter_topic_config(
+            1, topic, {
+                TopicSpec.PROPERTY_RETENTION_TIME: 360000,
+                TopicSpec.PROPERTY_TIMESTAMP_TYPE: "LogAppendTime"
+            })
+        kafka_tools = KafkaCliTools(self.redpanda)
+        spec = kafka_tools.describe_topic(topic)
+
+        assert spec.replication_factor == 3
+        assert spec.retention_ms == 360000
+        assert spec.message_timestamp_type == "LogAppendTime"
+
+    @cluster(num_nodes=3)
     def test_altering_multiple_topic_configurations(self):
         topic = self.topics[0].name
         kafka_tools = KafkaCliTools(self.redpanda)
         self.client().alter_topic_configs(
             topic, {
-                TopicSpec.PROPERTY_SEGMENT_SIZE: 1024,
+                TopicSpec.PROPERTY_SEGMENT_SIZE: 1024 * 1024,
                 TopicSpec.PROPERTY_RETENTION_TIME: 360000,
                 TopicSpec.PROPERTY_TIMESTAMP_TYPE: "LogAppendTime"
             })
         spec = kafka_tools.describe_topic(topic)
 
-        assert spec.segment_bytes == 1024
+        assert spec.segment_bytes == 1024 * 1024
         assert spec.retention_ms == 360000
         assert spec.message_timestamp_type == "LogAppendTime"
 
@@ -79,18 +101,18 @@ class AlterTopicConfiguration(RedpandaTest):
 
     @cluster(num_nodes=3)
     def test_configuration_properties_kafka_config_allowlist(self):
-        topic = self.topics[0].name
-        kafka_tools = KafkaCliTools(self.redpanda)
-        spec = kafka_tools.describe_topic(topic)
+        rpk = RpkTool(self.redpanda)
+        config = rpk.describe_topic_configs(self.topic)
+
+        new_segment_bytes = int(config['segment.bytes'][0]) + 1
         self.client().alter_topic_configs(
-            topic, {
+            self.topic, {
                 "unclean.leader.election.enable": True,
-                TopicSpec.PROPERTY_SEGMENT_SIZE: spec.segment_bytes + 1,
+                TopicSpec.PROPERTY_SEGMENT_SIZE: new_segment_bytes
             })
 
-        spec.segment_bytes += 1
-        new_spec = kafka_tools.describe_topic(topic)
-        assert new_spec == spec
+        new_config = rpk.describe_topic_configs(self.topic)
+        assert int(new_config['segment.bytes'][0]) == new_segment_bytes
 
     @cluster(num_nodes=3)
     def test_configuration_properties_name_validation(self):
@@ -110,6 +132,53 @@ class AlterTopicConfiguration(RedpandaTest):
         new_spec = kafka_tools.describe_topic(topic)
         # topic spec shouldn't change
         assert new_spec == spec
+
+    @cluster(num_nodes=3)
+    def test_segment_size_validation(self):
+        topic = self.topics[0].name
+        kafka_tools = KafkaCliTools(self.redpanda)
+        initial_spec = kafka_tools.describe_topic(topic)
+        self.redpanda.set_cluster_config({"log_segment_size_min": 1024})
+        try:
+            self.client().alter_topic_configs(
+                topic, {TopicSpec.PROPERTY_SEGMENT_SIZE: 16})
+        except subprocess.CalledProcessError as e:
+            assert "is outside of allowed range" in e.output
+
+        assert initial_spec.segment_bytes == kafka_tools.describe_topic(
+            topic
+        ).segment_bytes, "segment.bytes shouldn't be changed to invalid value"
+
+        # change min segment bytes redpanda property
+        self.redpanda.set_cluster_config({"log_segment_size_min": 1024 * 1024})
+        # try setting value that is smaller than requested min
+        try:
+            self.client().alter_topic_configs(
+                topic, {TopicSpec.PROPERTY_SEGMENT_SIZE: 1024 * 1024 - 1})
+        except subprocess.CalledProcessError as e:
+            assert "is outside of allowed range" in e.output
+
+        assert initial_spec.segment_bytes == kafka_tools.describe_topic(
+            topic
+        ).segment_bytes, "segment.bytes shouldn't be changed to invalid value"
+        valid_segment_size = 1024 * 1024 + 1
+        self.client().alter_topic_configs(
+            topic, {TopicSpec.PROPERTY_SEGMENT_SIZE: valid_segment_size})
+        assert kafka_tools.describe_topic(
+            topic).segment_bytes == valid_segment_size
+
+        self.redpanda.set_cluster_config(
+            {"log_segment_size_max": 10 * 1024 * 1024})
+        # try to set value greater than max allowed segment size
+        try:
+            self.client().alter_topic_configs(
+                topic, {TopicSpec.PROPERTY_SEGMENT_SIZE: 20 * 1024 * 1024})
+        except subprocess.CalledProcessError as e:
+            assert "is outside of allowed range" in e.output
+
+        # check that segment size didn't change
+        assert kafka_tools.describe_topic(
+            topic).segment_bytes == valid_segment_size
 
     @cluster(num_nodes=3)
     def test_shadow_indexing_config(self):
@@ -189,7 +258,7 @@ class ShadowIndexingGlobalConfig(RedpandaTest):
 
         self.client().alter_topic_config(topic, "redpanda.remote.read",
                                          "false")
-        self.client().alter_topic_config(topic, "redpanda.remote.read",
+        self.client().alter_topic_config(topic, "redpanda.remote.write",
                                          "false")
         altered_output = self.client().describe_topic_configs(topic)
         self.logger.info(f"altered_output={altered_output}")

@@ -22,15 +22,6 @@
 
 namespace kafka {
 
-struct metadata_response;
-
-struct metadata_api final {
-    using response_type = metadata_response;
-
-    static constexpr const char* name = "metadata";
-    static constexpr api_key key = api_key(3);
-};
-
 struct metadata_request {
     using api_type = metadata_api;
 
@@ -38,11 +29,11 @@ struct metadata_request {
 
     bool list_all_topics{false};
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
         if (version > api_version(0)) {
             list_all_topics = !data.topics;
@@ -56,11 +47,12 @@ struct metadata_request {
             list_all_topics = data.topics->empty();
         }
     }
-};
 
-inline std::ostream& operator<<(std::ostream& os, const metadata_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const metadata_request& r) {
+        return os << r.data;
+    }
+};
 
 struct metadata_response {
     using api_type = metadata_api;
@@ -70,17 +62,18 @@ struct metadata_response {
 
     metadata_response_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
-};
 
-inline std::ostream& operator<<(std::ostream& os, const metadata_response& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const metadata_response& r) {
+        return os << r.data;
+    }
+};
 
 } // namespace kafka

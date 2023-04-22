@@ -17,7 +17,6 @@
 #include "kafka/protocol/sync_group.h"
 #include "kafka/server/group_metadata.h"
 #include "kafka/types.h"
-#include "utils/concepts-enabled.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -57,8 +56,12 @@ public:
           .instance_id = std::move(group_instance_id),
           .client_id = std::move(client_id),
           .client_host = std::move(client_host),
-          .rebalance_timeout = rebalance_timeout,
-          .session_timeout = session_timeout,
+          .rebalance_timeout
+          = std::chrono::duration_cast<std::chrono::milliseconds>(
+            rebalance_timeout),
+          .session_timeout
+          = std::chrono::duration_cast<std::chrono::milliseconds>(
+            session_timeout),
           .subscription = iobuf{},
           .assignment = iobuf{},
         },
@@ -81,6 +84,8 @@ public:
 
     /// Get the member id.
     const kafka::member_id& id() const { return _state.id; }
+
+    void replace_id(member_id new_id) { _state.id = std::move(new_id); }
 
     /// Get the id of the member's group.
     const kafka::group_id& group_id() const { return _group_id; }
@@ -141,6 +146,9 @@ public:
 
     /// Check if the member is syncing.
     bool is_syncing() const { return bool(_sync_promise); }
+
+    /// Check if member is static
+    bool is_static() const { return bool(_state.instance_id); }
 
     /**
      * Get the sync response.
@@ -216,8 +224,6 @@ private:
 
 /// \brief Shared pointer to a group member.
 using member_ptr = ss::lw_shared_ptr<group_member>;
-
-std::ostream& operator<<(std::ostream&, const group_member&);
 
 /// @}
 

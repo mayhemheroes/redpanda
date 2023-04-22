@@ -2,7 +2,13 @@ apiVersion: redpanda.vectorized.io/v1alpha1
 kind: Cluster
 metadata:
   name: additional-configuration
-  namespace: default
 status:
   replicas: 1
   restarting: false
+
+---
+
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+collectors:
+- command: ../../../hack/get-redpanda-info.sh

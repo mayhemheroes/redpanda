@@ -11,7 +11,9 @@
 
 #pragma once
 
+#include "features/feature_table.h"
 #include "hashing/crc32c.h"
+#include "likely.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "raft/append_entries_buffer.h"
@@ -31,8 +33,8 @@
 #include "raft/replicate_batcher.h"
 #include "raft/timeout_jitter.h"
 #include "raft/types.h"
-#include "rpc/connection_cache.h"
 #include "seastarx.h"
+#include "ssx/semaphore.h"
 #include "storage/fwd.h"
 #include "storage/log.h"
 #include "storage/snapshot.h"
@@ -43,6 +45,7 @@
 #include <seastar/util/bool_class.hh>
 
 #include <optional>
+#include <string_view>
 
 namespace raft {
 class replicate_entries_stm;
@@ -89,12 +92,15 @@ public:
       timeout_jitter,
       storage::log,
       scheduling_config,
-      model::timeout_clock::duration disk_timeout,
+      config::binding<std::chrono::milliseconds> disk_timeout,
       consensus_client_protocol,
       leader_cb_t,
       storage::api&,
       std::optional<std::reference_wrapper<recovery_throttle>>,
-      recovery_memory_quota&);
+      recovery_memory_quota&,
+      features::feature_table&,
+      std::optional<voter_priority> = std::nullopt,
+      keep_snapshotted_log = keep_snapshotted_log::no);
 
     /// Initial call. Allow for internal state recovery
     ss::future<> start();
@@ -112,28 +118,51 @@ public:
 
     ss::future<timeout_now_reply> timeout_now(timeout_now_request&& r);
 
-    /// This method adds multiple members to the group and performs
-    /// configuration update
+    /// This method adds member to a group
     ss::future<std::error_code>
-      add_group_members(std::vector<model::broker>, model::revision_id);
+      add_group_member(model::broker, model::revision_id);
     /// Updates given member configuration
     ss::future<std::error_code> update_group_member(model::broker);
-    // Removes members from group
+    // Removes member from group
     ss::future<std::error_code>
-      remove_members(std::vector<model::node_id>, model::revision_id);
-    // Replace configuration of raft group with given set of nodes
+      remove_member(model::node_id, model::revision_id);
+    /**
+     * Replace configuration, uses revision provided with brokers
+     */
     ss::future<std::error_code>
-      replace_configuration(std::vector<model::broker>, model::revision_id);
+      replace_configuration(std::vector<broker_revision>, model::revision_id);
+
+    /**
+     * New simplified configuration change API, accepting only vnode instead of
+     * full broker object
+     */
+    ss::future<std::error_code> add_group_member(vnode, model::revision_id);
+    ss::future<std::error_code> remove_member(vnode, model::revision_id);
+    ss::future<std::error_code>
+      replace_configuration(std::vector<vnode>, model::revision_id);
+
     // Abort ongoing configuration change - may cause data loss
     ss::future<std::error_code> abort_configuration_change(model::revision_id);
     // Revert current configuration change - this is safe and will never cause
     // data loss
-    ss::future<std::error_code> revert_configuration_change(model::revision_id);
-    bool is_leader() const { return _vstate == vote_state::leader; }
+    ss::future<std::error_code> cancel_configuration_change(model::revision_id);
+    bool is_elected_leader() const { return _vstate == vote_state::leader; }
+    // The node won the elections and made sure that the records written in
+    // previous term are behind committed index
+    bool is_leader() const {
+        return is_elected_leader() && _term == _confirmed_term;
+    }
     bool is_candidate() const { return _vstate == vote_state::candidate; }
     std::optional<model::node_id> get_leader_id() const {
         return _leader_id ? std::make_optional(_leader_id->id()) : std::nullopt;
     }
+
+    /**
+     * On leader, return the number of under replicated followers.  On
+     * followers, return nullopt
+     */
+    std::optional<uint8_t> get_under_replicated() const;
+
     /**
      * Sends a round of heartbeats to followers, when majority of followers
      * replied with success to either this of any following request all reads up
@@ -150,8 +179,11 @@ public:
     group_configuration config() const;
     const model::ntp& ntp() const { return _log.config().ntp(); }
     clock_type::time_point last_heartbeat() const { return _hbeat; };
+    clock_type::time_point became_leader_at() const {
+        return _became_leader_at;
+    };
 
-    clock_type::time_point last_sent_append_entries_req_timesptamp(vnode);
+    clock_type::time_point last_sent_append_entries_req_timestamp(vnode);
     /**
      * \brief Persist snapshot with given data and start offset
      *
@@ -160,6 +192,20 @@ public:
      * consensus operations lock.
      */
     ss::future<> write_snapshot(write_snapshot_cfg);
+
+    struct opened_snapshot {
+        raft::snapshot_metadata metadata;
+        storage::snapshot_reader reader;
+
+        ss::future<> close() { return reader.close(); }
+    };
+
+    // Open the current snapshot for reading (if present)
+    ss::future<std::optional<opened_snapshot>> open_snapshot();
+
+    std::filesystem::path get_snapshot_path() const {
+        return _snapshot_mgr.snapshot_path();
+    }
 
     /// Increment and returns next append_entries order tracking sequence for
     /// follower with given node id
@@ -175,6 +221,7 @@ public:
     replicate(model::record_batch_reader&&, replicate_options);
     replicate_stages
     replicate_in_stages(model::record_batch_reader&&, replicate_options);
+    uint64_t get_snapshot_size() const { return _snapshot_size; }
 
     /**
      * Replication happens only when expected_term matches the current _term
@@ -209,6 +256,17 @@ public:
 
     model::offset get_latest_configuration_offset() const;
     model::offset committed_offset() const { return _commit_index; }
+    model::offset flushed_offset() const { return _flushed_offset; }
+    model::offset last_quorum_replicated_index() const {
+        return _last_quorum_replicated_index;
+    }
+    model::offset majority_replicated_index() const {
+        return _majority_replicated_index;
+    }
+    model::offset visibility_upper_bound_index() const {
+        return _visibility_upper_bound_index;
+    }
+    model::term_id confirmed_term() const { return _confirmed_term; }
 
     /**
      * Last visible index is an offset that is safe to be fetched by the
@@ -239,14 +297,25 @@ public:
         return _configuration_manager.wait_for_change(last_seen, as);
     }
 
-    ss::future<> step_down(model::term_id term) {
-        return _op_lock.with([this, term] {
+    ss::future<> step_down(model::term_id term, std::string_view ctx) {
+        return _op_lock.with([this, term, ctx] {
             // check again under op_lock semaphore, make sure we do not move
             // term backward
             if (term > _term) {
                 _term = term;
                 _voted_for = {};
-                do_step_down("external_stepdown");
+                do_step_down(fmt::format(
+                  "external_stepdown with term {} - {}", term, ctx));
+            }
+        });
+    }
+
+    ss::future<> step_down(std::string_view ctx) {
+        return _op_lock.with([this, ctx] {
+            do_step_down(fmt::format("external_stepdown - {}", ctx));
+            if (_leader_id) {
+                _leader_id = std::nullopt;
+                trigger_leadership_notification();
             }
         });
     }
@@ -254,8 +323,16 @@ public:
     ss::future<std::optional<storage::timequery_result>>
     timequery(storage::timequery_config cfg);
 
+    model::offset last_snapshot_index() const { return _last_snapshot_index; }
+    model::term_id last_snapshot_term() const { return _last_snapshot_term; }
+    model::offset received_snapshot_index() const {
+        return _received_snapshot_index;
+    }
+    size_t received_snapshot_bytes() const { return _received_snapshot_bytes; }
+    bool has_pending_flushes() const { return _has_pending_flushes; }
+
     model::offset start_offset() const {
-        return details::next_offset(_last_snapshot_index);
+        return model::next_offset(_last_snapshot_index);
     }
 
     model::offset dirty_offset() const { return _log.offsets().dirty_offset; }
@@ -278,15 +355,10 @@ public:
      */
     ss::future<transfer_leadership_reply>
       transfer_leadership(transfer_leadership_request);
-    ss::future<std::error_code> prepare_transfer_leadership(vnode);
     ss::future<std::error_code>
-      do_transfer_leadership(std::optional<model::node_id>);
-    /**
-     * requests leadership to be transferred to the current node. It sends
-     * transer leadership request to the current leader.
-     */
+      prepare_transfer_leadership(vnode, transfer_leadership_options);
     ss::future<std::error_code>
-      request_leadership(model::timeout_clock::time_point);
+      do_transfer_leadership(transfer_leadership_request);
 
     ss::future<> remove_persistent_state();
 
@@ -324,6 +396,7 @@ public:
 
     std::vector<follower_metrics> get_follower_metrics() const;
     result<follower_metrics> get_follower_metrics(model::node_id) const;
+    size_t get_follower_count() const;
     bool has_followers() const { return _fstats.size() > 0; }
 
     offset_monitor& visible_offset_monitor() {
@@ -342,10 +415,20 @@ public:
         _node_priority_override = raft::zero_voter_priority;
     }
 
+    /**
+     * Resets node priority only if it was not blocked
+     */
+    void reset_node_priority() {
+        if (_node_priority_override == raft::min_voter_priority) {
+            unblock_new_leadership();
+        }
+    }
     /*
      * Allow the current node to become a leader for this group.
      */
     void unblock_new_leadership() { _node_priority_override.reset(); }
+
+    const follower_stats& get_follower_stats() const { return _fstats; }
 
 private:
     friend replicate_entries_stm;
@@ -364,12 +447,12 @@ private:
     ss::future<append_entries_reply>
     do_append_entries(append_entries_request&&);
     ss::future<install_snapshot_reply>
-    do_install_snapshot(install_snapshot_request&& r);
+    do_install_snapshot(install_snapshot_request r);
     ss::future<> do_start();
 
     ss::future<result<replicate_result>> dispatch_replicate(
       append_entries_request,
-      std::vector<ss::semaphore_units<>>,
+      std::vector<ssx::semaphore_units>,
       absl::flat_hash_map<vnode, follower_req_seq>);
     /**
      * Hydrate the consensus state with the data from the snapshot
@@ -393,6 +476,8 @@ private:
       model::record_batch_reader&&,
       replicate_options);
 
+    ss::future<result<replicate_result>> chain_stages(replicate_stages);
+
     ss::future<storage::append_result>
     disk_append(model::record_batch_reader&&, update_last_quorum_index);
 
@@ -410,7 +495,7 @@ private:
     bool needs_recovery(const follower_index_metadata&, model::offset);
     void dispatch_recovery(follower_index_metadata&);
     void maybe_update_leader_commit_idx();
-    ss::future<> do_maybe_update_leader_commit_idx(ss::semaphore_units<>);
+    ss::future<> do_maybe_update_leader_commit_idx(ssx::semaphore_units);
 
     clock_type::time_point majority_heartbeat() const;
     /*
@@ -425,13 +510,14 @@ private:
     /// Replicates configuration to other nodes,
     //  caller have to pass in _op_sem semaphore units
     ss::future<std::error_code>
-    replicate_configuration(ss::semaphore_units<> u, group_configuration);
+    replicate_configuration(ssx::semaphore_units u, group_configuration);
 
     ss::future<> maybe_update_follower_commit_idx(model::offset);
 
     void arm_vote_timeout();
     void update_node_append_timestamp(vnode);
-    void update_node_hbeat_timestamp(vnode);
+    void update_node_reply_timestamp(vnode);
+    void maybe_update_node_reply_timestamp(vnode);
 
     void update_follower_stats(const group_configuration&);
     void trigger_leadership_notification();
@@ -444,6 +530,7 @@ private:
     absl::flat_hash_map<vnode, follower_req_seq> next_followers_request_seq();
 
     void setup_metrics();
+    void setup_public_metrics();
 
     bytes voted_for_key() const {
         return raft::details::serialize_group_key(
@@ -460,7 +547,7 @@ private:
     ss::future<std::error_code>
       interrupt_configuration_change(model::revision_id, Func);
 
-    ss::future<> maybe_commit_configuration(ss::semaphore_units<>);
+    ss::future<> maybe_commit_configuration(ssx::semaphore_units);
     void maybe_promote_to_voter(vnode);
 
     ss::future<model::record_batch_reader>
@@ -492,30 +579,60 @@ private:
 
     template<typename Reply>
     result<Reply> validate_reply_target_node(
-      std::string_view request, result<Reply>&& reply) {
-        if (unlikely(reply && reply.value().target_node_id != self())) {
-            /**
-             * if received node_id is not initialized it means that there were
-             * no raft group instance on target node to handle the request.
-             */
-            if (reply.value().target_node_id.id() == model::node_id{}) {
+      std::string_view request,
+      result<Reply> reply,
+      model::node_id requested_node_id) {
+        if (reply) {
+            // since we are not going to introduce the node in ADL versions of
+            // replies it may be not initialzed, in this case just ignore the
+            // check
+            if (unlikely(
+                  reply.value().node_id != vnode{}
+                  && reply.value().node_id.id() != requested_node_id)) {
                 vlog(
                   _ctxlog.warn,
-                  "received {} reply from the node where ntp {} does not "
-                  "exists",
+                  "received {} reply from a node that id does not match the "
+                  "requested one. Received: {}, requested: {}",
                   request,
-                  _log.config().ntp());
-                return result<Reply>(errc::group_not_exists);
+                  reply.value().node_id.id(),
+                  requested_node_id);
+                return result<Reply>(errc::invalid_target_node);
             }
+            if (unlikely(reply.value().target_node_id != self())) {
+                /**
+                 * if received node_id is not initialized it means that there
+                 * were no raft group instance on target node to handle the
+                 * request.
+                 */
+                if (reply.value().target_node_id.id() == model::node_id{}) {
+                    // A grace period, where perhaps it is okay that a peer
+                    // hasn't seen the controller log message that created
+                    // this partition yet.
+                    static constexpr clock_type::duration grace = 30s;
+                    bool instantiated_recently = (clock_type::now()
+                                                  - _instantiated_at)
+                                                 < grace;
+                    if (!instantiated_recently) {
+                        vlog(
+                          _ctxlog.warn,
+                          "received {} reply from the node where ntp {} does "
+                          "not "
+                          "exists",
+                          request,
+                          _log.config().ntp());
+                    }
+                    return result<Reply>(errc::group_not_exists);
+                }
 
-            vlog(
-              _ctxlog.warn,
-              "received {} reply addressed to different node: {}, current "
-              "node: {}",
-              request,
-              reply.value().target_node_id,
-              _self);
-            return result<Reply>(errc::invalid_target_node);
+                vlog(
+                  _ctxlog.warn,
+                  "received {} reply addressed to different node: {}, current "
+                  "node: {}",
+                  request,
+                  reply.value().target_node_id,
+                  _self);
+                return result<Reply>(errc::invalid_target_node);
+            }
         }
         return std::move(reply);
     }
@@ -528,14 +645,19 @@ private:
             vlog(
               _ctxlog.warn,
               "received {} request addressed to different node: {}, current "
-              "node: {}",
+              "node: {}, source: {}",
               request_name,
               target,
-              _self);
+              _self,
+              request.source_node());
             return true;
         }
         return false;
     }
+
+    void maybe_upgrade_configuration_to_v4(group_configuration&);
+
+    void update_confirmed_term();
     // args
     vnode _self;
     raft::group_id _group;
@@ -543,13 +665,25 @@ private:
     storage::log _log;
     offset_translator _offset_translator;
     scheduling_config _scheduling;
-    model::timeout_clock::duration _disk_timeout;
+    config::binding<std::chrono::milliseconds> _disk_timeout;
     consensus_client_protocol _client_protocol;
     leader_cb_t _leader_notification;
 
     // consensus state
     model::offset _commit_index;
     model::term_id _term;
+    // It's common to use raft log as a foundation for state machines:
+    // when a node becomes a leader it replays the log, reconstructs
+    // the state and becomes ready to serve the requests. However it is
+    // not enough for a node to become a leader, it should successfully
+    // replicate a new record to be sure that older records stored in
+    // the local log were actually replicated and do not constitute an
+    // artifact of the previously crashed leader. Redpanda uses a confi-
+    // guration batch for the initial replication to gain certainty. When
+    // commit index moves past the configuration batch _confirmed_term
+    // gets updated. So when _term==_confirmed_term it's safe to use
+    // local log to reconstruct the state.
+    model::term_id _confirmed_term;
     model::offset _flushed_offset{};
 
     // read at `ss::future<> start()`
@@ -560,6 +694,8 @@ private:
     /// useful for when we are not the leader
     clock_type::time_point _hbeat = clock_type::now();
     clock_type::time_point _became_leader_at = clock_type::now();
+    clock_type::time_point _instantiated_at = clock_type::now();
+
     /// used to keep track if we are a leader, or transitioning
     vote_state _vstate = vote_state::follower;
     /// used for votes only. heartbeats are done by heartbeat_manager
@@ -591,7 +727,9 @@ private:
     storage::api& _storage;
     std::optional<std::reference_wrapper<recovery_throttle>> _recovery_throttle;
     recovery_memory_quota& _recovery_mem_quota;
+    features::feature_table& _features;
     storage::simple_snapshot_manager _snapshot_mgr;
+    uint64_t _snapshot_size{0};
     std::optional<storage::snapshot_writer> _snapshot_writer;
     model::offset _last_snapshot_index;
     model::term_id _last_snapshot_term;
@@ -600,6 +738,11 @@ private:
     model::offset _visibility_upper_bound_index;
     voter_priority _target_priority = voter_priority::max();
     std::optional<voter_priority> _node_priority_override;
+    keep_snapshotted_log _keep_snapshotted_log;
+
+    // used to track currently installed snapshot
+    model::offset _received_snapshot_index;
+    size_t _received_snapshot_bytes = 0;
 
     /**
      * We keep an idex of the most recent entry replicated with quorum

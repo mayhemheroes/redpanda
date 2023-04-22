@@ -30,6 +30,7 @@ public:
       ss::sharded<controller_stm>&,
       ss::sharded<rpc::connection_cache>&,
       ss::sharded<partition_leaders_table>&,
+      ss::sharded<features::feature_table>&,
       ss::sharded<ss::abort_source>&,
       ss::sharded<security::authorizer>&);
 
@@ -53,6 +54,16 @@ public:
       std::vector<security::acl_binding_filter>,
       model::timeout_clock::duration);
 
+    /**
+     * For use during cluster creation, if RP_BOOTSTRAP_USER is set
+     * then returns the user creds specified in it
+     *
+     * @returns empty value if RP_BOOTSTRAP_USER is not set or user creds
+     *          cannot be parsed
+     */
+    static std::optional<user_and_credential>
+    get_bootstrap_user_creds_from_env();
+
 private:
     ss::future<std::vector<errc>> do_create_acls(
       std::vector<security::acl_binding>, model::timeout_clock::duration);
@@ -75,6 +86,7 @@ private:
     ss::sharded<controller_stm>& _stm;
     ss::sharded<rpc::connection_cache>& _connections;
     ss::sharded<partition_leaders_table>& _leaders;
+    ss::sharded<features::feature_table>& _features;
     ss::sharded<ss::abort_source>& _as;
     ss::sharded<security::authorizer>& _authorizer;
 };

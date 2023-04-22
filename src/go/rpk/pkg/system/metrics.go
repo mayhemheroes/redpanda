@@ -7,6 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+//go:build !windows
+
 package system
 
 import (
@@ -26,7 +28,7 @@ import (
 )
 
 type Metrics struct {
-	CpuPercentage float64 `json:"cpuPercentage"`
+	CPUPercentage float64 `json:"cpuPercentage"`
 	FreeMemoryMB  float64 `json:"freeMemoryMB"`
 	FreeSpaceMB   float64 `json:"freeSpaceMB"`
 }
@@ -46,7 +48,7 @@ type stat struct {
 	stime uint64
 }
 
-var errRedpandaDown = errors.New("the local redpanda process isn't running.")
+var errRedpandaDown = errors.New("the local redpanda process isn't running")
 
 func GatherMetrics(
 	fs afero.Fs, timeout time.Duration, conf config.Config,
@@ -73,7 +75,7 @@ func GatherMetrics(
 		return metrics, errs
 	}
 
-	metrics.CpuPercentage, err = redpandaCpuPercentage(fs, pid, timeout)
+	metrics.CPUPercentage, err = redpandaCPUPercentage(fs, pid, timeout)
 	if err != nil {
 		errs = multierror.Append(errs, err)
 	}
@@ -88,7 +90,7 @@ func GatherMetrics(
 	return metrics, errs
 }
 
-func redpandaCpuPercentage(
+func redpandaCPUPercentage(
 	fs afero.Fs, pid int, timeout time.Duration,
 ) (float64, error) {
 	clktck, err := sysconf.Sysconf(sysconf.SC_CLK_TCK)
@@ -157,5 +159,5 @@ func getFreeDiskSpaceMB(conf config.Config) (float64, error) {
 }
 
 func IsErrRedpandaDown(err error) bool {
-	return err == errRedpandaDown
+	return errors.Is(err, errRedpandaDown)
 }

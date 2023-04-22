@@ -1,0 +1,165 @@
+{
+    "apiVersion": "0.0.1",
+    "swaggerVersion": "1.2",
+    "basePath": "/v1",
+    "resourcePath": "/brokers",
+    "produces": [
+        "application/json"
+    ],
+    "apis": [
+        {
+            "path": "/v1/cluster/health_overview",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get cluster health overview",
+                    "type": "get_cluster_health_overview",
+                    "nickname": "get_cluster_health_overview",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/cluster/partition_balancer/status",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get partition autobalancer status",
+                    "type": "get_partition_balancer_status",
+                    "nickname": "get_partition_balancer_status",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/cluster/cancel_reconfigurations",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Cancel all partition reconfigurations",
+                    "type": "cancel_all_partitions_reconfigurations",
+                    "nickname": "cancel_all_partitions_reconfigurations",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/cluster/uuid",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get the UUID of the cluster this node belongs to. Not to be confused with the configurable cluster identifier used in metrics",
+                    "type": "get_cluster_uuid",
+                    "nickname": "get_cluster_uuid",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        }
+    ],
+    "models": {
+        "cluster_health_overview": {
+            "id": "cluster_health_overview",
+            "description": "Returns simple overview of cluster status",
+            "properties": {
+                "is_healthy": {
+                    "type": "boolean",
+                    "description": "basic cluster health indicator"
+                },
+                "controller_id": {
+                    "type": "int",
+                    "description": "node that is currently a leader or `-1` if leader is not elected"
+                },
+                "all_nodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "int"
+                    },
+                    "description": "ids of all nodes registered in the cluster"
+                },
+                "nodes_down": {
+                    "type": "array",
+                    "items": {
+                        "type": "int"
+                    },
+                    "description": "ids of all nodes being recognized as down"
+                },
+                "leaderless_partitions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "list of partitions for which no leader is elected"
+                },
+                "under_replicated_partitions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "list of partitions where one or more replicas has not replicated all data"
+                },
+                "bytes_in_cloud_storage": {
+                    "type": "long",
+                    "description": "total amount of bytes in cloud storage or -1 if unable to obtain data"
+                }
+            }
+        },
+        "partition_balancer_status": {
+            "id": "partition_balancer_status",
+            "description": "Returns status of the partition autobalancer",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "description": "off/ready/in_progress/stalled"
+                },
+                "violations": {
+                    "type": "partition_balancer_violations"
+                },
+                "seconds_since_last_tick": {
+                    "type": "int",
+                    "description": "last time the partition balancer ran"
+                },
+                "current_reassignments_count": {
+                    "type": "int",
+                    "description": "current number of partition reassignments in progress"
+                }
+            }
+        },
+        "partition_balancer_violations": {
+            "id": "partition_balancer_violations",
+            "properties": {
+                "unavailable_nodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "int"
+                    }
+                },
+                "over_disk_limit_nodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "int"
+                    }
+                }
+            }
+        },
+        "uuid": {
+            "id": "uuid",
+            "properties": {
+                "cluster_uuid": {
+                    "type": "string"
+                }
+            }
+        }
+    }
+}

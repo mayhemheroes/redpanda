@@ -11,9 +11,12 @@
 
 #pragma once
 #include "bytes/bytes.h"
+#include "bytes/details/out_of_range.h"
+#include "kafka/protocol/types.h"
 #include "model/fundamental.h"
 #include "reflection/adl.h"
 #include "seastarx.h"
+#include "utils/base64.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/sstring.hh>
@@ -25,42 +28,8 @@ namespace kafka {
 /// Kafka API request correlation.
 using correlation_id = named_type<int32_t, struct kafka_correlation_type>;
 
-/// Kafka API key.
-using api_key = named_type<int16_t, struct kafka_requests_api_key>;
-
-/// Kafka API version.
-using api_version = named_type<int16_t, struct kafka_requests_api_version>;
-
-/// Kafka group identifier.
-using group_id = named_type<ss::sstring, struct kafka_group_id>;
-
-/// Kafka transactional id identifier.
-using transactional_id = named_type<ss::sstring, struct kafka_transactional_id>;
-
-/// Kafka producer id identifier.
-using producer_id = named_type<int64_t, struct kafka_producer_id>;
-
-/// Kafka group member identifier.
-using member_id = named_type<ss::sstring, struct kafka_member_id>;
-
-/// Kafka group generation identifier.
-using generation_id = named_type<int32_t, struct kafka_generation_id>;
-
-/// Kafka group instance identifier.
-using group_instance_id
-  = named_type<ss::sstring, struct kafka_group_instance_id>;
-
-/// Kafka group protocol type.
-using protocol_type = named_type<ss::sstring, struct kafka_protocol_type>;
-
-/// Kafka group protocol name.
-using protocol_name = named_type<ss::sstring, struct kafka_protocol>;
-
 using client_id = named_type<ss::sstring, struct kafka_client_id_type>;
 using client_host = named_type<ss::sstring, struct kafka_client_host_type>;
-
-/// An unknown / missing member id (Kafka protocol specific)
-static inline const member_id unknown_member_id("");
 
 /// An unknown / missing generation id (Kafka protocol specific)
 static inline const generation_id unknown_generation_id(-1);
@@ -79,18 +48,6 @@ static constexpr fetch_session_epoch initial_fetch_session_epoch(0);
  */
 static constexpr fetch_session_epoch final_fetch_session_epoch(-1);
 
-enum class coordinator_type : int8_t {
-    group = 0,
-    transaction = 1,
-};
-
-using leader_epoch = named_type<int32_t, struct leader_epoch_tag>;
-/**
- * Used to mark that leader epoch is not intended to be used (Kafka protocol
- * specific)
- */
-static constexpr leader_epoch invalid_leader_epoch(-1);
-
 // TODO Ben: Why is this an undefined reference for pandaproxy when defined in
 // kafka/requests.cc
 inline std::ostream& operator<<(std::ostream& os, coordinator_type t) {
@@ -103,13 +60,17 @@ inline std::ostream& operator<<(std::ostream& os, coordinator_type t) {
     return os << "{unknown type}";
 }
 
-enum class config_resource_type : int8_t {
-    topic = 2,
-    broker = 4,
-    broker_logger = 8,
-};
-
-std::ostream& operator<<(std::ostream& os, config_resource_type);
+inline std::ostream& operator<<(std::ostream& os, config_resource_type t) {
+    switch (t) {
+    case config_resource_type::topic:
+        return os << "{topic}";
+    case config_resource_type::broker:
+        [[fallthrough]];
+    case config_resource_type::broker_logger:
+        break;
+    }
+    return os << "{unknown type}";
+}
 
 enum class config_resource_operation : int8_t {
     set = 0,
@@ -120,23 +81,17 @@ enum class config_resource_operation : int8_t {
 
 std::ostream& operator<<(std::ostream& os, config_resource_operation);
 
-/*
- * From where config values are sourced. For instance, a value might exist
- * because it is a default or because it was an override at the broker level.
- *
- * As our configuration becomes more sophisticated these should be taken into
- * account. Right now we only report a couple basic topic configs.
- */
-enum class describe_configs_source : int8_t {
-    topic = 1,
-    static_broker_config = 4,
-    default_config = 5,
-    // DYNAMIC_BROKER_CONFIG((byte) 2),
-    // DYNAMIC_DEFAULT_BROKER_CONFIG((byte) 3),
-    // DYNAMIC_BROKER_LOGGER_CONFIG((byte) 6);
-};
-
-std::ostream& operator<<(std::ostream& os, describe_configs_source);
+inline std::ostream& operator<<(std::ostream& os, describe_configs_source s) {
+    switch (s) {
+    case describe_configs_source::topic:
+        return os << "{topic}";
+    case describe_configs_source::static_broker_config:
+        return os << "{static_broker_config}";
+    case describe_configs_source::default_config:
+        return os << "{default_config}";
+    }
+    return os << "{unknown type}";
+}
 
 /// \brief A protocol configuration supported by a group member.
 ///
@@ -150,9 +105,12 @@ struct member_protocol {
     bool operator==(const member_protocol& o) const {
         return name == o.name && metadata == o.metadata;
     }
-};
 
-std::ostream& operator<<(std::ostream&, const member_protocol&);
+    friend std::ostream&
+    operator<<(std::ostream& os, const member_protocol& p) {
+        return os << p.name << ":" << p.metadata.size();
+    }
+};
 
 using assignments_type = std::unordered_map<member_id, bytes>;
 

@@ -12,6 +12,7 @@
 #include "cluster/controller.h"
 #include "cluster/id_allocator_frontend.h"
 #include "cluster/logger.h"
+#include "cluster/members_table.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/partition_leaders_table.h"
 #include "cluster/partition_manager.h"
@@ -23,6 +24,7 @@
 #include "kafka/server/coordinator_ntp_mapper.h"
 #include "kafka/server/group.h"
 #include "kafka/server/group_router.h"
+#include "rpc/connection_cache.h"
 #include "vlog.h"
 
 #include <seastar/core/coroutine.hh>
@@ -64,7 +66,9 @@ ss::future<bool> try_create_consumer_group_topic(
            * kindly ask client to retry on error
            */
           vassert(res.size() == 1, "expected exactly one result");
-          if (res[0].ec != cluster::errc::success) {
+          if (
+            res[0].ec != cluster::errc::success
+            && res[0].ec != cluster::errc::topic_already_exists) {
               vlog(
                 klog.warn,
                 "can not create {}/{} topic - error: {}",
@@ -109,7 +113,8 @@ ss::future<cluster::begin_group_tx_reply> rm_group_frontend::begin_group_tx(
   kafka::group_id group_id,
   model::producer_identity pid,
   model::tx_seq tx_seq,
-  model::timeout_clock::duration timeout) {
+  model::timeout_clock::duration timeout,
+  model::partition_id tm) {
     auto ntp_opt = _group_router.local().coordinator_mapper().local().ntp_for(
       group_id);
     if (!ntp_opt) {
@@ -120,17 +125,14 @@ ss::future<cluster::begin_group_tx_reply> rm_group_frontend::begin_group_tx(
         auto has_created = co_await try_create_consumer_group_topic(
           _group_router.local().coordinator_mapper().local(),
           _controller->get_topics_frontend().local(),
-          (int16_t)_controller->get_members_table()
-            .local()
-            .all_brokers()
-            .size());
+          (int16_t)_controller->get_members_table().local().node_count());
         if (!has_created) {
             vlog(
               cluster::txlog.warn,
               "can't create consumer group topic",
               group_id);
             co_return cluster::begin_group_tx_reply{
-              .ec = cluster::tx_errc::partition_not_exists};
+              cluster::tx_errc::partition_not_exists};
         }
     }
 
@@ -172,32 +174,29 @@ ss::future<cluster::begin_group_tx_reply> rm_group_frontend::begin_group_tx(
     }
 
     if (!leader_opt) {
-        co_return cluster::begin_group_tx_reply{.ec = ec};
+        co_return cluster::begin_group_tx_reply{ec};
     }
 
     auto leader = leader_opt.value();
     auto _self = _controller->self();
 
     if (leader == _self) {
-        cluster::begin_group_tx_request req;
-        req.group_id = group_id;
-        req.pid = pid;
-        req.tx_seq = tx_seq;
-        req.timeout = timeout;
+        cluster::begin_group_tx_request req{group_id, pid, tx_seq, timeout, tm};
         co_return co_await begin_group_tx_locally(std::move(req));
     }
 
     vlog(
       cluster::txlog.trace,
       "dispatching name:begin_group_tx, group_id:{}, pid:{}, tx_seq:{}, "
-      "from:{}, to:{}",
+      "timeout:{} from:{}, to:{}",
       group_id,
       pid,
       tx_seq,
+      timeout,
       _self,
       leader);
     auto reply = co_await dispatch_begin_group_tx(
-      leader, group_id, pid, tx_seq, timeout);
+      leader, group_id, pid, tx_seq, timeout, tm);
     vlog(
       cluster::txlog.trace,
       "received name:begin_group_tx, group_id:{}, pid:{}, tx_seq:{}, ec:{}, "
@@ -216,21 +215,19 @@ rm_group_frontend::dispatch_begin_group_tx(
   kafka::group_id group_id,
   model::producer_identity pid,
   model::tx_seq tx_seq,
-  model::timeout_clock::duration timeout) {
+  model::timeout_clock::duration timeout,
+  model::partition_id tm) {
     return _connection_cache.local()
       .with_node_client<cluster::tx_gateway_client_protocol>(
         _controller->self(),
         ss::this_shard_id(),
         leader,
         timeout,
-        [group_id, pid, tx_seq, timeout](
+        [group_id, pid, tx_seq, timeout, tm](
           cluster::tx_gateway_client_protocol cp) {
             return cp.begin_group_tx(
               cluster::begin_group_tx_request{
-                .group_id = group_id,
-                .pid = pid,
-                .tx_seq = tx_seq,
-                .timeout = timeout},
+                group_id, pid, tx_seq, timeout, tm},
               rpc::client_opts(model::timeout_clock::now() + timeout));
         })
       .then(&rpc::get_ctx_data<cluster::begin_group_tx_reply>)
@@ -240,8 +237,7 @@ rm_group_frontend::dispatch_begin_group_tx(
                 cluster::txlog.warn,
                 "got error {} on remote begin group tx",
                 r.error());
-              return cluster::begin_group_tx_reply{
-                .ec = cluster::tx_errc::timeout};
+              return cluster::begin_group_tx_reply{cluster::tx_errc::timeout};
           }
 
           return r.value();
@@ -252,10 +248,12 @@ ss::future<cluster::begin_group_tx_reply>
 rm_group_frontend::begin_group_tx_locally(cluster::begin_group_tx_request req) {
     vlog(
       cluster::txlog.trace,
-      "processing name:begin_group_tx, group_id:{}, pid:{}, tx_seq:{}",
+      "processing name:begin_group_tx, group_id:{}, pid:{}, tx_seq:{}, "
+      "timeout: {}",
       req.group_id,
       req.pid,
-      req.tx_seq);
+      req.tx_seq,
+      req.timeout);
     auto reply = co_await _group_router.local().begin_tx(req);
     vlog(
       cluster::txlog.trace,
@@ -280,7 +278,7 @@ ss::future<cluster::prepare_group_tx_reply> rm_group_frontend::prepare_group_tx(
     if (!ntp_opt) {
         vlog(cluster::txlog.warn, "can't find ntp for {} ", group_id);
         co_return cluster::prepare_group_tx_reply{
-          .ec = cluster::tx_errc::partition_not_exists};
+          cluster::tx_errc::partition_not_exists};
     }
     auto ntp = std::move(ntp_opt.value());
 
@@ -288,25 +286,21 @@ ss::future<cluster::prepare_group_tx_reply> rm_group_frontend::prepare_group_tx(
     if (!_metadata_cache.local().contains(nt, ntp.tp.partition)) {
         vlog(cluster::txlog.warn, "can't find meta info for {}", ntp);
         co_return cluster::prepare_group_tx_reply{
-          .ec = cluster::tx_errc::partition_not_exists};
+          cluster::tx_errc::partition_not_exists};
     }
 
     auto leader_opt = _leaders.local().get_leader(ntp);
     if (!leader_opt) {
         vlog(cluster::txlog.warn, "can't find a leader for {}", ntp);
         co_return cluster::prepare_group_tx_reply{
-          .ec = cluster::tx_errc::leader_not_found};
+          cluster::tx_errc::leader_not_found};
     }
     auto leader = leader_opt.value();
     auto _self = _controller->self();
 
     if (leader == _self) {
-        cluster::prepare_group_tx_request req;
-        req.group_id = group_id;
-        req.etag = etag;
-        req.pid = pid;
-        req.tx_seq = tx_seq;
-        req.timeout = timeout;
+        cluster::prepare_group_tx_request req{
+          group_id, etag, pid, tx_seq, timeout};
         co_return co_await prepare_group_tx_locally(std::move(req));
     }
 
@@ -355,11 +349,7 @@ rm_group_frontend::dispatch_prepare_group_tx(
           cluster::tx_gateway_client_protocol cp) {
             return cp.prepare_group_tx(
               cluster::prepare_group_tx_request{
-                .group_id = group_id,
-                .etag = etag,
-                .pid = pid,
-                .tx_seq = tx_seq,
-                .timeout = timeout},
+                group_id, etag, pid, tx_seq, timeout},
               rpc::client_opts(model::timeout_clock::now() + timeout));
         })
       .then(&rpc::get_ctx_data<cluster::prepare_group_tx_reply>)
@@ -369,8 +359,7 @@ rm_group_frontend::dispatch_prepare_group_tx(
                 cluster::txlog.warn,
                 "got error {} on remote prepare group tx",
                 r.error());
-              return cluster::prepare_group_tx_reply{
-                .ec = cluster::tx_errc::timeout};
+              return cluster::prepare_group_tx_reply{cluster::tx_errc::timeout};
           }
 
           return r.value();
@@ -411,7 +400,7 @@ ss::future<cluster::commit_group_tx_reply> rm_group_frontend::commit_group_tx(
     if (!ntp_opt) {
         vlog(cluster::txlog.warn, "can't find ntp for {}", group_id);
         co_return cluster::commit_group_tx_reply{
-          .ec = cluster::tx_errc::partition_not_exists};
+          cluster::tx_errc::partition_not_exists};
     }
 
     auto ntp = std::move(ntp_opt.value());
@@ -420,24 +409,20 @@ ss::future<cluster::commit_group_tx_reply> rm_group_frontend::commit_group_tx(
     if (!_metadata_cache.local().contains(nt, ntp.tp.partition)) {
         vlog(cluster::txlog.warn, "can' find meta info for {}", ntp);
         co_return cluster::commit_group_tx_reply{
-          .ec = cluster::tx_errc::partition_not_exists};
+          cluster::tx_errc::partition_not_exists};
     }
 
     auto leader_opt = _leaders.local().get_leader(ntp);
     if (!leader_opt) {
         vlog(cluster::txlog.warn, "can't find a leader for {}", ntp);
         co_return cluster::commit_group_tx_reply{
-          .ec = cluster::tx_errc::leader_not_found};
+          cluster::tx_errc::leader_not_found};
     }
     auto leader = leader_opt.value();
     auto _self = _controller->self();
 
     if (leader == _self) {
-        cluster::commit_group_tx_request req;
-        req.group_id = group_id;
-        req.pid = pid;
-        req.tx_seq = tx_seq;
-        req.timeout = timeout;
+        cluster::commit_group_tx_request req{pid, tx_seq, group_id, timeout};
         co_return co_await commit_group_tx_locally(std::move(req));
     }
 
@@ -481,11 +466,7 @@ rm_group_frontend::dispatch_commit_group_tx(
         [group_id, pid, tx_seq, timeout](
           cluster::tx_gateway_client_protocol cp) {
             return cp.commit_group_tx(
-              cluster::commit_group_tx_request{
-                .pid = pid,
-                .tx_seq = tx_seq,
-                .group_id = group_id,
-                .timeout = timeout},
+              cluster::commit_group_tx_request{pid, tx_seq, group_id, timeout},
               rpc::client_opts(model::timeout_clock::now() + timeout));
         })
       .then(&rpc::get_ctx_data<cluster::commit_group_tx_reply>)
@@ -495,8 +476,7 @@ rm_group_frontend::dispatch_commit_group_tx(
                 cluster::txlog.warn,
                 "got error {} on remote commit tx",
                 r.error());
-              return cluster::commit_group_tx_reply{
-                .ec = cluster::tx_errc::timeout};
+              return cluster::commit_group_tx_reply{cluster::tx_errc::timeout};
           }
 
           return r.value();
@@ -533,7 +513,7 @@ ss::future<cluster::abort_group_tx_reply> rm_group_frontend::abort_group_tx(
     if (!ntp_opt) {
         vlog(cluster::txlog.warn, "can't find ntp for {} ", group_id);
         co_return cluster::abort_group_tx_reply{
-          .ec = cluster::tx_errc::partition_not_exists};
+          cluster::tx_errc::partition_not_exists};
     }
     auto ntp = std::move(ntp_opt.value());
 
@@ -541,24 +521,25 @@ ss::future<cluster::abort_group_tx_reply> rm_group_frontend::abort_group_tx(
     if (!_metadata_cache.local().contains(nt, ntp.tp.partition)) {
         vlog(cluster::txlog.warn, "can't find meta info for {}", ntp);
         co_return cluster::abort_group_tx_reply{
-          .ec = cluster::tx_errc::partition_not_exists};
+          cluster::tx_errc::partition_not_exists};
     }
 
     auto leader_opt = _leaders.local().get_leader(ntp);
     if (!leader_opt) {
         vlog(cluster::txlog.warn, "can't find a leader for {}", ntp);
         co_return cluster::abort_group_tx_reply{
-          .ec = cluster::tx_errc::leader_not_found};
+          cluster::tx_errc::leader_not_found};
     }
     auto leader = leader_opt.value();
     auto _self = _controller->self();
 
     if (leader == _self) {
-        cluster::abort_group_tx_request req;
-        req.group_id = group_id;
-        req.pid = pid;
-        req.tx_seq = tx_seq;
-        req.timeout = timeout;
+        cluster::abort_group_tx_request req{
+          group_id,
+          pid,
+          tx_seq,
+          timeout,
+        };
         co_return co_await abort_group_tx_locally(std::move(req));
     }
 
@@ -602,11 +583,7 @@ rm_group_frontend::dispatch_abort_group_tx(
         [group_id, pid, tx_seq, timeout](
           cluster::tx_gateway_client_protocol cp) {
             return cp.abort_group_tx(
-              cluster::abort_group_tx_request{
-                .group_id = group_id,
-                .pid = pid,
-                .tx_seq = tx_seq,
-                .timeout = timeout},
+              cluster::abort_group_tx_request{group_id, pid, tx_seq, timeout},
               rpc::client_opts(model::timeout_clock::now() + timeout));
         })
       .then(&rpc::get_ctx_data<cluster::abort_group_tx_reply>)
@@ -616,8 +593,7 @@ rm_group_frontend::dispatch_abort_group_tx(
                 cluster::txlog.warn,
                 "got error {} on remote abort group tx",
                 r.error());
-              return cluster::abort_group_tx_reply{
-                .ec = cluster::tx_errc::timeout};
+              return cluster::abort_group_tx_reply{cluster::tx_errc::timeout};
           }
 
           return r.value();

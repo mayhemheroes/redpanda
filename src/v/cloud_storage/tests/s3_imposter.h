@@ -11,6 +11,8 @@
 #pragma once
 
 #include "cloud_storage/base_manifest.h"
+#include "config/configuration.h"
+#include "http/tests/registered_urls.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -33,6 +35,9 @@
 /// be retrieved using the GET request or deleted using the DELETE request.
 class s3_imposter_fixture {
 public:
+    uint16_t httpd_port_number();
+    static constexpr const char* httpd_host_name = "127.0.0.1";
+
     s3_imposter_fixture();
     ~s3_imposter_fixture();
 
@@ -60,12 +65,13 @@ public:
     set_expectations_and_listen(const std::vector<expectation>& expectations);
 
     /// Access all http requests ordered by time
-    const std::vector<ss::httpd::request>& get_requests() const;
+    const std::vector<http_test_utils::request_info>& get_requests() const;
 
     /// Access all http requests ordered by target url
-    const std::multimap<ss::sstring, ss::httpd::request>& get_targets() const;
+    const std::multimap<ss::sstring, http_test_utils::request_info>&
+    get_targets() const;
 
-    static s3::configuration get_configuration();
+    cloud_storage_clients::s3_configuration get_configuration();
 
 private:
     void set_routes(
@@ -76,7 +82,16 @@ private:
 
     std::unique_ptr<ss::httpd::handler_base> _handler;
     /// Contains saved requests
-    std::vector<ss::httpd::request> _requests;
+    std::vector<http_test_utils::request_info> _requests;
     /// Contains all accessed target urls
-    std::multimap<ss::sstring, ss::httpd::request> _targets;
+    std::multimap<ss::sstring, http_test_utils::request_info> _targets;
+};
+
+class enable_cloud_storage_fixture {
+public:
+    enable_cloud_storage_fixture();
+
+    ~enable_cloud_storage_fixture() {
+        config::shard_local_cfg().cloud_storage_enabled.set_value(false);
+    }
 };

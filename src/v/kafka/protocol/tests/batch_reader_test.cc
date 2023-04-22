@@ -14,8 +14,8 @@
 #include "kafka/protocol/exceptions.h"
 #include "kafka/protocol/kafka_batch_adapter.h"
 #include "model/fundamental.h"
+#include "model/tests/random_batch.h"
 #include "redpanda/tests/fixture.h"
-#include "storage/tests/utils/random_batch.h"
 
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/sstring.hh>
@@ -32,7 +32,7 @@ struct context {
 };
 
 context make_context(model::offset base_offset, size_t batch_count) {
-    auto input = storage::test::make_random_batches(base_offset, batch_count);
+    auto input = model::test::make_random_batches(base_offset, batch_count);
     BOOST_REQUIRE(!input.empty());
     const auto last_offset = input.back().last_offset();
 
@@ -128,7 +128,6 @@ SEASTAR_THREAD_TEST_CASE(consumer_records_consume_batch_fail_magic) {
 
     auto crs = kafka::batch_reader(std::move(ctx.record_set));
 
-    model::offset last_offset{};
     auto kba = crs.consume_batch();
     BOOST_REQUIRE(!kba.v2_format);
 }
@@ -140,7 +139,6 @@ SEASTAR_THREAD_TEST_CASE(consumer_records_consume_batch_fail_crc) {
 
     auto crs = kafka::batch_reader(std::move(ctx.record_set));
 
-    model::offset last_offset{};
     auto kba = crs.consume_batch();
     BOOST_REQUIRE(!kba.valid_crc);
 }
@@ -166,6 +164,7 @@ SEASTAR_THREAD_TEST_CASE(batch_reader_record_batch_reader_impl_fail_short_hdr) {
       std::move(ctx.record_set));
 
     BOOST_REQUIRE_EXCEPTION(
+      // NOLINTNEXTLINE(bugprone-use-after-move)
       model::consume_reader_to_memory(std::move(rdr), model::no_timeout).get(),
       kafka::exception,
       [](const kafka::exception& e) {
@@ -182,6 +181,7 @@ SEASTAR_THREAD_TEST_CASE(batch_reader_record_batch_reader_impl_fail_crc) {
       std::move(ctx.record_set));
 
     BOOST_REQUIRE_EXCEPTION(
+      // NOLINTNEXTLINE(bugprone-use-after-move)
       model::consume_reader_to_memory(std::move(rdr), model::no_timeout).get(),
       kafka::exception,
       [](const kafka::exception& e) {
@@ -199,6 +199,7 @@ SEASTAR_THREAD_TEST_CASE(batch_reader_record_batch_reader_impl_fail_lod) {
       std::move(ctx.record_set));
 
     BOOST_REQUIRE_EXCEPTION(
+      // NOLINTNEXTLINE(bugprone-use-after-move)
       model::consume_reader_to_memory(std::move(rdr), model::no_timeout).get(),
       kafka::exception,
       [](const kafka::exception& e) {
@@ -215,6 +216,7 @@ SEASTAR_THREAD_TEST_CASE(batch_reader_record_batch_reader_impl_fail_magic) {
       std::move(ctx.record_set));
 
     BOOST_REQUIRE_EXCEPTION(
+      // NOLINTNEXTLINE(bugprone-use-after-move)
       model::consume_reader_to_memory(std::move(rdr), model::no_timeout).get(),
       kafka::exception,
       [](const kafka::exception& e) {

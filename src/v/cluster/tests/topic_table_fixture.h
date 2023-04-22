@@ -12,6 +12,7 @@
 #pragma once
 
 #include "cluster/members_table.h"
+#include "cluster/partition_balancer_state.h"
 #include "cluster/scheduling/allocation_node.h"
 #include "cluster/scheduling/partition_allocator.h"
 #include "cluster/tests/utils.h"
@@ -20,17 +21,8 @@
 #include "test_utils/fixture.h"
 #include "units.h"
 
-static std::unique_ptr<cluster::allocation_node>
-create_allocation_node(model::node_id nid, uint32_t cores) {
-    return std::make_unique<cluster::allocation_node>(
-      nid,
-      cores,
-      absl::node_hash_map<ss::sstring, ss::sstring>{},
-      std::nullopt);
-}
-
-static void validate_delta(
-  const std::vector<cluster::topic_table::delta>& d,
+inline void validate_delta(
+  const fragmented_vector<cluster::topic_table::delta>& d,
   int new_partitions,
   int removed_partitions) {
     size_t additions = std::count_if(
@@ -46,6 +38,9 @@ static void validate_delta(
 }
 
 struct topic_table_fixture {
+    static constexpr uint32_t partitions_per_shard = 7000;
+    static constexpr uint32_t partitions_reserve_shard0 = 2;
+
     topic_table_fixture() {
         table.start().get0();
         members.start_single().get0();
@@ -54,7 +49,8 @@ struct topic_table_fixture {
             std::ref(members),
             config::mock_binding<std::optional<size_t>>(std::nullopt),
             config::mock_binding<std::optional<int32_t>>(std::nullopt),
-            config::mock_binding<size_t>(32_MiB),
+            config::mock_binding<uint32_t>(uint32_t{partitions_per_shard}),
+            config::mock_binding<uint32_t>(uint32_t{partitions_reserve_shard0}),
             config::mock_binding<bool>(false))
           .get0();
         allocator.local().register_node(
@@ -63,13 +59,26 @@ struct topic_table_fixture {
           create_allocation_node(model::node_id(2), 12));
         allocator.local().register_node(
           create_allocation_node(model::node_id(3), 4));
+        pb_state
+          .start_single(std::ref(table), std::ref(members), std::ref(allocator))
+          .get();
     }
 
     ~topic_table_fixture() {
+        pb_state.stop().get();
         table.stop().get0();
         allocator.stop().get0();
         members.stop().get0();
         as.request_abort();
+    }
+
+    static std::unique_ptr<cluster::allocation_node>
+    create_allocation_node(model::node_id nid, uint32_t cores) {
+        return std::make_unique<cluster::allocation_node>(
+          nid,
+          cores,
+          config::mock_binding<uint32_t>(uint32_t{partitions_per_shard}),
+          config::mock_binding<uint32_t>(uint32_t{partitions_reserve_shard0}));
     }
 
     cluster::topic_configuration_assignment make_tp_configuration(
@@ -77,7 +86,8 @@ struct topic_table_fixture {
         cluster::topic_configuration cfg(
           test_ns, model::topic(topic), partitions, replication_factor);
 
-        cluster::allocation_request req;
+        cluster::allocation_request req(
+          cluster::partition_allocation_domains::common);
         req.partitions.reserve(partitions);
         for (auto p = 0; p < partitions; ++p) {
             req.partitions.emplace_back(
@@ -86,8 +96,9 @@ struct topic_table_fixture {
 
         auto pas = allocator.local()
                      .allocate(std::move(req))
+                     .get()
                      .value()
-                     .get_assignments();
+                     ->get_assignments();
 
         return cluster::topic_configuration_assignment(cfg, std::move(pas));
     }
@@ -142,5 +153,6 @@ struct topic_table_fixture {
     ss::sharded<cluster::partition_allocator> allocator;
     ss::sharded<cluster::topic_table> table;
     ss::sharded<cluster::partition_leaders_table> leaders;
+    ss::sharded<cluster::partition_balancer_state> pb_state;
     ss::abort_source as;
 };

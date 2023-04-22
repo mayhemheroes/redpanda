@@ -82,8 +82,7 @@ ss::future<response_ptr> txn_offset_commit_handler::handle(
   request_context ctx, ss::smp_service_group ssg) {
     txn_offset_commit_request request;
     request.decode(ctx.reader(), ctx.header().version);
-
-    vlog(klog.trace, "Handling request {}", request);
+    log_request(ctx.header(), request);
 
     txn_offset_commit_ctx octx(std::move(ctx), std::move(request), ssg);
 
@@ -109,21 +108,16 @@ ss::future<response_ptr> txn_offset_commit_handler::handle(
         const auto topic_name = model::topic(it->name);
         model::topic_namespace_view tn(model::kafka_namespace, topic_name);
 
-        if (const auto& md = octx.rctx.metadata_cache().get_topic_metadata(tn);
-            md) {
+        if (octx.rctx.metadata_cache().contains(tn)) {
             /*
              * check if each partition exists
              */
             auto split = std::partition(
               it->partitions.begin(),
               it->partitions.end(),
-              [&md](const txn_offset_commit_request_partition& p) {
-                  return std::any_of(
-                    md->partitions.cbegin(),
-                    md->partitions.cend(),
-                    [&p](const model::partition_metadata& pmd) {
-                        return pmd.id == p.partition_index;
-                    });
+              [&octx, &tn](const txn_offset_commit_request_partition& p) {
+                  return octx.rctx.metadata_cache().contains(
+                    tn, p.partition_index);
               });
             /*
              * build responses for nonexistent topic partitions

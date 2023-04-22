@@ -12,6 +12,7 @@
 
 #include "bytes/iobuf_istreambuf.h"
 #include "bytes/iobuf_ostreambuf.h"
+#include "bytes/iostream.h"
 #include "cloud_storage/logger.h"
 #include "cloud_storage/types.h"
 #include "cluster/types.h"
@@ -24,6 +25,7 @@
 #include "json/writer.h"
 #include "model/compression.h"
 #include "model/fundamental.h"
+#include "model/metadata.h"
 #include "model/timestamp.h"
 
 #include <seastar/core/coroutine.hh>
@@ -156,7 +158,7 @@ struct topic_manifest_handler
     std::optional<model::initial_revision_id> _revision_id{};
 
     // optional fields
-    cluster::topic_properties _properties;
+    manifest_topic_configuration::topic_properties _properties;
     std::optional<ss::sstring> compaction_strategy_sv;
     std::optional<ss::sstring> timestamp_type_sv;
     std::optional<ss::sstring> compression_sv;
@@ -164,7 +166,7 @@ struct topic_manifest_handler
 };
 
 topic_manifest::topic_manifest(
-  const cluster::topic_configuration& cfg, model::initial_revision_id rev)
+  const manifest_topic_configuration& cfg, model::initial_revision_id rev)
   : _topic_config(cfg)
   , _rev(rev) {}
 
@@ -207,12 +209,12 @@ void topic_manifest::update(const topic_manifest_handler& handler) {
           fmt::format, "Missing _revision_id value in parsed topic manifest"));
     }
 
-    _topic_config = cluster::topic_configuration(
-      handler._namespace.value(),
-      handler._topic.value(),
-      handler._partition_count.value(),
-      handler._replication_factor.value());
-    _topic_config->properties = handler._properties;
+    _topic_config = manifest_topic_configuration{
+      .tp_ns = model::topic_namespace(
+        handler._namespace.value(), handler._topic.value()),
+      .partition_count = handler._partition_count.value(),
+      .replication_factor = handler._replication_factor.value(),
+      .properties = handler._properties};
 
     if (handler.compaction_strategy_sv) {
         try {
@@ -307,13 +309,19 @@ ss::future<> topic_manifest::update(ss::input_stream<char> is) {
     co_return;
 }
 
-serialized_json_stream topic_manifest::serialize() const {
+ss::future<serialized_json_stream> topic_manifest::serialize() const {
     iobuf serialized;
     iobuf_ostreambuf obuf(serialized);
     std::ostream os(&obuf);
     serialize(os);
+    if (!os.good()) {
+        throw std::runtime_error(fmt_with_ctx(
+          fmt::format,
+          "could not serialize topic manifest {}",
+          get_manifest_path()));
+    }
     size_t size_bytes = serialized.size_bytes();
-    return {
+    co_return serialized_json_stream{
       .stream = make_iobuf_input_stream(std::move(serialized)),
       .size_bytes = size_bytes};
 }
@@ -323,7 +331,7 @@ void topic_manifest::serialize(std::ostream& out) const {
     json::Writer<json::OStreamWrapper> w(wrapper);
     w.StartObject();
     w.Key("version");
-    w.Int(static_cast<int>(manifest_version::v1));
+    w.Int(static_cast<int>(topic_manifest_version));
     w.Key("namespace");
     w.String(_topic_config->tp_ns.ns());
     w.Key("topic");
@@ -380,7 +388,7 @@ void topic_manifest::serialize(std::ostream& out) const {
     // - key is not null - tristate is enabled and set
     if (!_topic_config->properties.retention_bytes.is_disabled()) {
         w.Key("retention_bytes");
-        if (_topic_config->properties.retention_bytes.has_value()) {
+        if (_topic_config->properties.retention_bytes.has_optional_value()) {
             w.Int64(_topic_config->properties.retention_bytes.value());
         } else {
             w.Null();
@@ -388,7 +396,7 @@ void topic_manifest::serialize(std::ostream& out) const {
     }
     if (!_topic_config->properties.retention_duration.is_disabled()) {
         w.Key("retention_duration");
-        if (_topic_config->properties.retention_duration.has_value()) {
+        if (_topic_config->properties.retention_duration.has_optional_value()) {
             w.Int64(
               _topic_config->properties.retention_duration.value().count());
         } else {

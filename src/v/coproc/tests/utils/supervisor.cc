@@ -312,7 +312,7 @@ ss::future<absl::node_hash_set<script_id>> supervisor::registered_scripts() {
       absl::node_hash_set<script_id>(),
       [](absl::node_hash_set<script_id> set, absl::node_hash_set<script_id> x) {
           set.merge(std::move(x));
-          return std::move(set);
+          return set;
       });
 }
 
@@ -320,10 +320,11 @@ ss::future<state_size_t>
 supervisor::heartbeat(empty_request&&, rpc::streaming_context&) {
     if (!*_delay_heartbeat.local()) {
         auto unique_scripts = co_await registered_scripts();
-        co_return state_size_t(unique_scripts.size());
+        co_return state_size_t{
+          .size = static_cast<int64_t>(unique_scripts.size())};
     }
     vlog(coproclog.warn, "Simulating node restart... heartbeat request");
-    co_return state_size_t(-1);
+    co_return state_size_t{.size = -1};
 }
 
 } // namespace coproc

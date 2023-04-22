@@ -31,7 +31,7 @@ static auto split_member_id(const ss::sstring& m) {
 static bool is_uuid(const ss::sstring& uuid) {
     try {
         boost::uuids::string_generator g;
-        auto _ = g(uuid.c_str());
+        g(uuid.c_str());
         return true;
     } catch (...) {
         return false;
@@ -45,12 +45,16 @@ static bool is_uuid(const ss::sstring& uuid) {
  */
 static group get() {
     static config::configuration conf;
+    ss::sharded<cluster::tx_gateway_frontend> fr;
+    ss::sharded<features::feature_table> feature_table;
     return group(
       kafka::group_id("g"),
       group_state::empty,
       conf,
       nullptr,
-      make_backward_compatible_serializer(),
+      fr,
+      feature_table,
+      make_consumer_offsets_serializer(),
       enable_group_metrics::no);
 }
 
@@ -63,7 +67,7 @@ static member_ptr get_group_member(
     return ss::make_lw_shared<group_member>(
       kafka::member_id(id),
       kafka::group_id("g"),
-      kafka::group_instance_id("i"),
+      kafka::group_instance_id(fmt::format("i-{}", id)),
       kafka::client_id("client-id"),
       kafka::client_host("client-host"),
       std::chrono::seconds(1),
@@ -167,7 +171,7 @@ SEASTAR_THREAD_TEST_CASE(rebalance_timeout) {
     auto m0 = ss::make_lw_shared<group_member>(
       kafka::member_id("m"),
       kafka::group_id("g"),
-      kafka::group_instance_id("i"),
+      kafka::group_instance_id("i-1"),
       kafka::client_id("client-id"),
       kafka::client_host("client-host"),
       std::chrono::seconds(1),
@@ -178,7 +182,7 @@ SEASTAR_THREAD_TEST_CASE(rebalance_timeout) {
     auto m1 = ss::make_lw_shared<group_member>(
       kafka::member_id("n"),
       kafka::group_id("g"),
-      kafka::group_instance_id("i"),
+      kafka::group_instance_id("i-2"),
       kafka::client_id("client-id"),
       kafka::client_host("client-host"),
       std::chrono::seconds(1),
@@ -382,7 +386,7 @@ SEASTAR_THREAD_TEST_CASE(supports_protocols) {
     auto m = ss::make_lw_shared<group_member>(
       kafka::member_id("m"),
       kafka::group_id("g"),
-      kafka::group_instance_id("i"),
+      kafka::group_instance_id("i-1"),
       kafka::client_id("client-id"),
       kafka::client_host("client-host"),
       std::chrono::seconds(1),
@@ -412,7 +416,7 @@ SEASTAR_THREAD_TEST_CASE(supports_protocols) {
     auto m2 = ss::make_lw_shared<group_member>(
       kafka::member_id("n"),
       kafka::group_id("g"),
-      kafka::group_instance_id("i"),
+      kafka::group_instance_id("i-2"),
       kafka::client_id("client-id"),
       kafka::client_host("client-host"),
       std::chrono::seconds(1),

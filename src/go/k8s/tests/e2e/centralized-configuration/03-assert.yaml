@@ -4,6 +4,9 @@ metadata:
   name: centralized-configuration
 status:
   restarting: true
-  conditions:
-    - type: ClusterConfigured
-      status: "False"
+---
+
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+collectors:
+  - command: ../../../hack/get-redpanda-info.sh

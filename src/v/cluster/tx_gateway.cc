@@ -14,6 +14,7 @@
 #include "cluster/tx_gateway_frontend.h"
 #include "cluster/types.h"
 #include "model/namespace.h"
+#include "model/record.h"
 #include "model/record_batch_reader.h"
 
 #include <seastar/core/coroutine.hh>
@@ -32,6 +33,12 @@ tx_gateway::tx_gateway(
   , _rm_group_proxy(group_proxy)
   , _rm_partition_frontend(rm_partition_frontend) {}
 
+ss::future<fetch_tx_reply>
+tx_gateway::fetch_tx(fetch_tx_request&& request, rpc::streaming_context&) {
+    return _tx_gateway_frontend.local().fetch_tx_locally(
+      request.tx_id, request.term, request.tm);
+}
+
 ss::future<try_abort_reply>
 tx_gateway::try_abort(try_abort_request&& request, rpc::streaming_context&) {
     return _tx_gateway_frontend.local().try_abort_locally(
@@ -40,14 +47,21 @@ tx_gateway::try_abort(try_abort_request&& request, rpc::streaming_context&) {
 
 ss::future<init_tm_tx_reply>
 tx_gateway::init_tm_tx(init_tm_tx_request&& request, rpc::streaming_context&) {
-    return _tx_gateway_frontend.local().init_tm_tx_locally(
-      request.tx_id, request.transaction_timeout_ms, request.timeout);
+    return _tx_gateway_frontend.local().init_tm_tx(
+      request.tx_id,
+      request.transaction_timeout_ms,
+      request.timeout,
+      model::unknown_pid);
 }
 
 ss::future<begin_tx_reply>
 tx_gateway::begin_tx(begin_tx_request&& request, rpc::streaming_context&) {
     return _rm_partition_frontend.local().begin_tx_locally(
-      request.ntp, request.pid, request.tx_seq, request.transaction_timeout_ms);
+      request.ntp,
+      request.pid,
+      request.tx_seq,
+      request.transaction_timeout_ms,
+      request.tm_partition);
 }
 
 ss::future<prepare_tx_reply>

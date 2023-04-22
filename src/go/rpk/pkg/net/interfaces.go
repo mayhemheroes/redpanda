@@ -13,12 +13,11 @@ import (
 	"net"
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/utils"
-	log "github.com/sirupsen/logrus"
+	"go.uber.org/zap"
 )
 
 func GetInterfacesByIps(addresses ...string) ([]string, error) {
-
-	log.Debugf("Looking for interface with '%v' addresses", addresses)
+	zap.L().Sugar().Debugf("Looking for interface with '%v' addresses", addresses)
 
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -31,7 +30,7 @@ func GetInterfacesByIps(addresses ...string) ([]string, error) {
 			return nil, err
 		}
 		for _, address := range addr {
-			log.Debugf("Checking '%s' address '%s'", iface.Name, address)
+			zap.L().Sugar().Debugf("Checking '%s' address '%s'", iface.Name, address)
 			for _, requestedAddr := range addresses {
 				if requestedAddr == "0.0.0.0" {
 					if (iface.Flags & net.FlagLoopback) == 0 {
@@ -45,7 +44,7 @@ func GetInterfacesByIps(addresses ...string) ([]string, error) {
 	return utils.GetKeys(nics), nil
 }
 
-func GetFreePort() (uint, error) {
+func getFreePort() (uint, error) {
 	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
 	if err != nil {
 		return 0, err
@@ -57,4 +56,20 @@ func GetFreePort() (uint, error) {
 	}
 	defer l.Close()
 	return uint(l.Addr().(*net.TCPAddr).Port), nil
+}
+
+func GetFreePortPool(n int) ([]uint, error) {
+	m := make(map[uint]struct{})
+	for len(m) != n {
+		p, err := getFreePort()
+		if err != nil {
+			return nil, err
+		}
+		m[p] = struct{}{}
+	}
+	var ports []uint
+	for port := range m {
+		ports = append(ports, port)
+	}
+	return ports, nil
 }

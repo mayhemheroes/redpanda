@@ -7,18 +7,19 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+from math import fabs
 from rptest.services.cluster import cluster
+from ducktape.mark import parametrize
 from ducktape.utils.util import wait_until
 
 from rptest.clients.kcl import KCL
-from rptest.clients.rpk import RpkTool
 from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST, SISettings
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.clients.types import TopicSpec
 from rptest.clients.rpk import RpkTool
 from rptest.util import (
     produce_until_segments,
-    wait_for_segments_removal,
+    wait_for_local_storage_truncate,
 )
 
 
@@ -27,6 +28,7 @@ class OffsetForLeaderEpochArchivalTest(RedpandaTest):
     Check offset for leader epoch handling
     """
     segment_size = 1 * (2 << 20)
+    local_retention = segment_size * 2
 
     def _produce(self, topic, msg_cnt):
         rpk = RpkTool(self.redpanda)
@@ -41,18 +43,39 @@ class OffsetForLeaderEpochArchivalTest(RedpandaTest):
                 "log_compaction_interval_ms": 1000
             },
             si_settings=SISettings(
+                test_context,
                 log_segment_size=OffsetForLeaderEpochArchivalTest.segment_size,
                 cloud_storage_cache_size=5 *
                 OffsetForLeaderEpochArchivalTest.segment_size))
 
+    def _alter_topic_retention_with_retry(self, topic):
+        rpk = RpkTool(self.redpanda)
+
+        def alter_and_verify():
+            try:
+                rpk.alter_topic_config(
+                    topic, TopicSpec.PROPERTY_RETENTION_LOCAL_TARGET_BYTES,
+                    OffsetForLeaderEpochArchivalTest.local_retention)
+
+                cfgs = rpk.describe_topic_configs(topic)
+                retention = int(
+                    cfgs[TopicSpec.PROPERTY_RETENTION_LOCAL_TARGET_BYTES][0])
+                return retention == OffsetForLeaderEpochArchivalTest.local_retention
+            except:
+                return False
+
+        wait_until(alter_and_verify, 15, 0.5)
+
     @cluster(num_nodes=3, log_allow_list=RESTART_LOG_ALLOW_LIST)
-    def test_querying_remote_partitions(self):
+    @parametrize(remote_reads=[False, True])
+    def test_querying_remote_partitions(self, remote_reads):
         topic = TopicSpec(redpanda_remote_read=True,
                           redpanda_remote_write=True)
         epoch_offsets = {}
         rpk = RpkTool(self.redpanda)
         self.client().create_topic(topic)
-        rpk.alter_topic_config(topic.name, "redpanda.remote.read", 'true')
+        rpk.alter_topic_config(topic.name, "redpanda.remote.read",
+                               str(remote_reads))
         rpk.alter_topic_config(topic.name, "redpanda.remote.write", 'true')
 
         def wait_for_topic():
@@ -77,12 +100,11 @@ class OffsetForLeaderEpochArchivalTest(RedpandaTest):
 
         wait_for_topic()
 
-        rpk.alter_topic_config(topic.name, TopicSpec.PROPERTY_RETENTION_BYTES,
-                               OffsetForLeaderEpochArchivalTest.segment_size)
-        wait_for_segments_removal(redpanda=self.redpanda,
-                                  topic=topic.name,
-                                  partition_idx=0,
-                                  count=7)
+        self._alter_topic_retention_with_retry(topic.name)
+
+        wait_for_local_storage_truncate(self.redpanda,
+                                        topic.name,
+                                        target_bytes=self.local_retention)
         kcl = KCL(self.redpanda)
 
         for epoch, offset in epoch_offsets.items():
@@ -92,4 +114,11 @@ class OffsetForLeaderEpochArchivalTest(RedpandaTest):
             self.logger.info(
                 f"epoch {epoch} end_offset: {epoch_end_offset}, expected offset: {offset}"
             )
-            assert epoch_end_offset == offset
+            if remote_reads:
+                assert epoch_end_offset == offset, f"{epoch_end_offset} vs {offset}"
+            else:
+                # Check that the returned offset isn't an invalid (-1) value,
+                # even if we read from an epoch that has been truncated locally
+                # and we can't read from cloud storage.
+                assert epoch_end_offset != -1, f"{epoch_end_offset} vs -1"
+                assert epoch_end_offset >= offset, f"{epoch_end_offset} vs {offset}"

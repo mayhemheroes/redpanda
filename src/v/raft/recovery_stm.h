@@ -18,8 +18,6 @@
 #include "storage/snapshot.h"
 #include "utils/prefix_logger.h"
 
-#include <seastar/core/semaphore.hh>
-
 #include <vector>
 
 namespace raft {
@@ -38,9 +36,9 @@ private:
     ss::future<> replicate(
       model::record_batch_reader&&,
       append_entries_request::flush_after_append,
-      ss::semaphore_units<>);
+      ssx::semaphore_units);
     ss::future<result<append_entries_reply>> dispatch_append_entries(
-      append_entries_request&&, std::vector<ss::semaphore_units<>>);
+      append_entries_request&&, std::vector<ssx::semaphore_units>);
     std::optional<follower_index_metadata*> get_follower_meta();
     clock_type::time_point append_entries_timeout();
 
@@ -68,6 +66,7 @@ private:
     // needed to early exit. (node down)
     bool _stop_requested = false;
     recovery_memory_quota& _memory_quota;
+    size_t _recovered_bytes_since_flush = 0;
 };
 
 } // namespace raft

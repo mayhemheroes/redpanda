@@ -10,6 +10,7 @@
 #include "storage/kvstore.h"
 
 #include "bytes/iobuf.h"
+#include "bytes/iostream.h"
 #include "config/configuration.h"
 #include "model/namespace.h"
 #include "prometheus/prometheus_sanitize.h"
@@ -30,8 +31,13 @@ static ss::logger lg("kvstore");
 
 namespace storage {
 
-kvstore::kvstore(kvstore_config kv_conf)
+kvstore::kvstore(
+  kvstore_config kv_conf,
+  storage_resources& resources,
+  ss::sharded<features::feature_table>& feature_table)
   : _conf(kv_conf)
+  , _resources(resources)
+  , _feature_table(feature_table)
   , _ntpc(model::kvstore_ntp(ss::this_shard_id()), _conf.base_dir)
   , _snap(
       std::filesystem::path(_ntpc.work_directory()),
@@ -66,7 +72,7 @@ ss::future<> kvstore::start() {
               "cached_bytes",
               [this] { return _probe.cached_bytes; },
               ss::metrics::description("Size of the database in memory")),
-            ss::metrics::make_derive(
+            ss::metrics::make_counter(
               "key_count",
               [this] { return _db.size(); },
               ss::metrics::description("Number of keys in the database")),
@@ -259,7 +265,9 @@ ss::future<> kvstore::roll() {
                  config::shard_local_cfg().storage_read_buffer_size(),
                  config::shard_local_cfg().storage_read_readahead_count(),
                  _conf.sanitize_fileops,
-                 std::nullopt)
+                 std::nullopt,
+                 _resources,
+                 _feature_table)
           .then([this](ss::lw_shared_ptr<segment> seg) {
               _segment = std::move(seg);
           });
@@ -286,8 +294,8 @@ ss::future<> kvstore::roll() {
                 lg.debug,
                 "Removing old segment with base offset {}",
                 seg->offsets().base_offset);
-              return ss::remove_file(seg->reader().filename()).then([seg] {
-                  return ss::remove_file(seg->index().filename());
+              return ss::remove_file(seg->reader().path().string()).then([seg] {
+                  return ss::remove_file(seg->index().path().string());
               });
           })
           .then([this] {
@@ -300,7 +308,9 @@ ss::future<> kvstore::roll() {
                        config::shard_local_cfg().storage_read_buffer_size(),
                        config::shard_local_cfg().storage_read_readahead_count(),
                        _conf.sanitize_fileops,
-                       std::nullopt)
+                       std::nullopt,
+                       _resources,
+                       _feature_table)
                 .then([this](ss::lw_shared_ptr<segment> seg) {
                     _segment = std::move(seg);
                 });
@@ -376,16 +386,18 @@ ss::future<> kvstore::recover() {
          */
         load_snapshot_in_thread();
 
-        auto dir = std::filesystem::path(_ntpc.work_directory());
         auto segments
           = recover_segments(
-              std::move(dir),
+              partition_path(_ntpc),
               debug_sanitize_files::yes,
               _ntpc.is_compacted(),
               [] { return std::nullopt; },
               _as,
               config::shard_local_cfg().storage_read_buffer_size(),
-              config::shard_local_cfg().storage_read_readahead_count())
+              config::shard_local_cfg().storage_read_readahead_count(),
+              std::nullopt,
+              _resources,
+              _feature_table)
               .get0();
 
         replay_segments_in_thread(std::move(segments));
@@ -506,12 +518,14 @@ void kvstore::replay_segments_in_thread(segment_set segs) {
           seg->offsets().base_offset,
           _next_offset);
 
-        auto input = seg->reader().data_stream(0, ss::default_priority_class());
+        auto reader_handle
+          = seg->reader().data_stream(0, ss::default_priority_class()).get();
         auto parser = std::make_unique<continuous_batch_parser>(
-          std::make_unique<replay_consumer>(this), std::move(input));
+          std::make_unique<replay_consumer>(this), std::move(reader_handle));
         auto p = parser.get();
         p->consume()
           .discard_result()
+          .then([p]() { return p->close(); })
           .finally([parser = std::move(parser)] {})
           .get();
 
@@ -528,8 +542,8 @@ void kvstore::replay_segments_in_thread(segment_set segs) {
           "Removing old segment with base offset {}",
           seg->offsets().base_offset);
         seg->close().get();
-        ss::remove_file(seg->reader().filename()).get();
-        ss::remove_file(seg->index().filename()).get();
+        ss::remove_file(seg->reader().path().string()).get();
+        ss::remove_file(seg->index().path().string()).get();
     }
 
     // close the rest

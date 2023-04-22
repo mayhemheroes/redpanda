@@ -9,28 +9,26 @@
 
 #include "storage/types.h"
 
+#include "storage/compacted_index.h"
+#include "storage/logger.h"
 #include "storage/ntp_config.h"
 #include "utils/human.h"
 #include "utils/to_string.h"
+#include "vlog.h"
 
 #include <fmt/core.h>
 #include <fmt/ostream.h>
 
 namespace storage {
 
-std::ostream& operator<<(std::ostream& o, const disk_space_alert d) {
-    switch (d) {
-    case disk_space_alert::ok:
-        o << "ok";
-        break;
-    case disk_space_alert::low_space:
-        o << "low_space";
-        break;
-    case disk_space_alert::degraded:
-        o << "degraded";
-        break;
+model::offset stm_manager::max_collectible_offset() {
+    model::offset result = model::offset::max();
+    for (const auto& stm : _stms) {
+        auto mco = stm->max_collectible_offset();
+        result = std::min(result, mco);
+        vlog(stlog.trace, "max_collectible_offset[{}] = {}", stm->name(), mco);
     }
-    return o;
+    return result;
 }
 
 std::ostream& operator<<(std::ostream& o, const disk& d) {
@@ -90,13 +88,19 @@ operator<<(std::ostream& o, const ntp_config::default_overrides& v) {
     fmt::print(
       o,
       "{{compaction_strategy: {}, cleanup_policy_bitflags: {}, segment_size: "
-      "{}, retention_bytes: {}, retention_time_ms: {}, recovery_enabled: {}}}",
+      "{}, retention_bytes: {}, retention_time_ms: {}, recovery_enabled: {}, "
+      "retention_local_target_bytes: {}, retention_local_target_ms: {}, "
+      "remote_delete: {}, segment_ms: {}}}",
       v.compaction_strategy,
       v.cleanup_policy_bitflags,
       v.segment_size,
       v.retention_bytes,
       v.retention_time,
-      v.recovery_enabled);
+      v.recovery_enabled,
+      v.retention_local_target_bytes,
+      v.retention_local_target_ms,
+      v.remote_delete,
+      v.segment_ms);
 
     return o;
 }
@@ -152,9 +156,11 @@ std::ostream& operator<<(std::ostream& o, const offset_stats& s) {
 std::ostream& operator<<(std::ostream& o, const compaction_config& c) {
     fmt::print(
       o,
-      "{{evicition_time:{}, max_bytes:{}, should_sanitize:{}}}",
+      "{{evicition_time:{}, max_bytes:{}, max_collectible_offset:{}, "
+      "should_sanitize:{}}}",
       c.eviction_time,
       c.max_bytes.value_or(-1),
+      c.max_collectible_offset,
       c.sanitize);
     return o;
 }
@@ -167,6 +173,21 @@ std::ostream& operator<<(std::ostream& o, const compaction_result& r) {
       r.size_before,
       r.size_after);
     return o;
+}
+
+std::ostream&
+operator<<(std::ostream& o, compacted_index::recovery_state state) {
+    switch (state) {
+    case compacted_index::recovery_state::index_missing:
+        return o << "index_missing";
+    case compacted_index::recovery_state::already_compacted:
+        return o << "already_compacted";
+    case compacted_index::recovery_state::index_needs_rebuild:
+        return o << "index_needs_rebuild";
+    case compacted_index::recovery_state::index_recovered:
+        return o << "index_recovered";
+    }
+    __builtin_unreachable();
 }
 
 } // namespace storage

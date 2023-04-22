@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "config/base_property.h"
 #include "config/property.h"
 
 namespace config {
@@ -68,6 +69,7 @@ struct numeric_bounds {
     std::optional<T> min = std::nullopt;
     std::optional<T> max = std::nullopt;
     std::optional<T> align = std::nullopt;
+    std::optional<odd_even_constraint> oddeven = std::nullopt;
 
     T clamp(T& original) {
         T result = original;
@@ -96,6 +98,14 @@ struct numeric_bounds {
         } else if (align.has_value() && value % align.value() != T{0}) {
             return fmt::format(
               "not aligned, must be aligned to nearest {}", align.value());
+        } else if (
+          oddeven.has_value() && oddeven.value() == odd_even_constraint::odd
+          && value % 2 == T{0}) {
+            return fmt::format("value must be odd");
+        } else if (
+          oddeven.has_value() && oddeven.value() == odd_even_constraint::even
+          && value % 2 == T{1}) {
+            return fmt::format("value must be even");
         }
         return std::nullopt;
     }
@@ -110,7 +120,8 @@ public:
       std::string_view desc,
       base_property::metadata meta,
       T def,
-      numeric_bounds<I> bounds)
+      numeric_bounds<I> bounds,
+      std::optional<legacy_default<T>> legacy = std::nullopt)
       : property<T>(
         conf,
         name,
@@ -121,7 +132,7 @@ public:
             // Extract inner value if we are an optional<>,
             // and pass through into numeric_bounds::validate
             using outer_type = std::decay_t<T>;
-            if constexpr (reflection::is_std_optional_v<outer_type>) {
+            if constexpr (reflection::is_std_optional<outer_type>) {
                 if (new_value.has_value()) {
                     return _bounds.validate(new_value.value());
                 } else {
@@ -131,7 +142,8 @@ public:
             } else {
                 return _bounds.validate(new_value);
             }
-        })
+        },
+        legacy)
       , _bounds(bounds)
       , _example(generate_example()) {}
 
@@ -147,7 +159,7 @@ public:
         // rather than via admin API.
 
         // If T is a std::optional, then need to unpack the value.
-        if constexpr (reflection::is_std_optional_v<outer_type>) {
+        if constexpr (reflection::is_std_optional<outer_type>) {
             if (val.has_value()) {
                 return property<T>::update_value(
                   std::move(_bounds.clamp(val.value())));
@@ -189,7 +201,7 @@ private:
                 guess -= guess % _bounds.align.value();
             }
         } else {
-            if constexpr (reflection::is_std_optional_v<T>) {
+            if constexpr (reflection::is_std_optional<T>) {
                 if (property<T>::_default.has_value()) {
                     guess = property<T>::_default.value();
                 } else {

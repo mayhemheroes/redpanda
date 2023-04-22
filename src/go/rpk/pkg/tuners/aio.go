@@ -15,12 +15,14 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/executors"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/executors/commands"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/utils"
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
+	"go.uber.org/zap"
 )
 
-const maxAIOEvents = 1048576
-const maxAIOEventsFile = "/proc/sys/fs/aio-max-nr"
+const (
+	maxAIOEvents     = 1048576
+	maxAIOEventsFile = "/proc/sys/fs/aio-max-nr"
+)
 
 func NewMaxAIOEventsChecker(fs afero.Fs) Checker {
 	return NewIntChecker(
@@ -43,7 +45,7 @@ func NewMaxAIOEventsTuner(fs afero.Fs, executor executors.Executor) Tunable {
 	return NewCheckedTunable(
 		NewMaxAIOEventsChecker(fs),
 		func() TuneResult {
-			log.Debugf("Setting max AIO events to %d", maxAIOEvents)
+			zap.L().Sugar().Debugf("Setting max AIO events to %d", maxAIOEvents)
 			err := executor.Execute(
 				commands.NewWriteFileCmd(
 					fs,

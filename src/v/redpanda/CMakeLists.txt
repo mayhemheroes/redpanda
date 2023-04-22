@@ -9,7 +9,10 @@ set(swags
   partition
   hbadger
   transaction
-  debug)
+  cluster
+  debug
+  usage
+  shadow_indexing)
 
 set(swag_files)
 foreach(swag ${swags})
@@ -22,13 +25,25 @@ foreach(swag ${swags})
   list(APPEND swag_files ${${swag}_swagger_files})
 endforeach()
 
+# Client facing utilities
+v_cc_library(
+  NAME clientutil
+  SRCS
+    cluster_config_schema_util.cc
+    ${cluster_config_swagger_files}
+  DEPS
+    v::config
+)
+
 v_cc_library(
   NAME application
-  SRCS 
+  SRCS
     ${swag_files}
+    cluster_config_schema_util.cc
     admin_server.cc
-    request_auth.cc
+    cli_parser.cc
     application.cc
+    monitor_unsafe_log_flag.cc
   DEPS
     Seastar::seastar
     v::cluster
@@ -37,12 +52,13 @@ v_cc_library(
     v::coproc
     v::pandaproxy_rest
     v::pandaproxy_schema_registry
-    v::archival
+    v::migrations
   )
 
+add_subdirectory(tests)
+
 add_executable(redpanda
-    main.cc
-  )
+    main.cc)
 target_link_libraries(redpanda PUBLIC v::application v::raft v::kafka)
 set_property(TARGET redpanda PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -53,4 +69,5 @@ if(CMAKE_BUILD_TYPE MATCHES Release)
     set_property(TARGET redpanda PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
   endif()
 endif()
+
 install(TARGETS redpanda DESTINATION bin)

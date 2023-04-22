@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "model/fundamental.h"
 #include "model/metadata.h"
 #include "raft/follower_queue.h"
 #include "raft/types.h"
@@ -54,7 +55,8 @@ public:
     }
 
     iterator emplace(vnode n, follower_index_metadata m) {
-        auto [it, success] = _followers.insert_or_assign(n, std::move(m));
+        _followers.erase(n);
+        auto [it, success] = _followers.emplace(n, std::move(m));
         vassert(success, "could not insert node:{}", n);
         return it;
     }
@@ -69,11 +71,17 @@ public:
 
     size_t size() const { return _followers.size(); }
 
-    ss::future<ss::semaphore_units<>> get_append_entries_unit(vnode);
+    ss::future<ssx::semaphore_units> get_append_entries_unit(vnode);
 
     void return_append_entries_units(vnode);
 
     void update_with_configuration(const group_configuration&);
+
+    void reset() {
+        for (auto& [_, meta] : _followers) {
+            meta.reset();
+        }
+    }
 
 private:
     friend std::ostream& operator<<(std::ostream&, const follower_stats&);

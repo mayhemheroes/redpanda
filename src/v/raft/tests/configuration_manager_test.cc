@@ -10,6 +10,7 @@
 #include "config/configuration.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
+#include "model/tests/randoms.h"
 #include "raft/configuration_manager.h"
 #include "raft/group_configuration.h"
 #include "raft/logger.h"
@@ -36,38 +37,46 @@ using namespace std::chrono_literals; // NOLINT
 struct config_manager_fixture {
     config_manager_fixture()
       : _storage(storage::api(
-        std::move([this]() {
+        [this] {
             return storage::kvstore_config(
               100_MiB,
               config::mock_binding(std::chrono::milliseconds(10)),
               base_dir,
               storage::debug_sanitize_files::yes);
-        }),
+        },
         [this]() {
             return storage::log_config(
-              storage::log_config::storage_type::disk,
-              base_dir,
-              100_MiB,
-              storage::debug_sanitize_files::yes);
-        }))
+              base_dir, 100_MiB, storage::debug_sanitize_files::yes);
+        },
+        _feature_table))
       , _logger(
           raft::group_id(1),
           model::ntp(model::ns("t"), model::topic("t"), model::partition_id(0)))
       , _cfg_mgr(
-          raft::group_configuration({}, model::revision_id(0)),
+          raft::group_configuration(
+            std::vector<raft::vnode>{}, model::revision_id(0)),
           raft::group_id(1),
           _storage,
           _logger) {
+        _feature_table.start().get();
+        _feature_table
+          .invoke_on_all(
+            [](features::feature_table& f) { f.testing_activate_all(); })
+          .get();
         _storage.start().get0();
     }
 
     ss::sstring base_dir = "test_cfg_manager_"
                            + random_generators::gen_alphanum_string(6);
+    ss::sharded<features::feature_table> _feature_table;
     storage::api _storage;
     raft::ctx_log _logger;
     raft::configuration_manager _cfg_mgr;
 
-    ~config_manager_fixture() { _storage.stop().get0(); }
+    ~config_manager_fixture() {
+        _feature_table.stop().get();
+        _storage.stop().get0();
+    }
 
     raft::group_configuration random_configuration() {
         std::vector<model::broker> nodes;
@@ -75,10 +84,10 @@ struct config_manager_fixture {
         std::vector<model::broker> learners;
         learners.reserve(2);
         for (auto i = 0; i < 3; ++i) {
-            nodes.push_back(tests::random_broker(i, i));
+            nodes.push_back(model::random_broker(i, i));
         }
         for (auto i = 0; i < 2; ++i) {
-            learners.push_back(tests::random_broker(i, i));
+            learners.push_back(model::random_broker(i, i));
         }
         return raft::group_configuration(
           std::move(nodes), model::revision_id(0));
@@ -104,7 +113,8 @@ struct config_manager_fixture {
 
     void validate_recovery() {
         raft::configuration_manager recovered(
-          raft::group_configuration({}, model::revision_id(0)),
+          raft::group_configuration(
+            std::vector<raft::vnode>{}, model::revision_id(0)),
           raft::group_id(1),
           _storage,
           _logger);
@@ -146,11 +156,13 @@ FIXTURE_TEST(test_getting_configurations, config_manager_fixture) {
     BOOST_REQUIRE_EQUAL(
       _cfg_mgr.get_highest_known_offset(), model::offset(1254));
     validate_recovery();
-    _cfg_mgr
-      .maybe_store_highest_known_offset(
-        model::offset(10000),
-        raft::configuration_manager::offset_update_treshold + 1_KiB)
-      .get0();
+
+    ss::gate gate;
+    _cfg_mgr.maybe_store_highest_known_offset_in_background(
+      model::offset(10000),
+      raft::configuration_manager::offset_update_treshold + 1_KiB,
+      gate);
+    gate.close().get();
 
     validate_recovery();
     BOOST_REQUIRE_EQUAL(
@@ -237,7 +249,8 @@ FIXTURE_TEST(test_start_write_concurrency, config_manager_fixture) {
     auto configurations = test_configurations();
 
     raft::configuration_manager new_cfg_manager(
-      raft::group_configuration({}, model::revision_id(1)),
+      raft::group_configuration(
+        std::vector<raft::vnode>{}, model::revision_id(1)),
       raft::group_id(1),
       _storage,
       _logger);
@@ -267,7 +280,7 @@ FIXTURE_TEST(test_assigning_initial_revision, config_manager_fixture) {
 
     raft::configuration_manager mgr(
       raft::group_configuration(
-        {tests::random_broker(0, 0), tests::random_broker(1, 1)},
+        {model::random_broker(0, 0), model::random_broker(1, 1)},
         raft::group_nodes{
           .voters = {raft::vnode(model::node_id(0), raft::no_revision)},
           .learners = {raft::vnode(model::node_id(1), raft::no_revision)},

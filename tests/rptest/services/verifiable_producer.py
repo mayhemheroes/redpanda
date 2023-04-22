@@ -220,22 +220,30 @@ class VerifiableProducer(BackgroundThreadService):
                 with self.lock:
                     if data["name"] == "producer_send_error":
                         data["node"] = idx
-                        self.not_acked_values.append(
-                            self.message_validator(data["value"]))
+                        value = self.message_validator(data["value"])
+                        key = data["key"]
+                        self.not_acked_values.append((key, value))
                         self.produced_count[idx] += 1
 
                     elif data["name"] == "producer_send_success":
                         partition = TopicPartition(data["topic"],
                                                    data["partition"])
                         value = self.message_validator(data["value"])
-                        self.acked_values.append(value)
+                        key = data["key"]
+                        self.acked_values.append((key, value))
 
                         if partition not in self.acked_values_by_partition:
                             self.acked_values_by_partition[partition] = []
                         self.acked_values_by_partition[partition].append(value)
 
-                        self._last_acked_offsets[partition] = data["offset"]
                         self.produced_count[idx] += 1
+
+                        # Completions are not guaranteed to be called in-order wrt offsets,
+                        # even if there is only one producer, so we must handle situation
+                        # where we see an offset lower than what we already recorded as highest.
+                        self._last_acked_offsets[partition] = max(
+                            data["offset"],
+                            self._last_acked_offsets.get(partition, 0))
 
                         # Log information if there is a large gap between successively acknowledged messages
                         t = time.time()

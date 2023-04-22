@@ -36,15 +36,13 @@ public:
       ss::sharded<controller_stm>&,
       ss::sharded<rpc::connection_cache>&,
       ss::sharded<partition_leaders_table>&,
-      ss::sharded<feature_table>&,
+      ss::sharded<features::feature_table>&,
       ss::sharded<ss::abort_source>&);
-
-    ss::future<> start();
-    ss::future<> stop();
 
     ss::future<std::error_code> decommission_node(model::node_id);
     ss::future<std::error_code> recommission_node(model::node_id);
     ss::future<std::error_code> finish_node_reallocations(model::node_id);
+    ss::future<std::error_code> remove_node(model::node_id);
 
     ss::future<std::error_code>
     set_maintenance_mode(model::node_id, bool enabled);
@@ -53,7 +51,11 @@ private:
     template<typename T>
     ss::future<std::error_code> do_replicate_node_command(model::node_id id) {
         return replicate_and_wait(
-          _stm, _as, T(id, 0), _node_op_timeout + model::timeout_clock::now());
+          _stm,
+          _feature_table,
+          _as,
+          T(id, 0),
+          _node_op_timeout + model::timeout_clock::now());
     }
 
     model::node_id _self;
@@ -61,7 +63,7 @@ private:
     ss::sharded<controller_stm>& _stm;
     ss::sharded<rpc::connection_cache>& _connections;
     ss::sharded<partition_leaders_table>& _leaders;
-    ss::sharded<feature_table>& _feature_table;
+    ss::sharded<features::feature_table>& _feature_table;
     ss::sharded<ss::abort_source>& _as;
 };
 } // namespace cluster

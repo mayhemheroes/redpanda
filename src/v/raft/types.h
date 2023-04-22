@@ -44,13 +44,32 @@ static constexpr clock_type::time_point no_timeout
   = clock_type::time_point::max();
 
 using group_id = named_type<int64_t, struct raft_group_id_type>;
-struct protocol_metadata {
+
+struct protocol_metadata
+  : serde::
+      envelope<protocol_metadata, serde::version<0>, serde::compat_version<0>> {
     group_id group;
     model::offset commit_index;
     model::term_id term;
     model::offset prev_log_index;
     model::term_id prev_log_term;
     model::offset last_visible_index;
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const protocol_metadata& m);
+
+    friend bool operator==(const protocol_metadata&, const protocol_metadata&)
+      = default;
+
+    auto serde_fields() {
+        return std::tie(
+          group,
+          commit_index,
+          term,
+          prev_log_index,
+          prev_log_term,
+          last_visible_index);
+    }
 };
 
 // The sequence used to track the order of follower append entries request
@@ -63,7 +82,9 @@ struct follower_index_metadata {
     follower_index_metadata(const follower_index_metadata&) = delete;
     follower_index_metadata& operator=(const follower_index_metadata&) = delete;
     follower_index_metadata(follower_index_metadata&&) = default;
-    follower_index_metadata& operator=(follower_index_metadata&&) = default;
+    follower_index_metadata& operator=(follower_index_metadata&&) = delete;
+    // resets the follower state i.e. all indicies and sequence numbers
+    void reset();
 
     vnode node_id;
     // index of last known log for this follower
@@ -80,8 +101,8 @@ struct follower_index_metadata {
     model::offset next_index;
     model::offset last_sent_offset;
     // timestamp of last append_entries_rpc call
-    clock_type::time_point last_sent_append_entries_req_timesptamp;
-    clock_type::time_point last_received_append_entries_reply_timestamp;
+    clock_type::time_point last_sent_append_entries_req_timestamp;
+    clock_type::time_point last_received_reply_timestamp;
     uint32_t heartbeats_failed{0};
     // The pair of sequences used to track append entries requests sent and
     // received by the follower. Every time append entries request is created
@@ -131,6 +152,8 @@ struct follower_index_metadata {
 
     follower_req_seq last_sent_seq{0};
     follower_req_seq last_received_seq{0};
+    // sequence number of last received successfull append entries request
+    follower_req_seq last_successful_received_seq{0};
     bool is_learner = true;
     bool is_recovering = false;
 
@@ -153,6 +176,9 @@ struct follower_index_metadata {
      */
     heartbeats_suppressed suppress_heartbeats = heartbeats_suppressed::no;
     follower_req_seq last_suppress_heartbeats_seq{0};
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const follower_index_metadata& i);
 };
 /**
  * class containing follower statistics, this may be helpful for debugging,
@@ -169,8 +195,19 @@ struct follower_metrics {
     bool under_replicated;
 };
 
-struct append_entries_request {
+struct append_entries_request
+  : serde::envelope<
+      append_entries_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
     using flush_after_append = ss::bool_class<struct flush_after_append_tag>;
+
+    /*
+     * default initialize with no record batch reader. default construction
+     * should only be used by serialization frameworks.
+     */
+    append_entries_request() noexcept = default;
 
     // required for the cases where we will set the target node id before
     // sending request to the node
@@ -181,8 +218,8 @@ struct append_entries_request {
       flush_after_append f = flush_after_append::yes) noexcept
       : node_id(src)
       , meta(m)
-      , batches(std::move(r))
-      , flush(f){};
+      , flush(f)
+      , _batches(std::move(r)) {}
 
     append_entries_request(
       vnode src,
@@ -193,8 +230,8 @@ struct append_entries_request {
       : node_id(src)
       , target_node_id(target)
       , meta(m)
-      , batches(std::move(r))
-      , flush(f){};
+      , flush(f)
+      , _batches(std::move(r)) {}
     ~append_entries_request() noexcept = default;
     append_entries_request(const append_entries_request&) = delete;
     append_entries_request& operator=(const append_entries_request&) = delete;
@@ -203,23 +240,69 @@ struct append_entries_request {
     operator=(append_entries_request&&) noexcept = default;
 
     raft::group_id target_group() const { return meta.group; }
+    vnode source_node() const { return node_id; }
     vnode target_node() const { return target_node_id; }
     vnode node_id;
     vnode target_node_id;
     protocol_metadata meta;
-    model::record_batch_reader batches;
+    model::record_batch_reader& batches() {
+        /*
+         * note that some call sites do:
+         *
+         *   auto b = std::move(req.batches())
+         *
+         * which does not reset the std::optional value. so this assertion is
+         * merely here to protect against use of a default constructed request.
+         */
+        vassert(_batches.has_value(), "request contains no batches");
+        return _batches.value();
+    }
     flush_after_append flush;
     static append_entries_request make_foreign(append_entries_request&& req) {
         return append_entries_request(
           req.node_id,
           req.target_node_id,
           std::move(req.meta),
-          model::make_foreign_record_batch_reader(std::move(req.batches)),
+          model::make_foreign_record_batch_reader(std::move(req.batches())),
           req.flush);
     }
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const append_entries_request& r) {
+        fmt::print(
+          o,
+          "node_id {} target_node_id {} meta {} batches {}",
+          r.node_id,
+          r.target_node_id,
+          r.meta,
+          r._batches);
+        return o;
+    }
+
+    ss::future<> serde_async_write(iobuf& out);
+    ss::future<> serde_async_read(iobuf_parser&, const serde::header);
+
+private:
+    /*
+     * batches is optional to allow append_entries_request to have a default
+     * constructor and integrate with serde until serde provides a more powerful
+     * interface for dealing with this.
+     */
+    std::optional<model::record_batch_reader> _batches;
 };
 
-struct append_entries_reply {
+/*
+ * append_entries_reply uses two different types of serialization: when
+ * encoding/decoding directly normal adl/serde per-field serialization is used.
+ * the second type is a custom encoding used by heartbeat_reply for more
+ * efficient encoding of a vectory of append_entries_reply.
+ */
+struct append_entries_reply
+  : serde::envelope<
+      append_entries_reply,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
     enum class status : uint8_t {
         success,
         failure,
@@ -243,12 +326,34 @@ struct append_entries_reply {
     model::offset last_term_base_offset;
     /// \brief did the rpc succeed or not
     status result = status::failure;
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const append_entries_reply& r);
+
+    friend bool
+    operator==(const append_entries_reply&, const append_entries_reply&)
+      = default;
+
+    auto serde_fields() {
+        return std::tie(
+          target_node_id,
+          node_id,
+          group,
+          term,
+          last_flushed_log_index,
+          last_dirty_log_index,
+          last_term_base_offset,
+          result);
+    }
 };
 
 struct heartbeat_metadata {
     protocol_metadata meta;
     vnode node_id;
     vnode target_node_id;
+
+    friend bool operator==(const heartbeat_metadata&, const heartbeat_metadata&)
+      = default;
 };
 
 /// \brief this is our _biggest_ modification to how raft works
@@ -257,14 +362,48 @@ struct heartbeat_metadata {
 /// at a time, as well as the receiving side will trigger the
 /// individual raft responses one at a time - for example to start replaying the
 /// log at some offset
-struct heartbeat_request {
+struct heartbeat_request
+  : serde::
+      envelope<heartbeat_request, serde::version<0>, serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
     std::vector<heartbeat_metadata> heartbeats;
-};
-struct heartbeat_reply {
-    std::vector<append_entries_reply> meta;
+
+    heartbeat_request() noexcept = default;
+    explicit heartbeat_request(std::vector<heartbeat_metadata> heartbeats)
+      : heartbeats(std::move(heartbeats)) {}
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const heartbeat_request& r);
+
+    friend bool operator==(const heartbeat_request&, const heartbeat_request&)
+      = default;
+
+    ss::future<> serde_async_write(iobuf& out);
+    void serde_read(iobuf_parser&, const serde::header&);
 };
 
-struct vote_request {
+struct heartbeat_reply
+  : serde::
+      envelope<heartbeat_reply, serde::version<0>, serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
+    std::vector<append_entries_reply> meta;
+
+    heartbeat_reply() noexcept = default;
+    explicit heartbeat_reply(std::vector<append_entries_reply> meta)
+      : meta(std::move(meta)) {}
+
+    friend std::ostream& operator<<(std::ostream& o, const heartbeat_reply& r);
+
+    friend bool operator==(const heartbeat_reply&, const heartbeat_reply&)
+      = default;
+
+    void serde_write(iobuf& out);
+    void serde_read(iobuf_parser&, const serde::header&);
+};
+
+struct vote_request
+  : serde::envelope<vote_request, serde::version<0>, serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
     vnode node_id;
     // node id to validate on receiver
     vnode target_node_id;
@@ -278,10 +417,28 @@ struct vote_request {
     /// \brief true if vote triggered by leadership transfer
     bool leadership_transfer;
     raft::group_id target_group() const { return group; }
+    vnode source_node() const { return node_id; }
     vnode target_node() const { return target_node_id; }
+
+    friend std::ostream& operator<<(std::ostream& o, const vote_request& r);
+
+    friend bool operator==(const vote_request&, const vote_request&) = default;
+
+    auto serde_fields() {
+        return std::tie(
+          node_id,
+          target_node_id,
+          group,
+          term,
+          prev_log_index,
+          prev_log_term,
+          leadership_transfer);
+    }
 };
 
-struct vote_reply {
+struct vote_reply
+  : serde::envelope<vote_reply, serde::version<1>, serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
     // node id to validate on receiver
     vnode target_node_id;
     /// \brief callee's term, for the caller to upate itself
@@ -294,6 +451,17 @@ struct vote_reply {
     /// - extension on raft. see Diego's phd dissertation, section 9.6
     /// - "Preventing disruptions when a server rejoins the cluster"
     bool log_ok = false;
+
+    // replying node
+    vnode node_id;
+
+    friend std::ostream& operator<<(std::ostream& o, const vote_reply& r);
+
+    friend bool operator==(const vote_reply&, const vote_reply&) = default;
+
+    auto serde_fields() {
+        return std::tie(target_node_id, term, granted, log_ok, node_id);
+    }
 };
 
 /// This structure is used by consensus to notify other systems about group
@@ -327,9 +495,19 @@ enum class consistency_level { quorum_ack, leader_ack, no_ack };
 
 struct replicate_options {
     explicit replicate_options(consistency_level l)
-      : consistency(l) {}
+      : consistency(l)
+      , timeout(std::nullopt) {}
+
+    replicate_options(consistency_level l, std::chrono::milliseconds timeout)
+      : consistency(l)
+      , timeout(timeout) {}
 
     consistency_level consistency;
+    std::optional<std::chrono::milliseconds> timeout;
+};
+
+struct transfer_leadership_options {
+    std::chrono::milliseconds recovery_timeout;
 };
 
 using offset_translator_delta = named_type<int64_t, struct ot_delta_tag>;
@@ -356,7 +534,12 @@ struct snapshot_metadata {
       "version is equal to 3, please change it accordignly");
 };
 
-struct install_snapshot_request {
+struct install_snapshot_request
+  : serde::envelope<
+      install_snapshot_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
     // node id to validate on receiver
     vnode target_node_id;
     // leader’s term
@@ -375,9 +558,26 @@ struct install_snapshot_request {
     bool done;
 
     raft::group_id target_group() const { return group; }
+    vnode source_node() const { return node_id; }
     vnode target_node() const { return target_node_id; }
     friend std::ostream&
     operator<<(std::ostream&, const install_snapshot_request&);
+
+    friend bool
+    operator==(const install_snapshot_request&, const install_snapshot_request&)
+      = default;
+
+    auto serde_fields() {
+        return std::tie(
+          target_node_id,
+          term,
+          group,
+          node_id,
+          last_included_index,
+          file_offset,
+          chunk,
+          done);
+    }
 };
 
 class install_snapshot_request_foreign_wrapper {
@@ -408,7 +608,12 @@ private:
     ptr_t _ptr;
 };
 
-struct install_snapshot_reply {
+struct install_snapshot_reply
+  : serde::envelope<
+      install_snapshot_reply,
+      serde::version<1>,
+      serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
     // node id to validate on receiver
     vnode target_node_id;
     // current term, for leader to update itself
@@ -421,12 +626,23 @@ struct install_snapshot_reply {
     //  as the value for byte_offset in the next request (most importantly,
     //  when a follower reboots, it returns 0 here and the leader starts at
     //  offset 0 in the next request).
-    uint64_t bytes_stored;
+    uint64_t bytes_stored = 0;
     // indicates if the request was successfull
     bool success = false;
 
+    // replying node
+    vnode node_id;
+
     friend std::ostream&
     operator<<(std::ostream&, const install_snapshot_reply&);
+
+    friend bool
+    operator==(const install_snapshot_reply&, const install_snapshot_reply&)
+      = default;
+
+    auto serde_fields() {
+        return std::tie(target_node_id, term, bytes_stored, success, node_id);
+    }
 };
 
 /**
@@ -443,7 +659,12 @@ struct write_snapshot_cfg {
     iobuf data;
 };
 
-struct timeout_now_request {
+struct timeout_now_request
+  : serde::envelope<
+      timeout_now_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
     // node id to validate on receiver
     vnode target_node_id;
 
@@ -452,28 +673,105 @@ struct timeout_now_request {
     model::term_id term;
 
     raft::group_id target_group() const { return group; }
+    vnode source_node() const { return node_id; }
     vnode target_node() const { return target_node_id; }
+
+    friend bool
+    operator==(const timeout_now_request&, const timeout_now_request&)
+      = default;
+
+    auto serde_fields() {
+        return std::tie(target_node_id, node_id, group, term);
+    }
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const timeout_now_request& r) {
+        fmt::print(
+          o,
+          "target_node_id {} node_id {} group {} term {}",
+          r.target_node_id,
+          r.node_id,
+          r.group,
+          r.term);
+        return o;
+    }
 };
 
-struct timeout_now_reply {
+struct timeout_now_reply
+  : serde::
+      envelope<timeout_now_reply, serde::version<0>, serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
     enum class status : uint8_t { success, failure };
     // node id to validate on receiver
     vnode target_node_id;
 
     model::term_id term;
     status result;
+
+    friend bool operator==(const timeout_now_reply&, const timeout_now_reply&)
+      = default;
+
+    auto serde_fields() { return std::tie(target_node_id, term, result); }
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const timeout_now_reply& r) {
+        fmt::print(
+          o,
+          "target_node_id {} term {} result {}",
+          r.target_node_id,
+          r.term,
+          static_cast<std::underlying_type_t<status>>(r.result));
+        return o;
+    }
 };
 
 // if not target is specified then the most up-to-date node will be selected
-struct transfer_leadership_request {
+struct transfer_leadership_request
+  : serde::envelope<
+      transfer_leadership_request,
+      serde::version<1>,
+      serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
     group_id group;
     std::optional<model::node_id> target;
+    std::optional<std::chrono::milliseconds> timeout;
+
     raft::group_id target_group() const { return group; }
+
+    friend bool operator==(
+      const transfer_leadership_request&, const transfer_leadership_request&)
+      = default;
+
+    auto serde_fields() { return std::tie(group, target, timeout); }
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const transfer_leadership_request& r) {
+        fmt::print(
+          o, "group {} target {} timeout {}", r.group, r.target, r.timeout);
+        return o;
+    }
 };
 
-struct transfer_leadership_reply {
+struct transfer_leadership_reply
+  : serde::envelope<
+      transfer_leadership_reply,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
     bool success{false};
     raft::errc result;
+
+    friend bool operator==(
+      const transfer_leadership_reply&, const transfer_leadership_reply&)
+      = default;
+
+    auto serde_fields() { return std::tie(success, result); }
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const transfer_leadership_reply& r) {
+        fmt::print(o, "success {} result {}", r.success, r.result);
+        return o;
+    }
 };
 
 // key types used to store data in key-value store
@@ -520,39 +818,22 @@ struct scheduling_config {
     ss::io_priority_class learner_recovery_iopc;
 };
 
-std::ostream& operator<<(std::ostream& o, const vnode& r);
 std::ostream& operator<<(std::ostream& o, const consistency_level& l);
-std::ostream& operator<<(std::ostream& o, const protocol_metadata& m);
-std::ostream& operator<<(std::ostream& o, const vote_reply& r);
 std::ostream& operator<<(std::ostream& o, const append_entries_reply::status&);
-std::ostream& operator<<(std::ostream& o, const append_entries_reply& r);
-std::ostream& operator<<(std::ostream& o, const vote_request& r);
-std::ostream& operator<<(std::ostream& o, const follower_index_metadata& i);
-std::ostream& operator<<(std::ostream& o, const heartbeat_request& r);
-std::ostream& operator<<(std::ostream& o, const heartbeat_reply& r);
+
+using with_learner_recovery_throttle
+  = ss::bool_class<struct with_recovery_throttle_tag>;
+
+using keep_snapshotted_log = ss::bool_class<struct keep_snapshotted_log_tag>;
+
 } // namespace raft
 
 namespace reflection {
-template<>
-struct async_adl<raft::append_entries_request> {
-    ss::future<> to(iobuf& out, raft::append_entries_request&& request);
-    ss::future<raft::append_entries_request> from(iobuf_parser& in);
-};
+
 template<>
 struct adl<raft::protocol_metadata> {
     void to(iobuf& out, raft::protocol_metadata request);
     raft::protocol_metadata from(iobuf_parser& in);
-};
-template<>
-struct async_adl<raft::heartbeat_request> {
-    ss::future<> to(iobuf& out, raft::heartbeat_request&& request);
-    ss::future<raft::heartbeat_request> from(iobuf_parser& in);
-};
-
-template<>
-struct async_adl<raft::heartbeat_reply> {
-    ss::future<> to(iobuf& out, raft::heartbeat_reply&& request);
-    ss::future<raft::heartbeat_reply> from(iobuf_parser& in);
 };
 
 template<>

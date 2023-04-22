@@ -23,7 +23,6 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/io_priority_class.hh>
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/with_scheduling_group.hh>
 
@@ -150,10 +149,12 @@ ss::future<> recovery_stm::do_recover(ss::io_priority_class iopc) {
         co_return;
     }
 
-    co_await replicate(
-      std::move(*reader),
-      should_flush(follower_committed_match_index),
-      std::move(read_memory_units));
+    auto flush = should_flush(follower_committed_match_index);
+    if (flush == append_entries_request::flush_after_append::yes) {
+        _recovered_bytes_since_flush = 0;
+    }
+
+    co_await replicate(std::move(*reader), flush, std::move(read_memory_units));
 
     meta = get_follower_meta();
 }
@@ -170,6 +171,8 @@ bool recovery_stm::state_changed() {
 
 append_entries_request::flush_after_append
 recovery_stm::should_flush(model::offset follower_committed_match_index) const {
+    constexpr size_t checkpoint_flush_size = 1_MiB;
+
     auto lstats = _ptr->_log.offsets();
 
     /**
@@ -179,7 +182,7 @@ recovery_stm::should_flush(model::offset follower_committed_match_index) const {
      * will be able to update committed_index up to the last offset
      * of last batch replicated with quorum_acks consistency level. Recovery STM
      * works outside of the Raft mutex. It is possible that it read batches that
-     * were appendend with quorum consistency level but the
+     * were appended with quorum consistency level but the
      * _last_quorum_replicated_index wasn't yet updated, hence we have to check
      * if last log append was executed with quorum write and if this is true
      * force the flush on follower.
@@ -191,9 +194,17 @@ recovery_stm::should_flush(model::offset follower_committed_match_index) const {
     const bool last_replicate_with_quorum = _ptr->_last_write_consistency_level
                                             == consistency_level::quorum_ack;
 
+    const bool is_last
+      = is_last_batch
+        && (follower_has_batches_to_commit || last_replicate_with_quorum);
+
+    // Flush every `checkpoint_flush_size` bytes recovered to ensure that the
+    // follower's stms can apply batches from the cache rather than disk.
+    const bool should_checkpoint_flush = _recovered_bytes_since_flush
+                                         >= checkpoint_flush_size;
+
     return append_entries_request::flush_after_append(
-      is_last_batch
-      && (follower_has_batches_to_commit || last_replicate_with_quorum));
+      is_last || should_checkpoint_flush);
 }
 
 ss::future<std::optional<model::record_batch_reader>>
@@ -219,29 +230,28 @@ recovery_stm::read_range_for_recovery(
     }
 
     vlog(_ctxlog.trace, "Reading batches, starting from: {}", start_offset);
-
-    // TODO: add timeout of maybe 1minute?
     auto reader = co_await _ptr->_log.make_reader(cfg);
-    auto batches = co_await model::consume_reader_to_memory(
-      std::move(reader), model::no_timeout);
+    try {
+        auto batches = co_await model::consume_reader_to_memory(
+          std::move(reader),
+          _ptr->_disk_timeout() + model::timeout_clock::now());
 
-    if (batches.empty()) {
-        vlog(_ctxlog.trace, "Read no batches for recovery, stopping");
-        _stop_requested = true;
-        co_return std::nullopt;
-    }
-    vlog(
-      _ctxlog.trace,
-      "Read batches in range [{},{}] for recovery",
-      batches.front().base_offset(),
-      batches.back().last_offset());
+        if (batches.empty()) {
+            vlog(_ctxlog.trace, "Read no batches for recovery, stopping");
+            _stop_requested = true;
+            co_return std::nullopt;
+        }
+        vlog(
+          _ctxlog.trace,
+          "Read batches in range [{},{}] for recovery",
+          batches.front().base_offset(),
+          batches.back().last_offset());
 
-    auto gap_filled_batches = details::make_ghost_batches_in_gaps(
-      start_offset, std::move(batches));
-    _base_batch_offset = gap_filled_batches.begin()->base_offset();
-    _last_batch_offset = gap_filled_batches.back().last_offset();
+        auto gap_filled_batches = details::make_ghost_batches_in_gaps(
+          start_offset, std::move(batches));
+        _base_batch_offset = gap_filled_batches.begin()->base_offset();
+        _last_batch_offset = gap_filled_batches.back().last_offset();
 
-    if (is_learner && _ptr->_recovery_throttle) {
         const auto size = std::accumulate(
           gap_filled_batches.cbegin(),
           gap_filled_batches.cend(),
@@ -249,15 +259,31 @@ recovery_stm::read_range_for_recovery(
           [](size_t acc, const auto& batch) {
               return acc + batch.size_bytes();
           });
-        co_await _ptr->_recovery_throttle->get()
-          .throttle(size)
-          .handle_exception_type([this](const ss::broken_semaphore&) {
-              vlog(_ctxlog.info, "Recovery throttling has stopped");
-          });
-    }
+        _recovered_bytes_since_flush += size;
 
-    co_return model::make_foreign_memory_record_batch_reader(
-      std::move(gap_filled_batches));
+        if (is_learner && _ptr->_recovery_throttle) {
+            vlog(
+              _ctxlog.trace,
+              "Requesting throttle for {} bytes, available in throttle: {}",
+              size,
+              _ptr->_recovery_throttle->get().available());
+            co_await _ptr->_recovery_throttle->get()
+              .throttle(size, _ptr->_as)
+              .handle_exception_type([this](const ss::broken_semaphore&) {
+                  vlog(_ctxlog.info, "Recovery throttling has stopped");
+              });
+        }
+
+        co_return model::make_foreign_memory_record_batch_reader(
+          std::move(gap_filled_batches));
+    } catch (const ss::timed_out_error& e) {
+        vlog(
+          _ctxlog.error,
+          "Timeout reading batches starting from {}. Stopping recovery",
+          start_offset);
+        _stop_requested = true;
+        co_return std::nullopt;
+    }
 }
 
 ss::future<> recovery_stm::open_snapshot_reader() {
@@ -288,10 +314,9 @@ ss::future<> recovery_stm::send_install_snapshot_request() {
             .chunk = std::move(chunk),
             .done = (_sent_snapshot_bytes + chunk_size) == _snapshot_size};
 
-          vlog(
-            _ctxlog.trace,
-            "Sending install snapshot request, last included index: {}",
-            req.last_included_index);
+          _sent_snapshot_bytes += chunk_size;
+
+          vlog(_ctxlog.trace, "sending install_snapshot request: {}", req);
           auto seq = _ptr->next_follower_sequence(_node_id);
           _ptr->update_suppress_heartbeats(
             _node_id, seq, heartbeats_suppressed::yes);
@@ -303,7 +328,7 @@ ss::future<> recovery_stm::send_install_snapshot_request() {
             .then([this](result<install_snapshot_reply> reply) {
                 return handle_install_snapshot_reply(
                   _ptr->validate_reply_target_node(
-                    "install_snapshot", std::move(reply)));
+                    "install_snapshot", reply, _node_id.id()));
             })
             .finally([this, seq] {
                 _ptr->update_suppress_heartbeats(
@@ -322,6 +347,7 @@ ss::future<> recovery_stm::close_snapshot_reader() {
 
 ss::future<> recovery_stm::handle_install_snapshot_reply(
   result<install_snapshot_reply> reply) {
+    vlog(_ctxlog.trace, "received install_snapshot reply: {}", reply);
     // snapshot delivery failed
     if (reply.has_error() || !reply.value().success) {
         // if snapshot delivery failed, stop recovery to update follower state
@@ -330,13 +356,13 @@ ss::future<> recovery_stm::handle_install_snapshot_reply(
         return close_snapshot_reader();
     }
     if (reply.value().term > _ptr->_term) {
-        return close_snapshot_reader().then(
-          [this, term = reply.value().term] { return _ptr->step_down(term); });
+        return close_snapshot_reader().then([this, term = reply.value().term] {
+            return _ptr->step_down(term, "snapshot response with greater term");
+        });
     }
-    _sent_snapshot_bytes = reply.value().bytes_stored;
 
     // we will send next chunk as a part of recovery loop
-    if (_sent_snapshot_bytes != _snapshot_size) {
+    if (reply.value().bytes_stored != _snapshot_size) {
         return ss::now();
     }
 
@@ -349,7 +375,7 @@ ss::future<> recovery_stm::handle_install_snapshot_reply(
 
     // snapshot received by the follower, continue with recovery
     (*meta)->match_index = _ptr->_last_snapshot_index;
-    (*meta)->next_index = details::next_offset(_ptr->_last_snapshot_index);
+    (*meta)->next_index = model::next_offset(_ptr->_last_snapshot_index);
     (*meta)->last_sent_offset = _ptr->_last_snapshot_index;
     return close_snapshot_reader();
 }
@@ -373,11 +399,11 @@ ss::future<> recovery_stm::install_snapshot() {
 ss::future<> recovery_stm::replicate(
   model::record_batch_reader&& reader,
   append_entries_request::flush_after_append flush,
-  ss::semaphore_units<> mem_units) {
+  ssx::semaphore_units mem_units) {
     // collect metadata for append entries request
     // last persisted offset is last_offset of batch before the first one in the
     // reader
-    auto prev_log_idx = details::prev_offset(_base_batch_offset);
+    auto prev_log_idx = model::prev_offset(_base_batch_offset);
     model::term_id prev_log_term;
 
     // get term for prev_log_idx batch
@@ -421,7 +447,7 @@ ss::future<> recovery_stm::replicate(
     auto seq = _ptr->next_follower_sequence(_node_id);
     _ptr->update_suppress_heartbeats(_node_id, seq, heartbeats_suppressed::yes);
     auto lstats = _ptr->_log.offsets();
-    std::vector<ss::semaphore_units<>> units;
+    std::vector<ssx::semaphore_units> units;
     units.push_back(std::move(mem_units));
     return dispatch_append_entries(std::move(r), std::move(units))
       .finally([this, seq] {
@@ -431,7 +457,7 @@ ss::future<> recovery_stm::replicate(
       .then([this, seq, dirty_offset = lstats.dirty_offset](auto r) {
           if (!r) {
               vlog(
-                _ctxlog.error,
+                _ctxlog.warn,
                 "recovery append entries error: {}",
                 r.error().message());
               _stop_requested = true;
@@ -452,7 +478,7 @@ ss::future<> recovery_stm::replicate(
               return;
           }
           // move the follower next index backward if recovery were not
-          // successfull
+          // successful
           //
           // Raft paper:
           // If AppendEntries fails because of log inconsistency: decrement
@@ -465,7 +491,7 @@ ss::future<> recovery_stm::replicate(
                   return;
               }
               meta.value()->next_index = std::max(
-                model::offset(0), details::prev_offset(_base_batch_offset));
+                model::offset(0), model::prev_offset(_base_batch_offset));
               meta.value()->last_sent_offset = model::offset{};
               vlog(
                 _ctxlog.trace,
@@ -480,18 +506,18 @@ clock_type::time_point recovery_stm::append_entries_timeout() {
 }
 
 ss::future<result<append_entries_reply>> recovery_stm::dispatch_append_entries(
-  append_entries_request&& r, std::vector<ss::semaphore_units<>> units) {
+  append_entries_request&& r, std::vector<ssx::semaphore_units> units) {
     _ptr->_probe.recovery_append_request();
 
     rpc::client_opts opts(append_entries_timeout());
     opts.resource_units = ss::make_foreign(
-      ss::make_lw_shared<std::vector<ss::semaphore_units<>>>(std::move(units)));
+      ss::make_lw_shared<std::vector<ssx::semaphore_units>>(std::move(units)));
 
     return _ptr->_client_protocol
       .append_entries(_node_id.id(), std::move(r), std::move(opts))
       .then([this](result<append_entries_reply> reply) {
           return _ptr->validate_reply_target_node(
-            "append_entries_recovery", std::move(reply));
+            "append_entries_recovery", reply, _node_id.id());
       });
 }
 
@@ -509,7 +535,7 @@ bool recovery_stm::is_recovery_finished() {
      */
     if (
       _ptr->_as.abort_requested() || _ptr->_bg.is_closed() || _stop_requested
-      || _term != _ptr->term() || !_ptr->is_leader()) {
+      || _term != _ptr->term() || !_ptr->is_elected_leader()) {
         return true;
     }
 

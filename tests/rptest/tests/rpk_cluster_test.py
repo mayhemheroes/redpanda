@@ -9,12 +9,16 @@
 
 import os
 import re
+import datetime
+import tempfile
 import zipfile
 import json
 
 from rptest.services.cluster import cluster
 from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST
+from rptest.util import expect_exception, get_cluster_license, get_second_cluster_license
 from ducktape.utils.util import wait_until
+from rptest.util import wait_until_result
 
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.clients.rpk import RpkTool, RpkException
@@ -55,10 +59,11 @@ class RpkClusterTest(RedpandaTest):
         # commands are run on redpanda nodes.
 
         working_dir = "/tmp"
+        file_path = os.path.join(working_dir, "bundle.zip")
         node = self.redpanda.nodes[0]
 
         rpk_remote = RpkRemoteTool(self.redpanda, node)
-        output = rpk_remote.debug_bundle(working_dir)
+        output = rpk_remote.debug_bundle(file_path)
         lines = output.split("\n")
 
         # On error, rpk bundle returns 0 but writes error description to stdout
@@ -94,16 +99,33 @@ class RpkClusterTest(RedpandaTest):
                 filtered_errors.append(l)
 
         assert not filtered_errors
-        assert output_file is not None
+        assert output_file == file_path
 
-        output_path = os.path.join(working_dir, output_file)
-        node.account.copy_from(output_path, working_dir)
+        node.account.copy_from(output_file, working_dir)
 
-        zf = zipfile.ZipFile(output_path)
+        zf = zipfile.ZipFile(output_file)
         files = zf.namelist()
         assert 'redpanda.yaml' in files
         assert 'redpanda.log' in files
-        assert 'prometheus-metrics.txt' in files
+
+        # At least the first controller log is being saved:
+        assert 'controller/0-1-v1.log' in files
+
+        # Cluster admin API calls:
+        assert 'admin/brokers.json' in files
+        assert 'admin/cluster_config.json' in files
+        assert 'admin/health_overview.json' in files
+
+        # Per-node admin API calls:
+        for n in self.redpanda.started_nodes():
+            # rpk will save 2 snapsots per metrics endpoint:
+            assert f'metrics/{n.account.hostname}-9644/t0_metrics.txt' in files
+            assert f'metrics/{n.account.hostname}-9644/t1_metrics.txt' in files
+            assert f'metrics/{n.account.hostname}-9644/t0_public_metrics.txt' in files
+            assert f'metrics/{n.account.hostname}-9644/t1_public_metrics.txt' in files
+            # and 1 cluster_view and node_config per node:
+            assert f'admin/cluster_view_{n.account.hostname}-9644.json' in files
+            assert f'admin/node_config_{n.account.hostname}-9644.json' in files
 
     @cluster(num_nodes=3)
     def test_get_config(self):
@@ -184,3 +206,94 @@ class RpkClusterTest(RedpandaTest):
             pass
         else:
             assert False, f"Unexpected success: '{r}'"
+
+    @cluster(num_nodes=3)
+    def test_upload_and_query_cluster_license_rpk(self):
+        """
+        Test uploading and retrieval of license via rpk
+        using --path option
+        """
+        license = get_cluster_license()
+        if license is None:
+            self.logger.info(
+                "Skipping test, REDPANDA_SAMPLE_LICENSE env var not found")
+            return
+
+        with tempfile.NamedTemporaryFile() as tf:
+            tf.write(bytes(license, 'UTF-8'))
+            tf.seek(0)
+            output = self._rpk.license_set(tf.name)
+            assert "Successfully uploaded license" in output
+
+        def obtain_license():
+            lic = self._rpk.license_info()
+            return (lic != "{}", lic)
+
+        rp_license = wait_until_result(
+            obtain_license,
+            timeout_sec=10,
+            backoff_sec=1,
+            retry_on_exc=True,
+            err_msg="unable to retrieve license information")
+
+        expected_license = {
+            'expires':
+            "Jul 11 2122",
+            'organization':
+            'redpanda-testing',
+            'type':
+            'enterprise',
+            'checksum_sha256':
+            '2730125070a934ca1067ed073d7159acc9975dc61015892308aae186f7455daf'
+        }
+        result = json.loads(rp_license)
+        assert expected_license == result, result
+
+        # Assert that a second put takes license
+        license = get_second_cluster_license()
+        output = self._rpk.license_set(None, license)
+        assert "Successfully uploaded license" in output
+
+        def obtain_new_license():
+            lic = self._rpk.license_info()
+            if lic is None or lic == "{}":
+                return False
+            result = json.loads(lic)
+            return result['organization'] == 'redpanda-testing-2'
+
+        wait_until(obtain_new_license,
+                   timeout_sec=10,
+                   backoff_sec=1,
+                   retry_on_exc=True,
+                   err_msg="unable to retrieve new license information")
+
+    @cluster(num_nodes=3)
+    def test_upload_cluster_license_rpk(self):
+        """
+        Test uploading of license via rpk
+        using inline license option
+        """
+        license = get_cluster_license()
+        if license is None:
+            self.logger.info(
+                "Skipping test, REDPANDA_SAMPLE_LICENSE env var not found")
+            return
+
+        output = self._rpk.license_set("", license)
+        assert "Successfully uploaded license" in output
+
+    @cluster(num_nodes=3)
+    def test_upload_cluster_license_error(self):
+        license = get_cluster_license()
+        if license is None:
+            self.logger.info(
+                "Skipping test, REDPANDA_SAMPLE_LICENSE env var not found")
+            return
+
+        with expect_exception(RpkException,
+                              lambda e: "License is malformed" in str(e)):
+            with tempfile.NamedTemporaryFile() as tf:
+                tf.write(bytes(license + 'r', 'UTF-8'))
+                tf.seek(0)
+
+                self._rpk.license_set(tf.name)

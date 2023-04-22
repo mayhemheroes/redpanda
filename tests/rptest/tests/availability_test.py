@@ -9,7 +9,6 @@
 
 import random
 
-from ducktape.mark import ok_to_fail
 from rptest.clients.default import DefaultClient
 from rptest.services.cluster import cluster
 from rptest.clients.types import TopicSpec
@@ -34,16 +33,18 @@ class AvailabilityTests(EndToEndFinjectorTest):
                             producer_timeout_sec=producer_timeout_sec,
                             consumer_timeout_sec=consumer_timeout_sec)
 
-    @ok_to_fail  # https://github.com/redpanda-data/redpanda/issues/3450
     @cluster(num_nodes=5, log_allow_list=CHAOS_LOG_ALLOW_LIST)
     def test_availability_when_one_node_failed(self):
         self.redpanda = RedpandaService(
             self.test_context,
             3,
             extra_rp_conf={
-                "enable_auto_rebalance_on_node_add": True,
+                "partition_autobalancing_mode": "node_add",
                 "group_topic_partitions": 1,
                 "default_topic_replications": 3,
+                # set disk timeout to value greater than max suspend time
+                # not to emit spurious errors
+                "raft_io_timeout_ms": 20000,
             })
 
         self.redpanda.start()
@@ -69,9 +70,12 @@ class AvailabilityTests(EndToEndFinjectorTest):
             self.test_context,
             3,
             extra_rp_conf={
-                "enable_auto_rebalance_on_node_add": True,
+                "partition_autobalancing_mode": "node_add",
                 "group_topic_partitions": 1,
                 "default_topic_replications": 3,
+                # set disk timeout to value greater than max suspend time
+                # not to emit spurious errors
+                "raft_io_timeout_ms": 20000,
             })
 
         self.redpanda.start()

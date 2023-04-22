@@ -18,6 +18,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	deadline   string = "deadline"
+	fScheduler string = "/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue/scheduler"
+)
+
 type deviceFeaturesMock struct {
 	disk.DeviceFeatures
 	getSupportedSchedulers   func(string) ([]string, error)
@@ -69,22 +74,22 @@ func TestDeviceSchedulerTuner_Tune(t *testing.T) {
 	// given
 	deviceFeatures := &deviceFeaturesMock{
 		getSchedulerFeatureFile: func(string) (string, error) {
-			return "/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue/scheduler", nil
+			return fScheduler, nil
 		},
 		getScheduler: func(string) (string, error) {
-			return "deadline", nil
+			return deadline, nil
 		},
 		getSupportedSchedulers: func(string) ([]string, error) {
 			return []string{"deadline", "cfq", "noop"}, nil
 		},
 	}
 	fs := afero.NewMemMapFs()
-	fs.MkdirAll("/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue", 0644)
+	fs.MkdirAll("/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue", 0o644)
 	tuner := NewDeviceSchedulerTuner(fs, "fake", deviceFeatures, executors.NewDirectExecutor())
 	// when
 	tuner.Tune()
 	// then
-	setValue, _ := afero.ReadFile(fs, "/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue/scheduler")
+	setValue, _ := afero.ReadFile(fs, fScheduler)
 	require.Equal(t, "noop", string(setValue))
 }
 
@@ -92,17 +97,17 @@ func TestDeviceSchedulerTuner_IsSupported_Should_return_true(t *testing.T) {
 	// given
 	deviceFeatures := &deviceFeaturesMock{
 		getSchedulerFeatureFile: func(string) (string, error) {
-			return "/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue/scheduler", nil
+			return fScheduler, nil
 		},
 		getScheduler: func(string) (string, error) {
-			return "deadline", nil
+			return deadline, nil
 		},
 		getSupportedSchedulers: func(string) ([]string, error) {
 			return []string{"deadline", "cfq", "noop"}, nil
 		},
 	}
 	fs := afero.NewMemMapFs()
-	fs.MkdirAll("/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue", 0644)
+	fs.MkdirAll("/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue", 0o644)
 	tuner := NewDeviceSchedulerTuner(fs, "fake", deviceFeatures, executors.NewDirectExecutor())
 	// when
 	supported, _ := tuner.CheckIfSupported()
@@ -114,17 +119,17 @@ func TestDeviceSchedulerTuner_IsSupported_should_return_false(t *testing.T) {
 	// given
 	deviceFeatures := &deviceFeaturesMock{
 		getSchedulerFeatureFile: func(string) (string, error) {
-			return "/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue/scheduler", nil
+			return fScheduler, nil
 		},
 		getScheduler: func(string) (string, error) {
-			return "deadline", nil
+			return deadline, nil
 		},
 		getSupportedSchedulers: func(string) ([]string, error) {
 			return []string{"deadline", "cfq"}, nil
 		},
 	}
 	fs := afero.NewMemMapFs()
-	fs.MkdirAll("/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue", 0644)
+	fs.MkdirAll("/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue", 0o644)
 	tuner := NewDeviceSchedulerTuner(fs, "fake", deviceFeatures, executors.NewDirectExecutor())
 	// when
 	supported, _ := tuner.CheckIfSupported()
@@ -136,21 +141,21 @@ func TestDeviceSchedulerTuner_Tune_should_prefer_none_over_noop(t *testing.T) {
 	// given
 	deviceFeatures := &deviceFeaturesMock{
 		getSchedulerFeatureFile: func(string) (string, error) {
-			return "/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue/scheduler", nil
+			return fScheduler, nil
 		},
 		getScheduler: func(string) (string, error) {
-			return "deadline", nil
+			return deadline, nil
 		},
 		getSupportedSchedulers: func(string) ([]string, error) {
 			return []string{"deadline", "cfq", "noop", "none"}, nil
 		},
 	}
 	fs := afero.NewMemMapFs()
-	fs.MkdirAll("/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue", 0644)
+	fs.MkdirAll("/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue", 0o644)
 	tuner := NewDeviceSchedulerTuner(fs, "fake", deviceFeatures, executors.NewDirectExecutor())
 	// when
 	tuner.Tune()
 	// then
-	setValue, _ := afero.ReadFile(fs, "/sys/devices/pci0000:00/0000:00:1d.0/0000:71:00.0/nvme/fake/queue/scheduler")
+	setValue, _ := afero.ReadFile(fs, fScheduler)
 	require.Equal(t, "none", string(setValue))
 }

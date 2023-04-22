@@ -10,11 +10,12 @@
 package admin
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 )
 
-// Replica contains the information of a partition replica
+// Replica contains the information of a partition replica.
 type Replica struct {
 	NodeID int `json:"node_id"`
 	Core   int `json:"core"`
@@ -31,14 +32,26 @@ type Partition struct {
 	Replicas    []Replica `json:"replicas"`
 }
 
-// GetPartition returns detailed partition information
+// Reconfiguration is the detail of a partition reconfiguration. There are
+// many keys returned, so the raw response is just unmarshalled into an
+// interface.
+type Reconfiguration map[string]interface{}
+
+// GetPartition returns detailed partition information.
 func (a *AdminAPI) GetPartition(
-	namespace, topic string, partition int,
+	ctx context.Context, namespace, topic string, partition int,
 ) (Partition, error) {
 	var pa Partition
 	return pa, a.sendAny(
+		ctx,
 		http.MethodGet,
 		fmt.Sprintf("/v1/partitions/%s/%s/%d", namespace, topic, partition),
 		nil,
 		&pa)
+}
+
+// Reconfigurations returns the list of ongoing partition reconfigurations.
+func (a *AdminAPI) Reconfigurations(ctx context.Context) ([]Reconfiguration, error) {
+	var response []Reconfiguration
+	return response, a.sendAny(ctx, http.MethodGet, "/v1/partitions/reconfigurations", nil, &response)
 }

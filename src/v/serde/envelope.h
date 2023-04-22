@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cinttypes>
+#include <concepts>
 #include <type_traits>
 
 namespace serde {
@@ -34,17 +35,19 @@ struct compat_version {
  *                         (change for every incompatible update)
  * \tparam CompatVersion   the minimum required version able to parse the type
  */
-template<
-  typename T,
-  typename Version,
-  typename CompatVersion = compat_version<Version::v>>
+template<typename T, typename Version, typename CompatVersion>
 struct envelope {
     bool operator==(envelope const&) const = default;
+    auto operator<=>(envelope const&) const = default;
     using value_t = T;
     static constexpr auto redpanda_serde_version = Version::v;
     static constexpr auto redpanda_serde_compat_version = CompatVersion::v;
     static constexpr auto redpanda_inherits_from_envelope = true;
 };
+
+// Overhead of the envelope in bytes: 4 bytes of size, one byte of version,
+// one byte of compat version.
+static constexpr size_t envelope_header_size = 6;
 
 /**
  * Checksum envelope uses CRC32c to check data integrity.
@@ -53,10 +56,7 @@ struct envelope {
  * This can be changed - for example by a separate template parameter
  * template <..., typename HashAlgo = crc32c>
  */
-template<
-  typename T,
-  typename Version,
-  typename CompatVersion = compat_version<Version::v>>
+template<typename T, typename Version, typename CompatVersion>
 struct checksum_envelope {
     bool operator==(checksum_envelope const&) const = default;
     using value_t = T;
@@ -66,77 +66,22 @@ struct checksum_envelope {
     static constexpr auto redpanda_serde_build_checksum = true;
 };
 
-namespace detail {
+// Overhead of the envelope in bytes: a checksummed envelope is
+// a regular envelope plus 4 bytes of checksum.
+static constexpr size_t checksum_envelope_header_size = envelope_header_size
+                                                        + 4;
 
-template<typename T, typename = void>
-struct has_compat_attribute : std::false_type {};
-
-template<typename T>
-struct has_compat_attribute<
-  T,
-  std::void_t<decltype(std::declval<T>().redpanda_serde_compat_version)>>
-  : std::true_type {};
-
-template<typename T, typename = void>
-struct has_version_attribute : std::false_type {};
-
-template<typename T>
-struct has_version_attribute<
-  T,
-  std::void_t<decltype(std::declval<T>().redpanda_serde_version)>>
-  : std::true_type {};
-
-template<typename T, typename = void>
-struct inherits_from_envelope : std::false_type {};
-
-template<typename T>
-struct inherits_from_envelope<
-  T,
-  std::void_t<decltype(std::declval<T>().redpanda_inherits_from_envelope)>>
-  : std::true_type {};
-
-template<typename T>
-struct compat_version_has_serde_version_type {
-    static constexpr auto const value = std::is_same_v<
-      std::decay_t<decltype(std::declval<T>().redpanda_serde_compat_version)>,
-      version_t>;
+template<typename T, typename Version = const serde::version_t&>
+concept is_envelope = requires {
+    { T::redpanda_serde_version } -> std::same_as<Version>;
+    { T::redpanda_serde_compat_version } -> std::same_as<Version>;
 };
 
 template<typename T>
-struct version_has_serde_version_type {
-    static constexpr auto const value = std::is_same_v<
-      std::decay_t<decltype(std::declval<T>().redpanda_serde_version)>,
-      version_t>;
-};
-
-template<typename T, typename = void>
-struct has_checksum_attribute : std::false_type {};
+concept is_checksum_envelope
+  = is_envelope<T> && T::redpanda_serde_build_checksum;
 
 template<typename T>
-struct has_checksum_attribute<
-  T,
-  std::void_t<decltype(std::declval<T>().redpanda_serde_build_checksum)>>
-  : std::true_type {};
-
-} // namespace detail
-
-template<typename T>
-inline constexpr auto const is_envelope_v = std::conjunction_v<
-  detail::has_compat_attribute<T>,
-  detail::has_version_attribute<T>,
-  detail::compat_version_has_serde_version_type<T>,
-  detail::version_has_serde_version_type<T>>;
-
-template<typename T>
-inline constexpr auto const is_checksum_envelope_v = std::conjunction_v<
-  detail::has_compat_attribute<T>,
-  detail::has_version_attribute<T>,
-  detail::compat_version_has_serde_version_type<T>,
-  detail::version_has_serde_version_type<T>,
-  detail::has_checksum_attribute<T>>;
-
-template<typename T>
-inline constexpr auto const inherits_from_envelope_v
-  = detail::inherits_from_envelope<T>::value;
+concept inherits_from_envelope = T::redpanda_inherits_from_envelope;
 
 } // namespace serde

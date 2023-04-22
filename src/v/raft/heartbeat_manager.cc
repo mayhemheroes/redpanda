@@ -87,7 +87,7 @@ static heartbeat_requests requests_for_range(
 
     auto last_heartbeat = clock_type::now() - heartbeat_interval;
     for (auto& ptr : c) {
-        if (!ptr->is_leader()) {
+        if (!ptr->is_elected_leader()) {
             continue;
         }
 
@@ -102,7 +102,8 @@ static heartbeat_requests requests_for_range(
             if (rni == ptr->self()) {
                 auto hb_metadata = ptr->meta();
                 pending_beats[rni.id()].emplace_back(
-                  heartbeat_metadata{hb_metadata, rni},
+                  heartbeat_metadata{
+                    .meta = hb_metadata, .node_id = rni, .target_node_id = rni},
                   heartbeat_manager::follower_request_meta(
                     ptr, follower_req_seq(0), hb_metadata.prev_log_index, rni));
                 return;
@@ -117,10 +118,10 @@ static heartbeat_requests requests_for_range(
                   ptr->group());
                 return;
             }
-            auto last_sent_append_entries_req_timesptamp
-              = ptr->last_sent_append_entries_req_timesptamp(rni);
+            auto last_sent_append_entries_req_timestamp
+              = ptr->last_sent_append_entries_req_timestamp(rni);
 
-            if (last_sent_append_entries_req_timesptamp > last_heartbeat) {
+            if (last_sent_append_entries_req_timestamp > last_heartbeat) {
                 vlog(
                   hbeatlog.trace,
                   "Heartbeat skipped - target: {}, ntp: {}, group_id: {}",
@@ -169,12 +170,12 @@ static heartbeat_requests requests_for_range(
 }
 
 heartbeat_manager::heartbeat_manager(
-  duration_type interval,
+  config::binding<std::chrono::milliseconds> interval,
   consensus_client_protocol proto,
   model::node_id self,
-  duration_type heartbeat_timeout)
-  : _heartbeat_interval(interval)
-  , _heartbeat_timeout(heartbeat_timeout)
+  config::binding<std::chrono::milliseconds> heartbeat_timeout)
+  : _heartbeat_interval(std::move(interval))
+  , _heartbeat_timeout(std::move(heartbeat_timeout))
   , _client_protocol(std::move(proto))
   , _self(self) {
     _heartbeat_timer.set_callback([this] { dispatch_heartbeats(); });
@@ -200,7 +201,7 @@ heartbeat_manager::send_heartbeats(std::vector<node_heartbeat> reqs) {
 }
 
 ss::future<> heartbeat_manager::do_dispatch_heartbeats() {
-    auto reqs = requests_for_range(_consensus_groups, _heartbeat_interval);
+    auto reqs = requests_for_range(_consensus_groups, _heartbeat_interval());
 
     for (const auto& node_id : reqs.reconnect_nodes) {
         if (co_await _client_protocol.ensure_disconnect(node_id)) {
@@ -243,7 +244,7 @@ ss::future<> heartbeat_manager::do_heartbeat(node_heartbeat&& r) {
                  r.target,
                  std::move(r.request),
                  rpc::client_opts(
-                   clock_type::now() + _heartbeat_timeout,
+                   rpc::timeout_spec::from_now(_heartbeat_timeout()),
                    rpc::compression_type::zstd,
                    512))
                .then([node = r.target,
@@ -281,19 +282,24 @@ void heartbeat_manager::process_reply(
         for (auto& [g, req_meta] : groups) {
             auto it = _consensus_groups.find(g);
             if (it == _consensus_groups.end()) {
-                vlog(hbeatlog.error, "cannot find consensus group:{}", g);
+                vlog(
+                  hbeatlog.warn,
+                  "cannot find consensus group:{}, may have been moved or "
+                  "deleted",
+                  g);
                 continue;
             }
+            auto consensus = *it;
 
-            (*it)->update_heartbeat_status(req_meta.follower_vnode, false);
+            consensus->update_heartbeat_status(req_meta.follower_vnode, false);
 
             // propagate error
-            (*it)->process_append_entries_reply(
+            consensus->process_append_entries_reply(
               n,
               result<append_entries_reply>(r.error()),
               req_meta.seq,
               req_meta.dirty_offset);
-            (*it)->get_probe().heartbeat_request_error();
+            consensus->get_probe().heartbeat_request_error();
         }
         return;
     }
@@ -306,15 +312,61 @@ void heartbeat_manager::process_reply(
               m.group);
             continue;
         }
+        auto consensus = *it;
         vlog(hbeatlog.trace, "Heartbeat reply from node: {} - {}", n, m);
-        auto meta = std::move(groups.find(m.group)->second);
-        (*it)->update_heartbeat_status(meta.follower_vnode, true);
 
-        (*it)->process_append_entries_reply(
+        if (unlikely(
+              m.result == append_entries_reply::status::group_unavailable)) {
+            // We may see these if the responding node is still starting up and
+            // the replica has yet to bootstrap.
+            vlog(
+              hbeatlog.debug,
+              "Heartbeat request for group {} was unavailable on node {}",
+              m.group,
+              n);
+            continue;
+        }
+
+        if (unlikely(m.result == append_entries_reply::status::timeout)) {
+            vlog(
+              hbeatlog.debug,
+              "Heartbeat request for group {} timed out on the node {}",
+              m.group,
+              n);
+            continue;
+        }
+
+        if (unlikely(m.target_node_id != consensus->self())) {
+            vlog(
+              hbeatlog.warn,
+              "Heartbeat response addressed to different node: {}, current "
+              "node: {}, response: {}",
+              m.target_node_id,
+              consensus->self(),
+              m);
+            continue;
+        }
+
+        auto meta_it = groups.find(m.group);
+        if (unlikely(meta_it == groups.end())) {
+            vlog(
+              hbeatlog.warn,
+              "Unexpected heartbeat reply for group {} from node {}, skipping: "
+              "{}",
+              m.group,
+              n,
+              m);
+            continue;
+        }
+
+        consensus->update_heartbeat_status(
+          meta_it->second.follower_vnode, true);
+
+        consensus->process_append_entries_reply(
           n,
-          result<append_entries_reply>(std::move(m)),
-          meta.seq,
-          meta.dirty_offset);
+          result<append_entries_reply>(m),
+          meta_it->second.seq,
+          meta_it->second.dirty_offset);
     }
 }
 
@@ -365,7 +417,7 @@ ss::future<> heartbeat_manager::stop() {
 }
 
 clock_type::time_point heartbeat_manager::next_heartbeat_timeout() {
-    return clock_type::now() + _heartbeat_interval;
+    return clock_type::now() + _heartbeat_interval();
 }
 
 } // namespace raft

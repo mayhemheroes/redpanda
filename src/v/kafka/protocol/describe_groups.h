@@ -20,41 +20,31 @@
 
 namespace kafka {
 
-struct describe_groups_response;
-
-class describe_groups_api final {
-public:
-    using response_type = describe_groups_response;
-
-    static constexpr const char* name = "describe groups";
-    static constexpr api_key key = api_key(15);
-};
-
 struct describe_groups_request final {
     using api_type = describe_groups_api;
 
     describe_groups_request_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const describe_groups_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const describe_groups_request& r) {
+        return os << r.data;
+    }
+};
 
 struct describe_groups_response final {
     using api_type = describe_groups_api;
 
     describe_groups_response_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
@@ -82,11 +72,11 @@ struct describe_groups_response final {
           .protocol_data = "",
         };
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const describe_groups_response& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const describe_groups_response& r) {
+        return os << r.data;
+    }
+};
 
 } // namespace kafka

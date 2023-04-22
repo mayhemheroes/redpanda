@@ -13,6 +13,7 @@
 #include "cluster/metadata_cache.h"
 #include "cluster/partition.h"
 #include "coproc/fwd.h"
+#include "kafka/protocol/errors.h"
 #include "kafka/types.h"
 #include "model/fundamental.h"
 #include "storage/translating_reader.h"
@@ -33,10 +34,12 @@ public:
         virtual const model::ntp& ntp() const = 0;
         virtual model::offset start_offset() const = 0;
         virtual model::offset high_watermark() const = 0;
-        virtual model::offset last_stable_offset() const = 0;
+        virtual checked<model::offset, error_code>
+        last_stable_offset() const = 0;
         virtual kafka::leader_epoch leader_epoch() const = 0;
         virtual std::optional<model::offset>
           get_leader_epoch_last_offset(kafka::leader_epoch) const = 0;
+        virtual bool is_elected_leader() const = 0;
         virtual bool is_leader() const = 0;
         virtual ss::future<std::error_code> linearizable_barrier() = 0;
         virtual ss::future<storage::translating_reader> make_reader(
@@ -51,6 +54,9 @@ public:
             model::offset,
             ss::lw_shared_ptr<const storage::offset_translator_state>)
           = 0;
+        virtual ss::future<error_code>
+          validate_fetch_offset(model::offset, model::timeout_clock::time_point)
+          = 0;
         virtual cluster::partition_probe& probe() = 0;
         virtual ~impl() noexcept = default;
     };
@@ -62,13 +68,15 @@ public:
 
     model::offset high_watermark() const { return _impl->high_watermark(); }
 
-    model::offset last_stable_offset() const {
+    checked<model::offset, error_code> last_stable_offset() const {
         return _impl->last_stable_offset();
     }
 
     ss::future<std::error_code> linearizable_barrier() {
         return _impl->linearizable_barrier();
     }
+
+    bool is_elected_leader() const { return _impl->is_elected_leader(); }
 
     bool is_leader() const { return _impl->is_leader(); }
 
@@ -99,6 +107,11 @@ public:
     std::optional<model::offset>
     get_leader_epoch_last_offset(kafka::leader_epoch epoch) const {
         return _impl->get_leader_epoch_last_offset(epoch);
+    }
+
+    ss::future<error_code> validate_fetch_offset(
+      model::offset o, model::timeout_clock::time_point deadline) {
+        return _impl->validate_fetch_offset(o, deadline);
     }
 
 private:

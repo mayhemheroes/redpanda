@@ -55,6 +55,11 @@ bool snapshot_exists(raft_node& n) {
     return snapshot_exists;
 }
 
+/**
+ * Specialized vs. raft_node::stop_node because in the below
+ * tests we explicitly stop consensus early, so need to avoid
+ * double-stopping it during stop_node.
+ */
 void stop_node(raft_node& node) {
     node.recovery_throttle.stop().get();
     node.server.stop().get0();
@@ -63,9 +68,13 @@ void stop_node(raft_node& node) {
         node._nop_stm->stop().get0();
     }
     node.raft_manager.stop().get0();
+    node.consensus = nullptr;
     node.hbeats->stop().get0();
+    node.hbeats.reset();
     node.cache.stop().get0();
+    node.log.reset();
     node.storage.stop().get0();
+    node.feature_table.stop().get0();
 
     node.started = false;
 }
@@ -83,6 +92,7 @@ FIXTURE_TEST(remove_persistent_state_test_no_snapshot, raft_test_fixture) {
     auto defered = ss::defer([&node] { stop_node(node); });
     BOOST_REQUIRE_EQUAL(is_group_state_cleared(node), false);
     BOOST_REQUIRE_EQUAL(snapshot_exists(node), false);
+    BOOST_REQUIRE_EQUAL(node.consensus->get_snapshot_size(), 0);
 
     // remove state
     node.consensus->remove_persistent_state().get0();
@@ -108,9 +118,12 @@ FIXTURE_TEST(remove_persistent_state_test_with_snapshot, raft_test_fixture) {
     auto defered = ss::defer([&node] { stop_node(node); });
     BOOST_REQUIRE_EQUAL(is_group_state_cleared(node), false);
     BOOST_REQUIRE_EQUAL(snapshot_exists(node), true);
+    BOOST_REQUIRE_EQUAL(
+      node.consensus->get_snapshot_size(), get_snapshot_size_from_disk(node));
 
     // remove state
     node.consensus->remove_persistent_state().get0();
     BOOST_REQUIRE_EQUAL(is_group_state_cleared(node), true);
     BOOST_REQUIRE_EQUAL(snapshot_exists(node), false);
+    BOOST_REQUIRE_EQUAL(node.consensus->get_snapshot_size(), 0);
 };

@@ -10,11 +10,11 @@
  */
 
 #pragma once
+#include "bytes/oncore.h"
 #include "config/base_property.h"
 #include "config/rjson_serialization.h"
 #include "json/stringbuffer.h"
 #include "json/writer.h"
-#include "oncore.h"
 #include "reflection/type_traits.h"
 #include "utils/intrusive_list_helpers.h"
 #include "utils/to_string.h"
@@ -36,6 +36,29 @@ class binding;
 template<typename T>
 class mock_property;
 
+/**
+ * An alternative default that only applies to clusters created before a
+ * particular logical version.
+ *
+ * This enables changing defaults for new clusters without disrupting
+ * existing clusters.
+ *
+ * **Be aware** that this only works for properties that are read _after_
+ * the bootstrap phase of startup.
+ */
+template<class T>
+class legacy_default {
+public:
+    legacy_default() = delete;
+
+    legacy_default(T v, legacy_version ov)
+      : value(std::move(v))
+      , max_original_version(ov) {}
+
+    T value;
+    legacy_version max_original_version;
+};
+
 template<class T>
 class property : public base_property {
 public:
@@ -48,10 +71,12 @@ public:
       std::string_view desc,
       base_property::metadata meta = {},
       T def = T{},
-      property::validator validator = property::noop_validator)
+      property::validator validator = property::noop_validator,
+      std::optional<legacy_default<T>> ld = std::nullopt)
       : base_property(conf, name, desc, meta)
       , _value(def)
       , _default(std::move(def))
+      , _legacy_default(std::move(ld))
       , _validator(std::move(validator)) {}
 
     /**
@@ -113,8 +138,13 @@ public:
     // serialize the value. the key is taken from the property name at the
     // serialization point in config_store::to_json to avoid users from being
     // forced to consume the property as a json object.
-    void to_json(json::Writer<json::StringBuffer>& w) const override {
-        json::rjson_serialize(w, _value);
+    void to_json(json::Writer<json::StringBuffer>& w, redact_secrets redact)
+      const override {
+        if (is_secret() && !is_default() && redact == redact_secrets::yes) {
+            json::rjson_serialize(w, secret_placeholder);
+        } else {
+            json::rjson_serialize(w, _value);
+        }
     }
 
     void set_value(std::any v) override {
@@ -149,6 +179,11 @@ public:
         return *this;
     }
 
+    /**
+     * Returns a binding<T> object which offers live access to the
+     * value of the property as well as the ability to watch for
+     * changes to the property.
+     */
     binding<T> bind() {
         assert_live_settable();
         return {*this};
@@ -168,28 +203,48 @@ public:
         }
     }
 
+    void notify_original_version(legacy_version ov) override {
+        if (!_legacy_default.has_value()) {
+            // Most properties have no legacy default, and ignore this.
+            return;
+        }
+
+        if (ov < _legacy_default.value().max_original_version) {
+            _default = _legacy_default.value().value;
+            // In case someone already made a binding to us early in startup
+            notify_watchers(_default);
+        }
+    }
+
+    constexpr static auto noop_validator = [](const auto&) {
+        return std::nullopt;
+    };
+
 protected:
+    void notify_watchers(const T& new_value) {
+        std::exception_ptr ex;
+        for (auto& binding : _bindings) {
+            try {
+                binding.update(new_value);
+            } catch (...) {
+                // In case there are multiple bindings:
+                // if one of them throws an exception from an on_change
+                // callback, proceed to update all bindings' values before
+                // re-raising the last exception we saw.  This avoids
+                // a situation where bindings could disagree about
+                // the property's value.
+                ex = std::current_exception();
+            }
+        }
+
+        if (ex) {
+            rethrow_exception(ex);
+        }
+    }
+
     bool update_value(T&& new_value) {
         if (new_value != _value) {
-            std::exception_ptr ex;
-            for (auto& binding : _bindings) {
-                try {
-                    binding.update(new_value);
-                } catch (...) {
-                    // In case there are multiple bindings:
-                    // if one of them throws an exception from an on_change
-                    // callback, proceed to update all bindings' values before
-                    // re-raising the last exception we saw.  This avoids
-                    // a situation where bindings could disagree about
-                    // the property's value.
-                    ex = std::current_exception();
-                }
-            }
-
-            if (ex) {
-                rethrow_exception(ex);
-            }
-
+            notify_watchers(new_value);
             _value = std::move(new_value);
 
             return true;
@@ -199,13 +254,14 @@ protected:
     }
 
     T _value;
-    const T _default;
+    T _default;
+
+    // An alternative default that applies if the cluster's original logical
+    // version is <= the defined version
+    const std::optional<legacy_default<T>> _legacy_default;
 
 private:
     validator _validator;
-    constexpr static auto noop_validator = [](const auto&) {
-        return std::nullopt;
-    };
 
     friend class binding<T>;
     friend class mock_property<T>;
@@ -277,7 +333,8 @@ public:
         _value = rhs._value;
         _parent = rhs._parent;
         _on_change = rhs._on_change;
-        if (_parent && this != &rhs) {
+        _hook.unlink();
+        if (_parent) {
             _parent->_bindings.push_back(*this);
         }
         return *this;
@@ -315,9 +372,11 @@ public:
      * the configuration value will be marked 'invalid' in the node's
      * configuration status, but the new value will still be set.
      *
-     * Ensure that the callback remains valid for as long as this binding:
-     * the simplest way to  accomplish this is to make both the callback
-     * and the binding attributes of the same object
+     * The callback is moved into this binding, and so will live as long as
+     * the binding. This means that callers must ensure
+     * that any objects referenced by the callback remain valid for as long as
+     * this binding: the simplest way to  accomplish this is to make both
+     * the callback and the binding attributes of the same object.
      */
     void watch(std::function<void()>&& f) {
         oncore_debug_verify(_verify_shard);
@@ -366,6 +425,12 @@ concept is_collection = requires(T x) {
 };
 
 template<typename T>
+concept is_pair = requires(T x) {
+    typename T::first_type;
+    typename T::second_type;
+};
+
+template<typename T>
 struct dependent_false : std::false_type {};
 
 template<typename T>
@@ -377,10 +442,12 @@ consteval std::string_view property_type_name() {
     } else if constexpr (std::is_same_v<type, bool>) {
         // boolean check must come before is_integral check
         return "boolean";
-    } else if constexpr (reflection::is_std_optional_v<type>) {
+    } else if constexpr (reflection::is_std_optional<type>) {
         return property_type_name<typename type::value_type>();
     } else if constexpr (is_collection<type>) {
         return property_type_name<typename type::value_type>();
+    } else if constexpr (is_pair<type>) {
+        return property_type_name<typename type::second_type>();
     } else if constexpr (has_type_name<type>) {
         return type::type_name();
     } else if constexpr (std::is_same_v<type, model::compression>) {
@@ -388,9 +455,6 @@ consteval std::string_view property_type_name() {
     } else if constexpr (std::is_same_v<type, model::timestamp_type>) {
         return "string";
     } else if constexpr (std::is_same_v<type, model::cleanup_policy_bitflags>) {
-        return "string";
-    } else if constexpr (std::
-                           is_same_v<type, model::violation_recovery_policy>) {
         return "string";
     } else if constexpr (std::is_same_v<type, config::data_directory_path>) {
         return "string";
@@ -412,10 +476,21 @@ consteval std::string_view property_type_name() {
         return "broker_endpoint";
     } else if constexpr (std::is_same_v<type, model::rack_id>) {
         return "rack_id";
+    } else if constexpr (std::is_same_v<
+                           type,
+                           model::partition_autobalancing_mode>) {
+        return "partition_autobalancing_mode";
     } else if constexpr (std::is_floating_point_v<type>) {
         return "number";
     } else if constexpr (std::is_integral_v<type>) {
         return "integer";
+    } else if constexpr (std::
+                           is_same_v<type, model::cloud_credentials_source>) {
+        return "string";
+    } else if constexpr (std::is_same_v<type, model::cloud_storage_backend>) {
+        return "string";
+    } else if constexpr (std::is_same_v<type, model::leader_balancer_mode>) {
+        return "string";
     } else {
         static_assert(dependent_false<T>::value, "Type name not defined");
     }
@@ -428,12 +503,28 @@ consteval std::string_view property_units_name() {
         return "ms";
     } else if constexpr (std::is_same_v<type, std::chrono::seconds>) {
         return "s";
-    } else if constexpr (reflection::is_std_optional_v<type>) {
+    } else if constexpr (reflection::is_std_optional<type>) {
         return property_units_name<typename type::value_type>();
     } else {
         // This will be transformed to nullopt at runtime: returning
         // std::optional from this function triggered a clang crash.
         return "";
+    }
+}
+
+template<typename T>
+consteval bool is_array() {
+    if constexpr (
+      std::is_same_v<T, ss::sstring> || std::is_same_v<T, std::string>) {
+        // Special case for strings, which are collections but we do not
+        // want to report them that way.
+        return false;
+    } else if constexpr (detail::is_collection<std::decay_t<T>>) {
+        return true;
+    } else if constexpr (reflection::is_std_optional<T>) {
+        return is_array<typename T::value_type>();
+    } else {
+        return false;
     }
 }
 
@@ -459,25 +550,12 @@ std::optional<std::string_view> property<T>::units_name() const {
 
 template<typename T>
 bool property<T>::is_nullable() const {
-    if constexpr (reflection::is_std_optional_v<std::decay_t<T>>) {
-        return true;
-    } else {
-        return false;
-    }
+    return reflection::is_std_optional<std::decay_t<T>>;
 }
 
 template<typename T>
 bool property<T>::is_array() const {
-    if constexpr (
-      std::is_same_v<T, ss::sstring> || std::is_same_v<T, std::string>) {
-        // Special case for strings, which are collections but we do not
-        // want to report them that way.
-        return false;
-    } else if constexpr (detail::is_collection<std::decay_t<T>>) {
-        return true;
-    } else {
-        return false;
-    }
+    return detail::is_array<T>();
 }
 
 /*
@@ -514,6 +592,51 @@ private:
             }
         } else {
             value.push_back(std::move(n.as<T>()));
+        }
+        return value;
+    }
+};
+
+/*
+ * Same as property<std::unordered_map<T::key_type, T>> but will also decode a
+ * single T. This can be useful for dealing with backwards compatibility or
+ * creating easier yaml schemas that have simplified special cases.
+ */
+template<typename T>
+class one_or_many_map_property
+  : public property<std::unordered_map<typename T::key_type, T>> {
+public:
+    using property<std::unordered_map<typename T::key_type, T>>::property;
+
+    bool set_value(YAML::Node n) override {
+        auto value = decode_yaml(std::move(n));
+        return property<std::unordered_map<typename T::key_type, T>>::
+          update_value(std::move(value));
+    }
+
+    std::optional<validation_error> validate(YAML::Node n) const override {
+        std::unordered_map<typename T::key_type, T> value = decode_yaml(
+          std::move(n));
+        return property<std::unordered_map<typename T::key_type, T>>::validate(
+          value);
+    }
+
+private:
+    /**
+     * Given either a single value or a list of values, return
+     * a hash_map of decoded values.
+     **/
+    std::unordered_map<typename T::key_type, T>
+    decode_yaml(const YAML::Node& n) const {
+        std::unordered_map<typename T::key_type, T> value;
+        if (n.IsSequence()) {
+            for (const auto& elem : n) {
+                auto elem_val = elem.as<T>();
+                value.emplace(elem_val.key(), std::move(elem_val));
+            }
+        } else {
+            auto elem_val = n.as<T>();
+            value.emplace(elem_val.key(), std::move(elem_val));
         }
         return value;
     }
@@ -612,19 +735,19 @@ public:
     }
 
     void print(std::ostream& o) const final {
-        o << name() << ":";
-
-        if (is_secret() && !is_default()) {
-            o << secret_placeholder;
-        } else {
-            o << _value.value_or(-1ms);
-        }
+        vassert(!is_secret(), "{} must not be a secret", name());
+        o << name() << ":" << _value.value_or(-1ms);
     }
 
     // serialize the value. the key is taken from the property name at the
     // serialization point in config_store::to_json to avoid users from being
     // forced to consume the property as a json object.
-    void to_json(json::Writer<json::StringBuffer>& w) const final {
+    void
+    to_json(json::Writer<json::StringBuffer>& w, redact_secrets) const final {
+        // TODO: there's nothing forcing the retention duration to be a
+        // non-secret; if a secret retention duration is ever introduced,
+        // redact it, but consider the implications on the JSON type.
+        vassert(!is_secret(), "{} must not be a secret", name());
         json::rjson_serialize(w, _value.value_or(-1ms));
     }
 

@@ -14,7 +14,10 @@
 
 namespace kafka {
 
-struct api_versions_handler : public handler<api_versions_api, 0, 2> {
+struct api_versions_handler
+  : public single_stage_handler<api_versions_api, 0, 3> {
+    static constexpr api_version min_flexible = api_version(3);
+
     static ss::future<response_ptr>
       handle(request_context, ss::smp_service_group);
 

@@ -31,7 +31,6 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
-#include <seastar/core/std-coroutine.hh>
 
 #include <exception>
 #include <limits>
@@ -176,6 +175,16 @@ put_config_subject(server::request_t rq, server::reply_t rp) {
     co_return rp;
 }
 
+ss::future<server::reply_t> get_mode(server::request_t rq, server::reply_t rp) {
+    parse_accept_header(rq, rp);
+    rq.req.reset();
+
+    rp.rep->write_body("json", ss::sstring{R"({
+  "mode": "READWRITE"
+})"});
+    co_return rp;
+}
+
 ss::future<server::reply_t>
 get_schemas_types(server::request_t rq, server::reply_t rp) {
     parse_accept_header(rq, rp);
@@ -279,7 +288,7 @@ post_subject(server::request_t rq, server::reply_t rp) {
         auto unparsed = ppj::rjson_parse(
           rq.req->content.data(), post_subject_versions_request_handler<>{sub});
         schema = co_await rq.service().schema_store().make_canonical_schema(
-          std::move(unparsed));
+          std::move(unparsed.def));
     } catch (const exception& e) {
         if (e.code() == error_code::schema_empty) {
             throw as_exception(invalid_subject_schema(sub));
@@ -314,8 +323,13 @@ post_subject_versions(server::request_t rq, server::reply_t rp) {
       rq.req->content.data(), post_subject_versions_request_handler<>{sub});
     rq.req.reset();
 
-    auto schema = co_await rq.service().schema_store().make_canonical_schema(
-      std::move(unparsed));
+    subject_schema schema{
+      co_await rq.service().schema_store().make_canonical_schema(
+        std::move(unparsed.def)),
+      unparsed.version.value_or(invalid_schema_version),
+      unparsed.id.value_or(invalid_schema_id),
+      is_deleted::no};
+
     auto schema_id = co_await rq.service().writer().write_subject_version(
       std::move(schema));
 
@@ -480,14 +494,14 @@ compatibility_subject_version(server::request_t rq, server::reply_t rp) {
     vlog(
       plog.info,
       "compatibility_subject_version: subject: {}, version: {}",
-      unparsed.sub(),
+      unparsed.def.sub(),
       ver);
     auto version = invalid_schema_version;
     if (ver == "latest") {
         auto versions = co_await rq.service().schema_store().get_versions(
-          unparsed.sub(), include_deleted::no);
+          unparsed.def.sub(), include_deleted::no);
         if (versions.empty()) {
-            throw as_exception(not_found(unparsed.sub(), version));
+            throw as_exception(not_found(unparsed.def.sub(), version));
         }
         version = versions.back();
     } else {
@@ -495,7 +509,7 @@ compatibility_subject_version(server::request_t rq, server::reply_t rp) {
     }
 
     auto schema = co_await rq.service().schema_store().make_canonical_schema(
-      std::move(unparsed));
+      std::move(unparsed.def));
     auto get_res = co_await get_or_load(rq, [&rq, &schema, version]() {
         return rq.service().schema_store().is_compatible(version, schema);
     });
@@ -503,6 +517,13 @@ compatibility_subject_version(server::request_t rq, server::reply_t rp) {
     auto json_rslt{
       json::rjson_serialize(post_compatibility_res{.is_compat = get_res})};
     rp.rep->write_body("json", json_rslt);
+    co_return rp;
+}
+
+ss::future<server::reply_t>
+status_ready(server::request_t rq, server::reply_t rp) {
+    co_await rq.service().writer().read_sync();
+    rp.rep->set_status(ss::http::reply::status_type::ok);
     co_return rp;
 }
 

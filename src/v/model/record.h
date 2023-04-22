@@ -312,6 +312,8 @@ public:
 
     void set_transactional_type() { _attributes |= transactional_mask; }
 
+    void unset_transactional_type() { _attributes &= ~transactional_mask; }
+
     bool operator==(const record_batch_attributes& other) const {
         return _attributes == other._attributes;
     }
@@ -440,9 +442,18 @@ struct record_batch_header {
 using tx_seq = named_type<int64_t, struct tm_tx_seq>;
 using producer_id = named_type<int64_t, struct producer_identity_id>;
 using producer_epoch = named_type<int16_t, struct producer_identity_epoch>;
-struct producer_identity {
+
+struct producer_identity
+  : serde::
+      envelope<producer_identity, serde::version<0>, serde::compat_version<0>> {
     int64_t id{-1};
     int16_t epoch{0};
+
+    producer_identity() noexcept = default;
+
+    constexpr producer_identity(int64_t id, int16_t epoch)
+      : id(id)
+      , epoch(epoch) {}
 
     model::producer_id get_id() const { return model::producer_id(id); }
 
@@ -458,7 +469,29 @@ struct producer_identity {
     }
 
     friend std::ostream& operator<<(std::ostream&, const producer_identity&);
+
+    auto serde_fields() { return std::tie(id, epoch); }
 };
+
+/// This structure is a part of rm_stm snapshot.
+/// Any change has to be reconciled with the
+/// snapshot (de)serialization logic.
+struct tx_range {
+    model::producer_identity pid;
+    model::offset first;
+    model::offset last;
+
+    auto operator<=>(const tx_range&) const = default;
+};
+
+// Comparator that sorts in ascending order by first offset.
+struct tx_range_cmp {
+    auto operator()(const tx_range& l, const tx_range& r) {
+        return l.first > r.first;
+    }
+};
+
+static constexpr producer_identity unknown_pid{-1, -1};
 
 struct batch_identity {
     static int32_t increment_sequence(int32_t sequence, int32_t increment) {
@@ -471,8 +504,7 @@ struct batch_identity {
 
     static batch_identity from(const record_batch_header& hdr) {
         return batch_identity{
-          .pid = model::
-            producer_identity{.id = hdr.producer_id, .epoch = hdr.producer_epoch},
+          .pid = model::producer_identity{hdr.producer_id, hdr.producer_epoch},
           .first_seq = hdr.base_sequence,
           .last_seq = increment_sequence(
             hdr.base_sequence, hdr.last_offset_delta),
@@ -638,7 +670,18 @@ public:
         verify_iterable();
         iobuf_const_parser parser(_records);
         for (auto i = 0; i < _header.record_count; i++) {
-            f(model::parse_one_record_copy_from_buffer(parser));
+            if constexpr (std::is_same_v<
+                            std::invoke_result_t<Func, model::record>,
+                            void>) {
+                f(model::parse_one_record_copy_from_buffer(parser));
+
+            } else {
+                ss::stop_iteration s = f(
+                  model::parse_one_record_copy_from_buffer(parser));
+                if (s == ss::stop_iteration::yes) {
+                    return;
+                }
+            }
         }
         if (unlikely(parser.bytes_left())) {
             throw std::out_of_range(fmt::format(

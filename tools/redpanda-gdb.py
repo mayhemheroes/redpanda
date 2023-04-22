@@ -573,7 +573,7 @@ class span(object):
 
         Due to https://github.com/scylladb/seastar/issues/625 there may be some
         pages at the end of the span which are not used by the small pool.
-        We try to detect this. It's not 100% accurrate but should work in most cases.
+        We try to detect this. It's not 100% accurate but should work in most cases.
 
         Returns 0 for free spans.
         """
@@ -1565,7 +1565,6 @@ class redpanda(gdb.Command):
 
 class sstring_printer(gdb.printing.PrettyPrinter):
     'print an sstring'
-
     def __init__(self, val):
         self.val = val
 
@@ -1584,7 +1583,6 @@ class sstring_printer(gdb.printing.PrettyPrinter):
 
 class model_ntp_printer(gdb.printing.PrettyPrinter):
     'print a model::ntp'
-
     def __init__(self, val):
         self.val = val
 

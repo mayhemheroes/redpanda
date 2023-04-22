@@ -28,15 +28,12 @@ inline const model::ntp controller_ntp(
  */
 inline const model::topic kvstore_topic("kvstore");
 inline model::ntp kvstore_ntp(ss::shard_id shard) {
-    return model::ntp(redpanda_ns, kvstore_topic, model::partition_id(shard));
+    return {redpanda_ns, kvstore_topic, model::partition_id(shard)};
 }
 
 inline const model::ns kafka_namespace("kafka");
 
 inline const model::ns kafka_internal_namespace("kafka_internal");
-inline const model::topic kafka_group_topic("group");
-inline const model::topic_namespace
-  kafka_group_nt(model::kafka_internal_namespace, kafka_group_topic);
 
 inline const model::topic kafka_consumer_offsets_topic("__consumer_offsets");
 
@@ -52,7 +49,10 @@ inline const model::topic_partition coprocessor_internal_tp{
 inline const model::topic tx_manager_topic("tx");
 inline const model::topic_namespace
   tx_manager_nt(model::kafka_internal_namespace, tx_manager_topic);
-inline const model::ntp tx_manager_ntp(
+// Previously we had only one partition in tm.
+// Now we support multiple partitions.
+// legacy_tm_ntp exists to support previous behaviour
+inline const model::ntp legacy_tm_ntp(
   model::kafka_internal_namespace,
   model::tx_manager_topic,
   model::partition_id(0));

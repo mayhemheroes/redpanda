@@ -18,7 +18,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// nolint:funlen // this is ok for a test
+//nolint:funlen // this is ok for a test
 func TestRedpandaPorts(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -28,12 +28,15 @@ func TestRedpandaPorts(t *testing.T) {
 		{"all with both internal and external", &redpandav1alpha1.Cluster{
 			Spec: redpandav1alpha1.ClusterSpec{
 				Configuration: redpandav1alpha1.RedpandaConfig{
-					AdminAPI:       []redpandav1alpha1.AdminAPI{{Port: 345}, {External: redpandav1alpha1.ExternalConnectivityConfig{Enabled: true}}},
-					KafkaAPI:       []redpandav1alpha1.KafkaAPI{{Port: 123}, {External: redpandav1alpha1.ExternalConnectivityConfig{Enabled: true}}},
-					PandaproxyAPI:  []redpandav1alpha1.PandaproxyAPI{{Port: 333}, {External: redpandav1alpha1.ExternalConnectivityConfig{Enabled: true}}},
-					SchemaRegistry: &redpandav1alpha1.SchemaRegistryAPI{Port: 444, External: &redpandav1alpha1.ExternalConnectivityConfig{Enabled: true}},
+					AdminAPI:      []redpandav1alpha1.AdminAPI{{Port: 345}, {External: redpandav1alpha1.ExternalConnectivityConfig{Enabled: true}}},
+					KafkaAPI:      []redpandav1alpha1.KafkaAPI{{Port: 123}, {External: redpandav1alpha1.ExternalConnectivityConfig{Enabled: true}}},
+					PandaproxyAPI: []redpandav1alpha1.PandaproxyAPI{{Port: 333}, {External: redpandav1alpha1.PandaproxyExternalConnectivityConfig{ExternalConnectivityConfig: redpandav1alpha1.ExternalConnectivityConfig{Enabled: true}}}},
+					SchemaRegistry: &redpandav1alpha1.SchemaRegistryAPI{Port: 444, External: &redpandav1alpha1.SchemaRegistryExternalConnectivityConfig{
+						ExternalConnectivityConfig: redpandav1alpha1.ExternalConnectivityConfig{Enabled: true},
+					}},
 				},
-			}}, &networking.RedpandaPorts{
+			},
+		}, &networking.RedpandaPorts{
 			KafkaAPI: networking.PortsDefinition{
 				Internal: &resources.NamedServicePort{
 					Name: resources.InternalListenerName,
@@ -83,7 +86,8 @@ func TestRedpandaPorts(t *testing.T) {
 					PandaproxyAPI:  []redpandav1alpha1.PandaproxyAPI{{Port: 333}},
 					SchemaRegistry: &redpandav1alpha1.SchemaRegistryAPI{Port: 444},
 				},
-			}}, &networking.RedpandaPorts{
+			},
+		}, &networking.RedpandaPorts{
 			KafkaAPI: networking.PortsDefinition{
 				Internal: &resources.NamedServicePort{
 					Name: resources.InternalListenerName,
@@ -109,12 +113,21 @@ func TestRedpandaPorts(t *testing.T) {
 				},
 			},
 		}},
-		{"kafka api has nodeport explicitly specifies", &redpandav1alpha1.Cluster{
+		{"apis have nodeport explicitly specified", &redpandav1alpha1.Cluster{
 			Spec: redpandav1alpha1.ClusterSpec{
 				Configuration: redpandav1alpha1.RedpandaConfig{
 					KafkaAPI: []redpandav1alpha1.KafkaAPI{{Port: 123}, {Port: 30001, External: redpandav1alpha1.ExternalConnectivityConfig{Enabled: true}}},
+					AdminAPI: []redpandav1alpha1.AdminAPI{{Port: 234}, {Port: 30002, External: redpandav1alpha1.ExternalConnectivityConfig{Enabled: true}}},
+					PandaproxyAPI: []redpandav1alpha1.PandaproxyAPI{{Port: 345}, {Port: 30003, External: redpandav1alpha1.PandaproxyExternalConnectivityConfig{
+						ExternalConnectivityConfig: redpandav1alpha1.ExternalConnectivityConfig{Enabled: true},
+					}}},
+					SchemaRegistry: &redpandav1alpha1.SchemaRegistryAPI{Port: 30004, External: &redpandav1alpha1.SchemaRegistryExternalConnectivityConfig{
+						ExternalConnectivityConfig: redpandav1alpha1.ExternalConnectivityConfig{Enabled: true},
+						StaticNodePort:             true,
+					}},
 				},
-			}}, &networking.RedpandaPorts{
+			},
+		}, &networking.RedpandaPorts{
 			KafkaAPI: networking.PortsDefinition{
 				Internal: &resources.NamedServicePort{
 					Name: resources.InternalListenerName,
@@ -125,8 +138,35 @@ func TestRedpandaPorts(t *testing.T) {
 					Port: 30001,
 				},
 			},
+			AdminAPI: networking.PortsDefinition{
+				Internal: &resources.NamedServicePort{
+					Name: resources.AdminPortName,
+					Port: 234,
+				},
+				External: &resources.NamedServicePort{
+					Name: resources.AdminPortExternalName,
+					Port: 30002,
+				},
+			},
+			PandaProxy: networking.PortsDefinition{
+				Internal: &resources.NamedServicePort{
+					Name: resources.PandaproxyPortInternalName,
+					Port: 345,
+				},
+				External: &resources.NamedServicePort{
+					Name: resources.PandaproxyPortExternalName,
+					Port: 30003,
+				},
+			},
+			SchemaRegistry: networking.PortsDefinition{
+				External: &resources.NamedServicePort{
+					Name: resources.SchemaRegistryPortName,
+					Port: 30004,
+				},
+			},
 		}},
-		{"kafka api external has bootstrap loadbalancer",
+		{
+			"kafka api external has bootstrap loadbalancer",
 			&redpandav1alpha1.Cluster{
 				Spec: redpandav1alpha1.ClusterSpec{
 					Configuration: redpandav1alpha1.RedpandaConfig{
@@ -144,7 +184,8 @@ func TestRedpandaPorts(t *testing.T) {
 							},
 						},
 					},
-				}},
+				},
+			},
 			&networking.RedpandaPorts{
 				KafkaAPI: networking.PortsDefinition{
 					Internal: &resources.NamedServicePort{
@@ -161,7 +202,8 @@ func TestRedpandaPorts(t *testing.T) {
 						Port:       1234,
 						TargetPort: 123 + 1,
 					},
-				}},
+				},
+			},
 		},
 	}
 	for _, tt := range tests {

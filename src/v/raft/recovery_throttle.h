@@ -9,9 +9,15 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "config/configuration.h"
+#include "config/property.h"
+#include "prometheus/prometheus_sanitize.h"
+#include "raft/logger.h"
 #include "seastarx.h"
+#include "ssx/metrics.h"
+#include "ssx/semaphore.h"
+#include "utils/token_bucket.h"
 
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/util/later.hh>
@@ -30,87 +36,76 @@ namespace raft {
  *      https://github.com/redpanda-data/redpanda/issues/1771
  */
 class recovery_throttle {
-    using clock_type = ss::lowres_clock;
-    static constexpr std::chrono::milliseconds refresh_error{5};
-    static constexpr std::chrono::milliseconds refresh_interval{50};
-
 public:
-    explicit recovery_throttle(size_t rate)
-      : _rate(rate)
-      , _sem{_rate}
-      , _last_refresh(clock_type::now())
-      , _refresh_timer([this] { handle_refresh(); }) {}
-
-    ss::future<> throttle(size_t size) {
-        _refresh_timer.cancel();
-        refresh();
-
-        /*
-         * when try_wait succeeds it implies that there are no waiters so there
-         * is no risk in returning without arming the refresh timer.
-         */
-        if (_sem.try_wait(size)) {
-            return ss::now();
-        }
-
-        auto elapsed = clock_type::now() - _last_refresh;
-        if (elapsed >= refresh_interval) {
-            _refresh_timer.arm(refresh_interval);
-        } else {
-            _refresh_timer.arm(refresh_interval - elapsed);
-        }
-
-        return _sem.wait(size);
+    explicit recovery_throttle(config::binding<size_t> rate_binding)
+      : _rate_binding(std::move(rate_binding))
+      , _throttler(get_per_core_rate(), "raft/recovery-rate") {
+        _rate_binding.watch([this]() { update_rate(); });
+        setup_metrics();
     }
 
-    void shutdown() {
-        _refresh_timer.cancel();
-        _sem.broken();
+    ss::future<> throttle(size_t size, ss::abort_source& as) {
+        return _throttler.throttle(size, as);
     }
+
+    size_t available() { return _throttler.available(); }
+
+    void shutdown() { _throttler.shutdown(); }
 
 private:
-    void refresh() {
-        auto now = clock_type::now();
-        auto elapsed = now - _last_refresh;
-        if (elapsed < refresh_interval) {
+    size_t get_per_core_rate() { return _rate_binding() / ss::smp::count; }
+
+    void update_rate() {
+        auto const per_core_rate = get_per_core_rate();
+        _throttler.update_rate(per_core_rate);
+        vlog(
+          raftlog.info,
+          "Updating recovery throttle with new rate of {}",
+          per_core_rate);
+    }
+
+    void setup_metrics() {
+        setup_internal_metrics();
+        setup_public_metrics();
+    }
+
+    void setup_internal_metrics() {
+        if (config::shard_local_cfg().disable_metrics()) {
             return;
         }
-        _last_refresh = now;
 
-        /*
-         * subtract out half the lowres clock granularity as an error adjustment
-         * that will be pessimistic and error on the side of lower throughput.
-         */
-        auto refresh = _rate * (elapsed - refresh_error)
-                       / std::chrono::milliseconds(1000);
-
-        _sem.signal(refresh);
-
-        /*
-         * throttling is based on an estimate. if rate is low and a waiter
-         * underestimated we may need to allow the available tokens to exceed
-         * the rate to let a waiter through.
-         */
-        if (_sem.current() > _rate && !_sem.waiters()) {
-            _sem.consume(_sem.current() - _rate);
-        }
+        // TODO: Delete this metric after public is supported in scraping
+        // configurations
+        namespace sm = ss::metrics;
+        _internal_metrics.add_group(
+          prometheus_sanitize::metrics_name("raft:recovery"),
+          {sm::make_gauge(
+            "partition_movement_available_bandwidth",
+            [this] { return _throttler.available(); },
+            sm::description(
+              "Bandwidth available for partition movement. bytes/sec"))});
     }
 
-    void handle_refresh() {
-        refresh();
-        /*
-         * if a waiter exists continue refreshing since it is not guaranteed
-         * that throttle will be invoked (e.g. excactly one recovering group).
-         */
-        if (_sem.waiters()) {
-            _refresh_timer.arm(refresh_interval);
+    void setup_public_metrics() {
+        if (config::shard_local_cfg().disable_public_metrics()) {
+            return;
         }
+
+        namespace sm = ss::metrics;
+        _public_metrics.add_group(
+          prometheus_sanitize::metrics_name("raft:recovery"),
+          {sm::make_gauge(
+            "partition_movement_available_bandwidth",
+            [this] { return _throttler.available(); },
+            sm::description(
+              "Bandwidth available for partition movement. bytes/sec"))});
     }
 
-    size_t _rate;
-    ss::semaphore _sem;
-    clock_type::time_point _last_refresh;
-    ss::timer<> _refresh_timer;
+    config::binding<size_t> _rate_binding;
+    token_bucket<> _throttler;
+    ss::metrics::metric_groups _internal_metrics;
+    ss::metrics::metric_groups _public_metrics{
+      ssx::metrics::public_metrics_handle};
 };
 
 } // namespace raft

@@ -1,21 +1,25 @@
+// Copyright 2022 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
 package plugin
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"runtime"
 	"sort"
-	"strings"
 	"time"
 
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 // Manifest represents a plugin manifest, which is essentially a list of
@@ -65,6 +69,7 @@ func DownloadManifest(url string) (*Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to request manifest: %v", err)
 	}
+	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read manifest body: %v", err)
@@ -79,7 +84,7 @@ func DownloadManifest(url string) (*Manifest, error) {
 
 	const understand = "2021-07-27"
 	if m.Version != understand {
-		return nil, fmt.Errorf("Plugin manifest indicates version %q, and we can only understand %q! Please update rpk!", m.Version, understand)
+		return nil, fmt.Errorf("plugin manifest indicates version %q, and we can only understand %q; please update rpk", m.Version, understand)
 	}
 
 	sort.Slice(m.Plugins, func(i, j int) bool {
@@ -172,49 +177,5 @@ func (p *ManifestPlugin) Download(baseURL, os, host string) ([]byte, error) {
 	}
 
 	u := baseURL + path
-	req, err := http.NewRequestWithContext(
-		context.Background(),
-		http.MethodGet,
-		u,
-		nil,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create request %s: %v", u, err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("unable to issue request to %s: %v", u, err)
-	}
-	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("unsuccessful plugin response from %s, status: %s", u, http.StatusText(resp.StatusCode))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("unable to read response from %s: %v", u, err)
-	}
-
-	if decompress {
-		gzr, err := gzip.NewReader(bytes.NewBuffer(body))
-		if err != nil {
-			return nil, fmt.Errorf("unable to create gzip reader: %w", err)
-		}
-		if body, err = io.ReadAll(gzr); err != nil {
-			return nil, fmt.Errorf("unable to gzip decompress plugin: %w", err)
-		}
-		if err = gzr.Close(); err != nil {
-			return nil, fmt.Errorf("unable to close gzip reader: %w", err)
-		}
-	}
-
-	shasum := sha256.Sum256(body)
-	gotsha := strings.ToLower(hex.EncodeToString(shasum[:]))
-	expsha := strings.ToLower(sha)
-
-	if gotsha != expsha {
-		return nil, fmt.Errorf("checksum of plugin %s does not match what the manifest specifies (downloaded sha256sum: %s, manifest specified sha256sum: %s)", u, gotsha, expsha)
-	}
-
-	return body, nil
+	return Download(context.Background(), u, decompress, sha)
 }

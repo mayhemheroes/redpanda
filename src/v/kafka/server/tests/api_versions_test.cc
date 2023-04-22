@@ -18,23 +18,20 @@
 
 // https://github.com/apache/kafka/blob/eaccb92/core/src/test/scala/unit/kafka/server/ApiVersionsRequestTest.scala
 
-// version 3 is not supported
-#if 0
 FIXTURE_TEST(validate_latest_version, redpanda_thread_fixture) {
     auto client = make_kafka_client().get0();
     client.connect().get();
 
     kafka::api_versions_request request;
-    request.client_software_name = "name";
-    request.client_software_version = "version";
-    auto response = client.dispatch(request).get0();
-    BOOST_TEST(response.error == kafka::error_code::none);
+    request.data.client_software_name = "redpanda";
+    request.data.client_software_version = "x.x.x";
+    auto response = client.dispatch(request, kafka::api_version(3)).get0();
+    BOOST_TEST(response.data.error_code == kafka::error_code::none);
     client.stop().then([&client] { client.shutdown(); }).get();
 
     auto expected = kafka::get_supported_apis();
-    BOOST_TEST(response.apis == expected);
+    BOOST_TEST(response.data.api_keys == expected);
 }
-#endif
 
 FIXTURE_TEST(validate_v0, redpanda_thread_fixture) {
     auto client = make_kafka_client().get0();
@@ -48,21 +45,6 @@ FIXTURE_TEST(validate_v0, redpanda_thread_fixture) {
     auto expected = kafka::get_supported_apis();
     BOOST_TEST(response.data.api_keys == expected);
 }
-
-// version 3 is not supported
-#if 0
-FIXTURE_TEST(validate_v3, redpanda_thread_fixture) {
-    auto client = make_kafka_client().get0();
-    client.connect().get();
-
-    kafka::api_versions_request request;
-    auto response = client.dispatch(request, kafka::api_version(3)).get0();
-    client.stop().then([&client] { client.shutdown(); }).get();
-
-    // invalid since name/version are empty in the request
-    BOOST_TEST(response.error == kafka::error_code::invalid_request);
-}
-#endif
 
 FIXTURE_TEST(unsupported_version, redpanda_thread_fixture) {
     auto client = make_kafka_client().get0();
@@ -91,4 +73,25 @@ FIXTURE_TEST(unsupported_version, redpanda_thread_fixture) {
     BOOST_TEST(api->api_key == kafka::api_versions_api::key);
     BOOST_TEST(api->min_version == kafka::api_versions_handler::min_supported);
     BOOST_TEST(api->max_version == kafka::api_versions_handler::max_supported);
+}
+
+// Tests for bug that broke flex request parsing for null or empty client ids
+FIXTURE_TEST(flex_with_empty_client_id, redpanda_thread_fixture) {
+    auto client = make_kafka_client("").get0();
+    client.connect().get();
+
+    kafka::api_versions_request request;
+    auto response = client.dispatch(request, kafka::api_version(3)).get0();
+    BOOST_TEST(response.data.error_code == kafka::error_code::none);
+    client.stop().then([&client] { client.shutdown(); }).get();
+}
+
+FIXTURE_TEST(flex_with_null_client_id, redpanda_thread_fixture) {
+    auto client = make_kafka_client(std::nullopt).get0();
+    client.connect().get();
+
+    kafka::api_versions_request request;
+    auto response = client.dispatch(request, kafka::api_version(3)).get0();
+    BOOST_TEST(response.data.error_code == kafka::error_code::none);
+    client.stop().then([&client] { client.shutdown(); }).get();
 }

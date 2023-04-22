@@ -15,22 +15,20 @@
 #include "kafka/server/handlers/topics/types.h"
 
 namespace kafka {
-// clang-format off
-CONCEPT(
 template<typename Request, typename T>
-concept RequestValidator = requires (T validator, const Request& request) {
+concept RequestValidator = requires(T validator, const Request& request) {
     { T::is_valid(request) } -> std::same_as<bool>;
     { T::ec } -> std::convertible_to<const error_code&>;
     { T::error_message } -> std::convertible_to<const char*>;
-};)
-// clang-format on
+};
 
 template<typename Request, typename... Ts>
 struct validator_type_list {};
 
 template<typename Request, typename... Validators>
-CONCEPT(requires(RequestValidator<Request, Validators>, ...))
-using make_validator_types = validator_type_list<Request, Validators...>;
+requires(
+  RequestValidator<Request, Validators>,
+  ...) using make_validator_types = validator_type_list<Request, Validators...>;
 
 struct custom_partition_assignment_negative_partition_count {
     static constexpr error_code ec = error_code::invalid_request;
@@ -142,5 +140,113 @@ struct unsupported_configuration_entries {
                && end == config_entries.find("flush.ms");
     }
 };
+
+struct remote_read_and_write_are_not_supported_for_read_replica {
+    static constexpr error_code ec = error_code::invalid_config;
+    static constexpr const char* error_message
+      = "remote read and write are not supported for read replicas";
+
+    static bool is_valid(const creatable_topic& c) {
+        auto config_entries = config_map(c.configs);
+        auto end = config_entries.end();
+        bool is_recovery
+          = (config_entries.find(topic_property_recovery) != end);
+        bool is_read_replica
+          = (config_entries.find(topic_property_read_replica) != end);
+        bool remote_read
+          = (config_entries.find(topic_property_remote_read) != end);
+        bool remote_write
+          = (config_entries.find(topic_property_remote_write) != end);
+
+        if (is_read_replica && (remote_read || remote_write || is_recovery)) {
+            return false;
+        }
+        return true;
+    }
+};
+
+struct batch_max_bytes_limits {
+    static constexpr error_code ec = error_code::invalid_config;
+    static constexpr const char* error_message
+      = "Property max.message.bytes value must be positive";
+
+    static bool is_valid(const creatable_topic& c) {
+        auto it = std::find_if(
+          c.configs.begin(),
+          c.configs.end(),
+          [](const createable_topic_config& cfg) {
+              return cfg.name == topic_property_max_message_bytes;
+          });
+        if (it != c.configs.end() && it->value.has_value()) {
+            return boost::lexical_cast<int32_t>(it->value.value()) > 0;
+        }
+
+        return true;
+    }
+};
+
+struct compression_type_validator_details {
+    using validated_type = model::compression;
+
+    static constexpr const char* error_message
+      = "Unsupported compression type ";
+    static constexpr const auto config_name = topic_property_compression;
+};
+
+struct compaction_strategy_validator_details {
+    using validated_type = model::compaction_strategy;
+
+    static constexpr const char* error_message
+      = "Unsupported compaction strategy ";
+    static constexpr const auto config_name
+      = topic_property_compaction_strategy;
+};
+
+struct timestamp_type_validator_details {
+    using validated_type = model::timestamp_type;
+
+    static constexpr const char* error_message = "Unsupported timestamp type ";
+    static constexpr const auto config_name = topic_property_timestamp_type;
+};
+
+struct cleanup_policy_validator_details {
+    using validated_type = model::cleanup_policy_bitflags;
+
+    static constexpr const char* error_message = "Unsupported cleanup policy ";
+    static constexpr const auto config_name = topic_property_cleanup_policy;
+};
+
+template<typename T>
+struct configuration_value_validator {
+    static constexpr const char* error_message = T::error_message;
+    static constexpr error_code ec = error_code::invalid_config;
+
+    static bool is_valid(const creatable_topic& c) {
+        auto config_entries = config_map(c.configs);
+        auto end = config_entries.end();
+
+        auto iter = config_entries.find(T::config_name);
+
+        if (end == iter) {
+            return true;
+        }
+
+        try {
+            boost::lexical_cast<typename T::validated_type>(iter->second);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+};
+
+using compression_type_validator
+  = configuration_value_validator<compression_type_validator_details>;
+using compaction_strategy_validator
+  = configuration_value_validator<compaction_strategy_validator_details>;
+using timestamp_type_validator
+  = configuration_value_validator<timestamp_type_validator_details>;
+using cleanup_policy_validator
+  = configuration_value_validator<cleanup_policy_validator_details>;
 
 } // namespace kafka

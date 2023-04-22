@@ -8,13 +8,10 @@
  * the Business Source License, use of this software will be governed
  * by the Apache License, Version 2.0
  */
-
 #pragma once
-#include <seastar/core/sstring.hh>
-
 #include <cstdint>
-#include <functional> // needed for std::hash
 #include <limits>
+#include <ostream>
 #include <type_traits>
 #include <utility>
 
@@ -117,6 +114,10 @@ public:
         return base_named_type(std::numeric_limits<type>::max());
     }
 
+    friend std::ostream& operator<<(std::ostream& o, const base_named_type& t) {
+        return o << "{" << t() << "}";
+    };
+
 protected:
     type _value = std::numeric_limits<T>::min();
 };
@@ -128,10 +129,11 @@ public:
       = std::is_nothrow_move_constructible<T>::value;
 
     base_named_type() = default;
-    explicit base_named_type(const type& v)
-      : _value(v) {}
-    explicit base_named_type(type&& v)
-      : _value(std::move(v)) {}
+
+    template<typename... Args>
+    requires std::constructible_from<T, Args...>
+    explicit base_named_type(Args&&... args)
+      : _value(std::forward<Args>(args)...) {}
 
     base_named_type(base_named_type&& o) noexcept(move_noexcept) = default;
 
@@ -176,14 +178,12 @@ public:
     operator const type&() const& { return _value; }
     operator type() && { return std::move(_value); }
 
+    friend std::ostream& operator<<(std::ostream& o, const base_named_type& t) {
+        return o << "{" << t() << "}";
+    };
+
 protected:
     type _value;
-};
-
-template<typename T, typename Tag, typename IsConstexpr>
-inline std::ostream&
-operator<<(std::ostream& o, const base_named_type<T, Tag, IsConstexpr>& t) {
-    return o << "{" << t() << "}";
 };
 
 } // namespace detail

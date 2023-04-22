@@ -14,6 +14,7 @@
 #include "json/stringbuffer.h"
 #include "json/writer.h"
 #include "seastarx.h"
+#include "utils/named_type.h"
 
 #include <seastar/util/bool_class.hh>
 
@@ -33,6 +34,10 @@ using required = ss::bool_class<struct required_tag>;
 using needs_restart = ss::bool_class<struct needs_restart_tag>;
 using is_secret = ss::bool_class<struct is_secret_tag>;
 
+// Whether to redact secrets. If true, `secret_placeholder` should be used
+// instead of the config value.
+using redact_secrets = ss::bool_class<struct redact_secrets_tag>;
+
 enum class visibility {
     // Tunables can be set by the user, but they control implementation
     // details like (e.g. buffer sizes, queue lengths)
@@ -45,6 +50,16 @@ enum class visibility {
     // should never be presented to the user for editing.
     deprecated,
 };
+
+// Whether to force an even or an odd value for a given property.
+enum class odd_even_constraint {
+    even,
+    odd,
+};
+
+// This is equivalent to cluster::cluster_version, but defined here to
+// avoid a dependency between config/ and cluster/
+using legacy_version = named_type<int64_t, struct legacy_version_tag>;
 
 std::string_view to_string_view(visibility v);
 
@@ -75,7 +90,8 @@ public:
     // this serializes the property value. a full configuration serialization is
     // performed in config_store::to_json where the json object key is taken
     // from the property name.
-    virtual void to_json(json::Writer<json::StringBuffer>& w) const = 0;
+    virtual void to_json(
+      json::Writer<json::StringBuffer>& w, redact_secrets redact) const = 0;
 
     virtual void print(std::ostream&) const = 0;
     virtual bool set_value(YAML::Node) = 0;
@@ -114,6 +130,12 @@ public:
     virtual std::optional<validation_error> validate(YAML::Node) const = 0;
     virtual base_property& operator=(const base_property&) = 0;
     virtual ~base_property() noexcept = default;
+
+    /**
+     * Notify the property of the cluster's original logical version, in case
+     * it has alternative defaults for old clusters.
+     */
+    virtual void notify_original_version(legacy_version) = 0;
 
 private:
     friend std::ostream& operator<<(std::ostream&, const base_property&);

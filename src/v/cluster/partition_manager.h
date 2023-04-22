@@ -11,11 +11,14 @@
 
 #pragma once
 
-#include "cloud_storage/cache_service.h"
-#include "cloud_storage/partition_recovery_manager.h"
-#include "cloud_storage/remote.h"
+#include "archival/fwd.h"
+#include "cloud_storage/fwd.h"
+#include "cluster/fwd.h"
 #include "cluster/ntp_callbacks.h"
 #include "cluster/partition.h"
+#include "cluster/types.h"
+#include "features/feature_table.h"
+#include "model/fundamental.h"
 #include "model/metadata.h"
 #include "raft/consensus_client_protocol.h"
 #include "raft/group_manager.h"
@@ -37,7 +40,14 @@ public:
       ss::sharded<cluster::tx_gateway_frontend>&,
       ss::sharded<cloud_storage::partition_recovery_manager>&,
       ss::sharded<cloud_storage::remote>&,
-      ss::sharded<cloud_storage::cache>&);
+      ss::sharded<cloud_storage::cache>&,
+      ss::lw_shared_ptr<const archival::configuration>,
+      ss::sharded<features::feature_table>&,
+      ss::sharded<cluster::tm_stm_cache_manager>&,
+      ss::sharded<archival::upload_housekeeping_service>&,
+      config::binding<uint64_t>);
+
+    ~partition_manager();
 
     using manage_cb_t
       = ss::noncopyable_function<void(ss::lw_shared_ptr<partition>)>;
@@ -72,15 +82,19 @@ public:
 
     ss::future<> start() { return ss::now(); }
     ss::future<> stop_partitions();
-    ss::future<consensus_ptr>
-      manage(storage::ntp_config, raft::group_id, std::vector<model::broker>);
+    ss::future<consensus_ptr> manage(
+      storage::ntp_config,
+      raft::group_id,
+      std::vector<model::broker>,
+      std::optional<remote_topic_properties> = std::nullopt,
+      std::optional<cloud_storage_clients::bucket_name> = std::nullopt,
+      raft::with_learner_recovery_throttle
+      = raft::with_learner_recovery_throttle::yes,
+      raft::keep_snapshotted_log = raft::keep_snapshotted_log::no);
 
     ss::future<> shutdown(const model::ntp& ntp);
-    ss::future<> remove(const model::ntp& ntp);
 
-    std::optional<storage::log> log(const model::ntp& ntp) {
-        return _storage.log_mgr().get(ntp);
-    }
+    ss::future<> remove(const model::ntp& ntp, partition_removal_mode mode);
 
     /*
      * register for notification of new partitions within the specific topic
@@ -89,8 +103,8 @@ public:
      *
      * the callback must not block.
      *
-     * we don't currently have any mechanism for un-managing partitions, so that
-     * interface is non-existent.
+     * we don't currently have any mechanism for un-managing partitions, so
+     * that interface is non-existent.
      */
     notification_id_type register_manage_notification(
       const model::ns& ns, const model::topic& topic, manage_cb_t cb) {
@@ -117,8 +131,8 @@ public:
      *
      * the callback must not block.
      *
-     * we don't currently have any mechanism for un-managing partitions, so that
-     * interface is non-existent.
+     * we don't currently have any mechanism for un-managing partitions, so
+     * that interface is non-existent.
      */
     notification_id_type register_unmanage_notification(
       const model::ns& ns, const model::topic& topic, unmanage_cb_t cb) {
@@ -163,6 +177,10 @@ public:
         }
     }
 
+    /// Report the aggregate backlog of all archivers for all managed
+    /// partitions
+    uint64_t upload_backlog_size() const;
+
 private:
     /// Download log if partition_recovery_manager is initialized.
     ///
@@ -170,8 +188,8 @@ private:
     /// In this case this method always returns false.
     /// \param ntp_cfg is an ntp_config instance to recover
     /// \return true if the recovery was invoked, false otherwise
-    ss::future<cloud_storage::log_recovery_result>
-    maybe_download_log(storage::ntp_config& ntp_cfg);
+    ss::future<cloud_storage::log_recovery_result> maybe_download_log(
+      storage::ntp_config& ntp_cfg, std::optional<remote_topic_properties> rtp);
 
     ss::future<> do_shutdown(ss::lw_shared_ptr<partition>);
 
@@ -190,8 +208,23 @@ private:
       _partition_recovery_mgr;
     ss::sharded<cloud_storage::remote>& _cloud_storage_api;
     ss::sharded<cloud_storage::cache>& _cloud_storage_cache;
+    ss::lw_shared_ptr<const archival::configuration> _archival_conf;
+    ss::sharded<features::feature_table>& _feature_table;
+    ss::sharded<cluster::tm_stm_cache_manager>& _tm_stm_cache_manager;
+    ss::sharded<archival::upload_housekeeping_service>& _upload_hks;
     ss::gate _gate;
+
+    // In general, all our background work is in partition objects which
+    // have their own abort source.  This abort source is only for work that
+    // happens after partition stop, during deletion.
+    ss::abort_source _as;
+
     bool _block_new_leadership{false};
+
+    config::binding<uint64_t> _max_concurrent_producer_ids;
+
+    // Our handle from registering for leadership notifications on group_manager
+    std::optional<cluster::notification_id_type> _leader_notify_handle;
 
     friend std::ostream& operator<<(std::ostream&, const partition_manager&);
 };

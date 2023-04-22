@@ -11,7 +11,6 @@
 #include "random/generators.h"
 #include "storage/opfuzz/opfuzz.h"
 #include "storage/tests/storage_test_fixture.h"
-#include "storage/tests/utils/random_batch.h"
 #include "storage/types.h"
 #include "test_utils/fixture.h"
 #include "utils/file_sanitizer.h"
@@ -35,7 +34,6 @@ FIXTURE_TEST(test_random_workload, storage_test_fixture) {
     // BLOCK on logging so that we can make sense of the logs
     std::cout.setf(std::ios::unitbuf);
     storage::log_manager mngr = make_log_manager(storage::log_config(
-      storage::log_config::storage_type::disk,
       std::move(test_dir),
       200_MiB,
       storage::debug_sanitize_files::no,
@@ -84,7 +82,6 @@ FIXTURE_TEST(test_random_remove, storage_test_fixture) {
     // BLOCK on logging so that we can make sense of the logs
     std::cout.setf(std::ios::unitbuf);
     storage::log_manager mngr = make_log_manager(storage::log_config(
-      storage::log_config::storage_type::disk,
       std::move(test_dir),
       200_MiB,
       storage::debug_sanitize_files::no,
@@ -127,7 +124,7 @@ FIXTURE_TEST(test_random_remove, storage_test_fixture) {
 
     std::vector<size_t> random_ntp_removal_sequence;
     std::generate_n(
-      std::back_inserter(random_ntp_removal_sequence), ntp_count, [ntp_count] {
+      std::back_inserter(random_ntp_removal_sequence), ntp_count, [] {
           // generate *inclusive* indices
           return random_generators::get_int<size_t>(0, ntp_count - 1);
       });

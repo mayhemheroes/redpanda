@@ -21,15 +21,6 @@
 
 namespace kafka {
 
-struct heartbeat_response;
-
-struct heartbeat_api final {
-    using response_type = heartbeat_response;
-
-    static constexpr const char* name = "heartbeat";
-    static constexpr api_key key = api_key(12);
-};
-
 struct heartbeat_request final {
     using api_type = heartbeat_api;
 
@@ -38,18 +29,19 @@ struct heartbeat_request final {
     // set during request processing after mapping group to ntp
     model::ntp ntp;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
-};
 
-inline std::ostream& operator<<(std::ostream& os, const heartbeat_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const heartbeat_request& r) {
+        return os << r.data;
+    }
+};
 
 struct heartbeat_response final {
     using api_type = heartbeat_api;
@@ -66,21 +58,22 @@ struct heartbeat_response final {
     heartbeat_response(const heartbeat_request&, error_code error)
       : heartbeat_response(error) {}
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
+
+    friend std::ostream&
+    operator<<(std::ostream& os, const heartbeat_response& r) {
+        return os << r.data;
+    }
 };
 
 inline ss::future<heartbeat_response> make_heartbeat_error(error_code error) {
     return ss::make_ready_future<heartbeat_response>(error);
-}
-
-inline std::ostream& operator<<(std::ostream& os, const heartbeat_response& r) {
-    return os << r.data;
 }
 
 } // namespace kafka

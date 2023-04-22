@@ -25,15 +25,17 @@ struct seed_server {
     net::unresolved_address addr;
 
     bool operator==(const seed_server&) const = default;
+    friend bool operator<(const seed_server& lhs, const seed_server& rhs) {
+        return lhs.addr < rhs.addr;
+    }
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const config::seed_server& s) {
+        fmt::print(o, "addr: {}", s.addr);
+        return o;
+    }
 };
 } // namespace config
-
-namespace std {
-static inline ostream& operator<<(ostream& o, const config::seed_server& s) {
-    fmt::print(o, "addr: {}", s.addr);
-    return o;
-}
-} // namespace std
 
 namespace YAML {
 template<>

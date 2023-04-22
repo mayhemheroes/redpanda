@@ -13,19 +13,18 @@ import (
 	"fmt"
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/irq"
-	log "github.com/sirupsen/logrus"
+	"go.uber.org/zap"
 )
 
 func getDefaultMode(
-	nic Nic, cpuMask string, cpuMasks irq.CpuMasks,
+	nic Nic, cpuMask string, cpuMasks irq.CPUMasks,
 ) (irq.Mode, error) {
-
 	if nic.IsHwInterface() {
 		rxQueuesCount, err := nic.GetRxQueueCount()
 		if err != nil {
 			return "", err
 		}
-		log.Debugf("Calculating default mode for '%s'", nic.Name())
+		zap.L().Sugar().Debugf("Calculating default mode for '%s'", nic.Name())
 		numOfCores, err := cpuMasks.GetNumberOfCores(cpuMask)
 		if err != nil {
 			return "", err
@@ -34,7 +33,7 @@ func getDefaultMode(
 		if err != nil {
 			return "", err
 		}
-		log.Debugf("Considering '%d' cores and '%d' PUs", numOfCores, numOfPUs)
+		zap.L().Sugar().Debugf("Considering '%d' cores and '%d' PUs", numOfCores, numOfPUs)
 
 		if numOfPUs <= 4 || rxQueuesCount == int(numOfPUs) {
 			return irq.Mq, nil
@@ -64,24 +63,24 @@ func getDefaultMode(
 		}
 		return defaultMode, nil
 	}
-	return "", fmt.Errorf("Virutal device %s is not supported", nic.Name())
+	return "", fmt.Errorf("Virtual device %s is not supported", nic.Name())
 }
 
 func GetRpsCPUMask(
-	nic Nic, mode irq.Mode, cpuMask string, cpuMasks irq.CpuMasks,
+	nic Nic, mode irq.Mode, cpuMask string, cpuMasks irq.CPUMasks,
 ) (string, error) {
-	effectiveCPUMask, err := cpuMasks.BaseCpuMask(cpuMask)
+	effectiveCPUMask, err := cpuMasks.BaseCPUMask(cpuMask)
 	if err != nil {
 		return "", err
 	}
-	var effectiveMode = mode
+	effectiveMode := mode
 	if mode == irq.Default {
 		effectiveMode, err = getDefaultMode(nic, effectiveCPUMask, cpuMasks)
 		if err != nil {
 			return "", err
 		}
 	}
-	computationsCPUMask, err := cpuMasks.CpuMaskForComputations(
+	computationsCPUMask, err := cpuMasks.CPUMaskForComputations(
 		effectiveMode, effectiveCPUMask)
 	if err != nil {
 		return "", err
@@ -90,13 +89,13 @@ func GetRpsCPUMask(
 }
 
 func GetHwInterfaceIRQsDistribution(
-	nic Nic, mode irq.Mode, cpuMask string, cpuMasks irq.CpuMasks,
+	nic Nic, mode irq.Mode, cpuMask string, cpuMasks irq.CPUMasks,
 ) (map[int]string, error) {
-	effectiveCPUMask, err := cpuMasks.BaseCpuMask(cpuMask)
+	effectiveCPUMask, err := cpuMasks.BaseCPUMask(cpuMask)
 	if err != nil {
 		return nil, err
 	}
-	var effectiveMode = mode
+	effectiveMode := mode
 	if mode == irq.Default {
 		effectiveMode, err = getDefaultMode(nic, effectiveCPUMask, cpuMasks)
 		if err != nil {
@@ -113,13 +112,13 @@ func GetHwInterfaceIRQsDistribution(
 		return nil, err
 	}
 
-	irqCPUMask, err := cpuMasks.CpuMaskForIRQs(effectiveMode, effectiveCPUMask)
+	irqCPUMask, err := cpuMasks.CPUMaskForIRQs(effectiveMode, effectiveCPUMask)
 	if err != nil {
 		return nil, err
 	}
 
 	if maxRxQueues >= len(allIRQs) {
-		log.Debugf("Calculating distribution '%s' IRQs", nic.Name())
+		zap.L().Sugar().Debugf("Calculating distribution '%s' IRQs", nic.Name())
 		IRQsDistribution, err := cpuMasks.GetIRQsDistributionMasks(
 			allIRQs, irqCPUMask)
 		if err != nil {
@@ -132,14 +131,14 @@ func GetHwInterfaceIRQsDistribution(
 	if err != nil {
 		return nil, err
 	}
-	log.Debugf("Number of Rx queues for '%s' = '%d'", nic.Name(), rxQueues)
-	log.Infof("Distributing '%s' IRQs handling Rx queues", nic.Name())
+	zap.L().Sugar().Debugf("Number of Rx queues for '%s' = '%d'", nic.Name(), rxQueues)
+	fmt.Printf("Distributing '%s' IRQs handling Rx queues\n", nic.Name())
 	IRQsDistribution, err := cpuMasks.GetIRQsDistributionMasks(
 		allIRQs[0:rxQueues], irqCPUMask)
 	if err != nil {
 		return nil, err
 	}
-	log.Infof("Distributing rest of '%s' IRQs", nic.Name())
+	fmt.Printf("Distributing rest of '%s' IRQs\n", nic.Name())
 	restIRQsDistribution, err := cpuMasks.GetIRQsDistributionMasks(
 		allIRQs[rxQueues:], irqCPUMask)
 	if err != nil {
@@ -171,7 +170,6 @@ func CollectIRQs(nic Nic) ([]int, error) {
 				return nil, err
 			}
 			IRQs = append(IRQs, slaveIRQs...)
-
 		}
 	}
 	return IRQs, nil

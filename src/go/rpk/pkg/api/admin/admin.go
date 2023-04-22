@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -29,16 +28,16 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/net"
 	"github.com/sethgrid/pester"
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
+	"go.uber.org/zap"
 )
 
-// ErrNoAdminAPILeader happen when there's no leader for the Admin API
+// ErrNoAdminAPILeader happen when there's no leader for the Admin API.
 var ErrNoAdminAPILeader = errors.New("no Admin API leader found")
 
-type HttpError struct {
+type HTTPResponseError struct {
 	Method   string
-	Url      string
+	URL      string
 	Response *http.Response
 	Body     []byte
 }
@@ -57,8 +56,8 @@ type GenericErrorBody struct {
 // AdminAPI is a client to interact with Redpanda's admin server.
 type AdminAPI struct {
 	urls                []string
-	brokerIdToUrlsMutex sync.Mutex
-	brokerIdToUrls      map[int]string
+	brokerIDToUrlsMutex sync.Mutex
+	brokerIDToUrls      map[int]string
 	retryClient         *pester.Client
 	oneshotClient       *http.Client
 	basicCredentials    BasicCredentials
@@ -66,8 +65,8 @@ type AdminAPI struct {
 }
 
 func getBasicCredentials(cfg *config.Config) BasicCredentials {
-	if cfg.Rpk.KafkaApi.SASL != nil {
-		return BasicCredentials{Username: cfg.Rpk.KafkaApi.SASL.User, Password: cfg.Rpk.KafkaApi.SASL.Password}
+	if cfg.Rpk.KafkaAPI.SASL != nil {
+		return BasicCredentials{Username: cfg.Rpk.KafkaAPI.SASL.User, Password: cfg.Rpk.KafkaAPI.SASL.Password}
 	} else {
 		return BasicCredentials{Username: "", Password: ""}
 	}
@@ -76,7 +75,7 @@ func getBasicCredentials(cfg *config.Config) BasicCredentials {
 // NewClient returns an AdminAPI client that talks to each of the addresses in
 // the rpk.admin_api section of the config.
 func NewClient(fs afero.Fs, cfg *config.Config) (*AdminAPI, error) {
-	a := &cfg.Rpk.AdminApi
+	a := &cfg.Rpk.AdminAPI
 	addrs := a.Addresses
 	tc, err := a.TLS.Config(fs)
 	if err != nil {
@@ -95,7 +94,7 @@ func NewHostClient(
 		return nil, errors.New("invalid empty admin host")
 	}
 
-	a := &cfg.Rpk.AdminApi
+	a := &cfg.Rpk.AdminAPI
 	addrs := a.Addresses
 	tc, err := a.TLS.Config(fs)
 	if err != nil {
@@ -152,7 +151,7 @@ func newAdminAPI(
 	client.LogHook = func(e pester.ErrEntry) {
 		// Only log from here when retrying: a final error propagates to caller
 		if e.Err != nil && e.Retry <= client.MaxRetries {
-			log.Infof("Retrying %s for error: %s", e.Verb, e.Err.Error())
+			fmt.Printf("Retrying %s for error: %s\n", e.Verb, e.Err.Error())
 		}
 	}
 
@@ -164,7 +163,7 @@ func newAdminAPI(
 		oneshotClient:    &http.Client{Timeout: 10 * time.Second},
 		basicCredentials: creds,
 		tlsConfig:        tlsConfig,
-		brokerIdToUrls:   make(map[int]string),
+		brokerIDToUrls:   make(map[int]string),
 	}
 	if tlsConfig != nil {
 		a.retryClient.Transport = &http.Transport{TLSClientConfig: tlsConfig}
@@ -215,25 +214,25 @@ var rng = func() func(int) int {
 	}
 }()
 
-func (a *AdminAPI) mapBrokerIDsToURLs() {
+func (a *AdminAPI) mapBrokerIDsToURLs(ctx context.Context) {
 	err := a.eachBroker(func(aa *AdminAPI) error {
-		nc, err := aa.GetNodeConfig()
+		nc, err := aa.GetNodeConfig(ctx)
 		if err != nil {
 			return err
 		}
-		a.brokerIdToUrlsMutex.Lock()
-		a.brokerIdToUrls[nc.NodeID] = aa.urls[0]
-		a.brokerIdToUrlsMutex.Unlock()
+		a.brokerIDToUrlsMutex.Lock()
+		a.brokerIDToUrls[nc.NodeID] = aa.urls[0]
+		a.brokerIDToUrlsMutex.Unlock()
 		return nil
 	})
 	if err != nil {
-		log.Warn(fmt.Sprintf("failed to map brokerID to URL for 1 or more brokers: %v", err))
+		zap.L().Sugar().Warn(fmt.Sprintf("failed to map brokerID to URL for 1 or more brokers: %v", err))
 	}
 }
 
-// GetLeaderID returns the broker ID of the leader of the Admin API
-func (a *AdminAPI) GetLeaderID() (*int, error) {
-	pa, err := a.GetPartition("redpanda", "controller", 0)
+// GetLeaderID returns the broker ID of the leader of the Admin API.
+func (a *AdminAPI) GetLeaderID(ctx context.Context) (*int, error) {
+	pa, err := a.GetPartition(ctx, "redpanda", "controller", 0)
 	if pa.LeaderID == -1 {
 		return nil, ErrNoAdminAPILeader
 	}
@@ -249,12 +248,15 @@ func (a *AdminAPI) GetLeaderID() (*int, error) {
 // On errors, this function will keep trying all the nodes we know about until
 // one of them succeeds, or we run out of nodes.  In the latter case, we will return
 // the error from the last node we tried.
-func (a *AdminAPI) sendAny(method, path string, body, into interface{}) error {
+func (a *AdminAPI) sendAny(ctx context.Context, method, path string, body, into interface{}) error {
 	// Shuffle the list of URLs
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	shuffled := make([]string, len(a.urls))
 	copy(shuffled, a.urls)
 	rng.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+
+	// After a 503 or 504, wait a little for an election
+	const unavailableBackoff = 1500 * time.Millisecond
 
 	var err error
 	for i := range shuffled {
@@ -262,7 +264,17 @@ func (a *AdminAPI) sendAny(method, path string, body, into interface{}) error {
 
 		// If err is set, we are retrying after a failure on the previous node
 		if err != nil {
-			log.Infof("Request error, trying another node: %s", err.Error())
+			fmt.Printf("Request error, trying another node: %s\n", err.Error())
+			var httpErr *HTTPResponseError
+			if errors.As(err, &httpErr) {
+				status := httpErr.Response.StatusCode
+
+				// The node was up but told us the cluster
+				// wasn't ready: wait before retry.
+				if status == 503 || status == 504 {
+					time.Sleep(unavailableBackoff)
+				}
+			}
 		}
 
 		// Where there are multiple nodes, disable the HTTP request retry in favour of our
@@ -270,7 +282,7 @@ func (a *AdminAPI) sendAny(method, path string, body, into interface{}) error {
 		retryable := len(shuffled) == 1
 
 		var res *http.Response
-		res, err = a.sendAndReceive(context.Background(), method, url, body, retryable)
+		res, err = a.sendAndReceive(ctx, method, url, body, retryable)
 		if err == nil {
 			// Success, return the result from this node.
 			return maybeUnmarshalRespInto(method, url, res, into)
@@ -282,9 +294,9 @@ func (a *AdminAPI) sendAny(method, path string, body, into interface{}) error {
 }
 
 // sendToLeader sends a single request to the leader of the Admin API for Redpanda >= 21.11.1
-// otherwise, it broadcasts the request
+// otherwise, it broadcasts the request.
 func (a *AdminAPI) sendToLeader(
-	method, path string, body, into interface{},
+	ctx context.Context, method, path string, body, into interface{},
 ) error {
 	const (
 		// When there is no leader, we wait long enough for an election to complete
@@ -296,7 +308,7 @@ func (a *AdminAPI) sendToLeader(
 	)
 	// If there's only one broker, let's just send the request to it
 	if len(a.urls) == 1 {
-		return a.sendOne(method, path, body, into, true)
+		return a.sendOne(ctx, method, path, body, into, true)
 	}
 
 	retries := 3
@@ -304,7 +316,7 @@ func (a *AdminAPI) sendToLeader(
 	var leaderURL string
 	for leaderID == nil || leaderURL == "" {
 		var err error
-		leaderID, err = a.GetLeaderID()
+		leaderID, err = a.GetLeaderID(ctx)
 		if errors.Is(err, ErrNoAdminAPILeader) {
 			// No leader?  We might have contacted a recently-started node
 			// who doesn't know yet, or there might be an election pending,
@@ -320,27 +332,25 @@ func (a *AdminAPI) sendToLeader(
 			return err
 		} else {
 			// Got a leader ID, check if it's resolvable
-			leaderURL, err = a.brokerIDToURL(*leaderID)
-			if err != nil && len(a.brokerIdToUrls) == 0 {
+			leaderURL, err = a.brokerIDToURL(ctx, *leaderID)
+			if err != nil && len(a.brokerIDToUrls) == 0 {
 				// Could not map any IDs: probably this is an old redpanda
 				// with no node_config endpoint.  Fall back to broadcast.
-				return a.sendAll(method, path, body, into)
-			} else if err != nil {
-				// Have ID mapping for some nodes but not the one that is
-				// allegedly the leader.  This leader ID is probably stale,
-				// e.g. if it just died a moment ago.  Try again.  This is
-				// a long timeout, because it's the sum of the time for nodes
-				// to start an election, followed by the worst cast number of
-				// election rounds
-				retries -= 1
-				if retries == 0 {
-					return err
-				}
-				time.Sleep(staleLeaderBackoff)
-			} else {
-				// Success: break out of retry loop
+				return a.sendAll(ctx, method, path, body, into)
+			} else if err == nil {
 				break
 			}
+			// Have ID mapping for some nodes but not the one that is
+			// allegedly the leader.  This leader ID is probably stale,
+			// e.g. if it just died a moment ago.  Try again.  This is
+			// a long timeout, because it's the sum of the time for nodes
+			// to start an election, followed by the worst cast number of
+			// election rounds
+			retries -= 1
+			if retries == 0 {
+				return err
+			}
+			time.Sleep(staleLeaderBackoff)
 		}
 	}
 
@@ -348,15 +358,15 @@ func (a *AdminAPI) sendToLeader(
 	if err != nil {
 		return err
 	}
-	return aLeader.sendOne(method, path, body, into, true)
+	return aLeader.sendOne(ctx, method, path, body, into, true)
 }
 
-func (a *AdminAPI) brokerIDToURL(brokerID int) (string, error) {
+func (a *AdminAPI) brokerIDToURL(ctx context.Context, brokerID int) (string, error) {
 	if url, ok := a.getURLFromBrokerID(brokerID); ok {
 		return url, nil
 	} else {
 		// Try once to map again broker IDs to URLs
-		a.mapBrokerIDsToURLs()
+		a.mapBrokerIDsToURLs(ctx)
 		if url, ok := a.getURLFromBrokerID(brokerID); ok {
 			return url, nil
 		}
@@ -365,9 +375,9 @@ func (a *AdminAPI) brokerIDToURL(brokerID int) (string, error) {
 }
 
 func (a *AdminAPI) getURLFromBrokerID(brokerID int) (string, bool) {
-	a.brokerIdToUrlsMutex.Lock()
-	url, ok := a.brokerIdToUrls[brokerID]
-	a.brokerIdToUrlsMutex.Unlock()
+	a.brokerIDToUrlsMutex.Lock()
+	url, ok := a.brokerIDToUrls[brokerID]
+	a.brokerIDToUrlsMutex.Unlock()
 	return url, ok
 }
 
@@ -378,13 +388,13 @@ func (a *AdminAPI) getURLFromBrokerID(brokerID int) (string, bool) {
 // as temporarily having no leader for a raft group.  Set it to false if the endpoint
 // should always work while the node is up, e.g. GETs of node-local state.
 func (a *AdminAPI) sendOne(
-	method, path string, body, into interface{}, retryable bool,
+	ctx context.Context, method, path string, body, into interface{}, retryable bool,
 ) error {
 	if len(a.urls) != 1 {
 		return fmt.Errorf("unable to issue a single-admin-endpoint request to %d admin endpoints", len(a.urls))
 	}
 	url := a.urls[0] + path
-	res, err := a.sendAndReceive(context.Background(), method, url, body, retryable)
+	res, err := a.sendAndReceive(ctx, method, url, body, retryable)
 	if err != nil {
 		return err
 	}
@@ -404,7 +414,7 @@ func (a *AdminAPI) sendOne(
 // Unfortunately these assumptions do not match all environments in which
 // Redpanda is deployed, hence, we need to reintroduce the sendAll method and
 // broadcast on writes to the Admin API.
-func (a *AdminAPI) sendAll(method, path string, body, into interface{}) error {
+func (a *AdminAPI) sendAll(rootCtx context.Context, method, path string, body, into interface{}) error {
 	var (
 		once   sync.Once
 		resURL string
@@ -426,7 +436,7 @@ func (a *AdminAPI) sendAll(method, path string, body, into interface{}) error {
 	)
 
 	for i, url := range a.urlsWithPath(path) {
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(rootCtx)
 		myURL := url
 		except := i
 		cancels = append(cancels, cancel)
@@ -453,7 +463,7 @@ func (a *AdminAPI) sendAll(method, path string, body, into interface{}) error {
 }
 
 // eachBroker creates a single host AdminAPI for each of the brokers and calls `fn`
-// for each of them in a go routine
+// for each of them in a go routine.
 func (a *AdminAPI) eachBroker(fn func(aa *AdminAPI) error) error {
 	var grp multierror.Group
 	for _, url := range a.urls {
@@ -477,10 +487,11 @@ func (a *AdminAPI) eachBroker(fn func(aa *AdminAPI) error) error {
 func maybeUnmarshalRespInto(
 	method, url string, resp *http.Response, into interface{},
 ) error {
+	defer resp.Body.Close()
 	if into == nil {
 		return nil
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("unable to read %s %s response body: %w", method, url, err)
 	}
@@ -499,16 +510,23 @@ func maybeUnmarshalRespInto(
 
 // sendAndReceive sends a request and returns the response. If body is
 // non-nil, this json encodes the body and sends it with the request.
+// If the body is already an io.Reader, the reader is used directly
+// without marshaling.
 func (a *AdminAPI) sendAndReceive(
 	ctx context.Context, method, url string, body interface{}, retryable bool,
 ) (*http.Response, error) {
 	var r io.Reader
 	if body != nil {
-		bs, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("unable to encode request body for %s %s: %w", method, url, err) // should not happen
+		// We might be passing io reader already as body, e.g: license file.
+		if v, ok := body.(io.Reader); ok {
+			r = v
+		} else {
+			bs, err := json.Marshal(body)
+			if err != nil {
+				return nil, fmt.Errorf("unable to encode request body for %s %s: %w", method, url, err) // should not happen
+			}
+			r = bytes.NewBuffer(bs)
 		}
-		r = bytes.NewBuffer(bs)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, url, r)
@@ -520,9 +538,9 @@ func (a *AdminAPI) sendAndReceive(
 		req.SetBasicAuth(a.basicCredentials.Username, a.basicCredentials.Password)
 	}
 
-	const applicationJson = "application/json"
-	req.Header.Set("Content-Type", applicationJson)
-	req.Header.Set("Accept", applicationJson)
+	const applicationJSON = "application/json"
+	req.Header.Set("Content-Type", applicationJSON)
+	req.Header.Set("Accept", applicationJSON)
 
 	// Issue request to the appropriate client, depending on retry behaviour
 	var res *http.Response
@@ -544,24 +562,24 @@ func (a *AdminAPI) sendAndReceive(
 	}
 
 	if res.StatusCode/100 != 2 {
-		resBody, err := ioutil.ReadAll(res.Body)
+		resBody, err := io.ReadAll(res.Body)
 		status := http.StatusText(res.StatusCode)
 		if err != nil {
 			return nil, fmt.Errorf("request %s %s failed: %s, unable to read body: %w", method, url, status, err)
 		}
-		return nil, &HttpError{Response: res, Body: resBody}
+		return nil, &HTTPResponseError{Response: res, Body: resBody, Method: method, URL: url}
 	}
 
 	return res, nil
 }
 
-func (he HttpError) DecodeGenericErrorBody() (GenericErrorBody, error) {
+func (he HTTPResponseError) DecodeGenericErrorBody() (GenericErrorBody, error) {
 	var resp GenericErrorBody
 	err := json.Unmarshal(he.Body, &resp)
 	return resp, err
 }
 
-func (he HttpError) Error() string {
-	return fmt.Sprintf("request %s %s failed: %s, body: %q",
-		he.Method, he.Url, http.StatusText(he.Response.StatusCode), he.Body)
+func (he HTTPResponseError) Error() string {
+	return fmt.Sprintf("request %s %s failed: %s, body: %q\n",
+		he.Method, he.URL, http.StatusText(he.Response.StatusCode), he.Body)
 }

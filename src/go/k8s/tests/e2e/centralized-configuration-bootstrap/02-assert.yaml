@@ -26,3 +26,10 @@ status:
           message: |
             40960
   phase: Succeeded
+
+---
+
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+collectors:
+  - command: ../../../hack/get-redpanda-info.sh

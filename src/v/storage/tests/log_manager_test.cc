@@ -9,6 +9,7 @@
 
 #include "model/fundamental.h"
 #include "model/record_utils.h"
+#include "model/tests/random_batch.h"
 #include "random/generators.h"
 #include "storage/api.h"
 #include "storage/directories.h"
@@ -16,7 +17,6 @@
 #include "storage/segment_appender.h"
 #include "storage/segment_appender_utils.h"
 #include "storage/segment_reader.h"
-#include "storage/tests/utils/random_batch.h"
 #include "utils/file_sanitizer.h"
 
 #include <seastar/core/thread.hh>
@@ -34,7 +34,7 @@ void write_garbage(segment_appender& ptr) {
 }
 
 void write_batches(ss::lw_shared_ptr<segment> seg) {
-    auto batches = test::make_random_batches(
+    auto batches = model::test::make_random_batches(
       seg->offsets().base_offset + model::offset(1), 1);
     for (auto& b : batches) {
         b.header().header_crc = model::internal_header_only_crc(b.header());
@@ -44,11 +44,7 @@ void write_batches(ss::lw_shared_ptr<segment> seg) {
 }
 
 log_config make_config() {
-    return log_config{
-      log_config::storage_type::disk,
-      "test.dir",
-      1024,
-      debug_sanitize_files::yes};
+    return log_config{"test.dir", 1024, debug_sanitize_files::yes};
 }
 
 ntp_config config_from_ntp(const model::ntp& ntp) {
@@ -60,6 +56,14 @@ constexpr unsigned default_segment_readahead_count = 10;
 
 SEASTAR_THREAD_TEST_CASE(test_can_load_logs) {
     auto conf = make_config();
+
+    ss::sharded<features::feature_table> feature_table;
+    feature_table.start().get();
+    feature_table
+      .invoke_on_all(
+        [](features::feature_table& f) { f.testing_activate_all(); })
+      .get();
+
     storage::api store(
       [conf]() {
           return storage::kvstore_config(
@@ -68,9 +72,13 @@ SEASTAR_THREAD_TEST_CASE(test_can_load_logs) {
             conf.base_dir,
             storage::debug_sanitize_files::yes);
       },
-      [conf]() { return conf; });
+      [conf]() { return conf; },
+      feature_table);
     store.start().get();
-    auto stop_kvstore = ss::defer([&store] { store.stop().get(); });
+    auto stop_kvstore = ss::defer([&store, &feature_table] {
+        store.stop().get();
+        feature_table.stop().get();
+    });
     auto& m = store.log_mgr();
     std::vector<storage::ntp_config> ntps;
     ntps.reserve(4);

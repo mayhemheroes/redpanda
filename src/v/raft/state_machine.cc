@@ -26,7 +26,7 @@ state_machine::state_machine(
   , _bootstrap_last_applied(_raft->read_last_applied()) {}
 
 ss::future<> state_machine::start() {
-    vlog(_log.info, "Starting state machine for ntp={}", _raft->ntp());
+    vlog(_log.debug, "Starting state machine for ntp={}", _raft->ntp());
     ssx::spawn_with_gate(_gate, [this] {
         return ss::do_until(
           [this] { return _gate.is_closed(); }, [this] { return apply(); });
@@ -34,7 +34,10 @@ ss::future<> state_machine::start() {
     return ss::now();
 }
 
-void state_machine::set_next(model::offset offset) { _next = offset; }
+void state_machine::set_next(model::offset offset) {
+    _next = offset;
+    _waiters.notify(model::prev_offset(offset));
+}
 
 ss::future<> state_machine::handle_eviction() {
     vlog(
@@ -45,15 +48,20 @@ ss::future<> state_machine::handle_eviction() {
 }
 
 ss::future<> state_machine::stop() {
+    vlog(_log.debug, "Asked to stop state_machine {}", _raft->ntp());
     _waiters.stop();
     _as.request_abort();
-    return _gate.close();
+    return _gate.close().then([this] {
+        vlog(_log.debug, "state_machine is stopped {}", _raft->ntp());
+    });
 }
 
 ss::future<> state_machine::wait(
-  model::offset offset, model::timeout_clock::time_point timeout) {
-    return ss::with_gate(_gate, [this, timeout, offset] {
-        return _waiters.wait(offset, timeout, std::nullopt);
+  model::offset offset,
+  model::timeout_clock::time_point timeout,
+  std::optional<std::reference_wrapper<ss::abort_source>> as) {
+    return ss::with_gate(_gate, [this, timeout, offset, as] {
+        return _waiters.wait(offset, timeout, as);
     });
 }
 
@@ -73,8 +81,8 @@ state_machine::batch_applicator::operator()(model::record_batch batch) {
 
     auto last_offset = batch.last_offset();
     return _machine->apply(std::move(batch)).then([this, last_offset] {
-        _last_applied = last_offset;
-        _machine->_waiters.notify(_last_applied);
+        _machine->_next = model::next_offset(last_offset);
+        _machine->_waiters.notify(last_offset);
         return ss::stop_iteration::no;
     });
 }
@@ -126,17 +134,25 @@ ss::future<> state_machine::apply() {
       })
       .then([this](model::record_batch_reader reader) {
           // apply each batch to the state machine
-          return std::move(reader)
-            .consume(batch_applicator(this), model::no_timeout)
-            .then([this](model::offset last_applied) {
-                if (last_applied >= model::offset(0)) {
-                    _next = last_applied + model::offset(1);
-                }
-            });
+          return std::move(reader).consume(
+            batch_applicator(this), model::no_timeout);
       })
+      .handle_exception_type([this](const ss::timed_out_error&) {
+          // This is a safe retry, but if it happens in tests we're interested
+          // in seeing what happened in the debug log
+          vlog(
+            _log.debug,
+            "Timeout in state_machine::apply on ntp {}",
+            _raft->ntp());
+      })
+      .handle_exception_type([](const ss::abort_requested_exception&) {})
+      .handle_exception_type([](const ss::gate_closed_exception&) {})
       .handle_exception([this](const std::exception_ptr& e) {
           vlog(
-            _log.info, "State machine for ntp={} handles {}", _raft->ntp(), e);
+            _log.info,
+            "State machine for ntp={} caught exception {}",
+            _raft->ntp(),
+            e);
       });
 }
 
@@ -144,7 +160,7 @@ ss::future<> state_machine::write_last_applied(model::offset o) {
     return _raft->write_last_applied(o);
 }
 
-ss::future<result<model::offset>> state_machine::instert_linerizable_barrier(
+ss::future<result<model::offset>> state_machine::insert_linearizable_barrier(
   model::timeout_clock::time_point timeout) {
     return ss::with_timeout(timeout, _raft->linearizable_barrier())
       .handle_exception_type([](const ss::timed_out_error&) {

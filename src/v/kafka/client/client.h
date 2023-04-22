@@ -27,10 +27,10 @@
 #include "kafka/protocol/list_offsets.h"
 #include "kafka/types.h"
 #include "net/unresolved_address.h"
+#include "ssx/semaphore.h"
 #include "utils/retry.h"
 
 #include <seastar/core/condition-variable.hh>
-#include <seastar/core/semaphore.hh>
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
@@ -61,12 +61,24 @@ public:
 
 private:
     func _func;
-    ss::semaphore _lock{1};
+    ssx::semaphore _lock{1, "k/client"};
 };
+
+namespace impl {
+
+constexpr auto default_external_mitigate = [](std::exception_ptr ex) {
+    return ss::make_exception_future(ex);
+};
+
+}
 
 class client {
 public:
-    explicit client(YAML::Node const& cfg);
+    using external_mitigate
+      = ss::noncopyable_function<ss::future<>(std::exception_ptr)>;
+    explicit client(
+      YAML::Node const& cfg,
+      external_mitigate mitigater = impl::default_external_mitigate);
 
     /// \brief Connect to all brokers.
     ss::future<> connect();
@@ -90,11 +102,11 @@ public:
 
     /// \brief Dispatch a request to any broker.
     template<typename Func>
-    CONCEPT(requires requires {
+    requires requires {
         typename std::invoke_result_t<Func>::api_type::response_type;
-    })
-    ss::future<typename std::invoke_result_t<
-      Func>::api_type::response_type> dispatch(Func func) {
+    }
+    ss::future<typename std::invoke_result_t<Func>::api_type::response_type>
+    dispatch(Func func) {
         return gated_retry_with_mitigation([this, func{std::move(func)}]() {
             return _brokers.any().then([func](shared_broker_t broker) {
                 return broker->dispatch(func());
@@ -162,6 +174,9 @@ public:
     configuration& config() { return _config; }
 
 private:
+    ss::future<list_offsets_response>
+    do_list_offsets(model::topic_partition tp);
+
     /// \brief Connect and update metdata.
     ss::future<> do_connect(net::unresolved_address addr);
 
@@ -204,6 +219,9 @@ private:
       _consumers;
     /// \brief Wait for retries.
     ss::gate _gate;
+
+    ss::noncopyable_function<ss::future<>(std::exception_ptr)>
+      _external_mitigate;
 };
 
 } // namespace kafka::client

@@ -7,6 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+//go:build !windows
+
 package commands
 
 import (
@@ -14,7 +16,7 @@ import (
 	"fmt"
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/ethtool"
-	log "github.com/sirupsen/logrus"
+	"go.uber.org/zap"
 )
 
 type ethtoolChangeCommand struct {
@@ -35,7 +37,7 @@ func NewEthtoolChangeCmd(
 }
 
 func (c *ethtoolChangeCommand) Execute() error {
-	log.Debugf("Chaninging interface '%s', features '%v'", c.intf, c.config)
+	zap.L().Sugar().Debugf("Chaninging interface '%s', features '%v'", c.intf, c.config)
 	return c.ethtool.Change(c.intf, c.config)
 }
 

@@ -15,14 +15,16 @@
 #include "kafka/protocol/errors.h"
 #include "model/fundamental.h"
 #include "model/record.h"
-#include "raft/consensus.h"
 #include "raft/errc.h"
 #include "raft/logger.h"
 #include "raft/state_machine.h"
 #include "raft/types.h"
 #include "storage/snapshot.h"
+#include "storage/types.h"
 #include "utils/expiring_promise.h"
+#include "utils/fragmented_vector.h"
 #include "utils/mutex.h"
+#include "utils/prefix_logger.h"
 
 #include <absl/container/flat_hash_map.h>
 
@@ -66,11 +68,10 @@ struct stm_snapshot {
  *
  * How does it work?
  *
- * When persisted_stm becomes a leader it syncs its state with the tip
- * of the log (by writing a checkout batch checkpoint_batch_type and
- * reading/executing the commands up to its offset) and caches the
- * current raft's term. Then it uses the cached term for conditional
- * replication so in a case when its state becomes stale (a new leader
+ * When persisted_stm becomes a leader it replicates the configuration batch and
+ * uses its offset `last_term_start_offset` as a limit, up to which we read
+ * and execute the commands. It caches the current raft term, and uses that for
+ * conditional replication: In a case when its state becomes stale (a new leader
  * with higher term has been chosen) the conditional replication fails
  * preventing an operation on the stale state.
  *
@@ -89,9 +90,14 @@ public:
     void make_snapshot_in_background() final;
     ss::future<> ensure_snapshot_exists(model::offset) final;
     model::offset max_collectible_offset() override;
-    ss::future<> remove_persistent_state();
+    ss::future<fragmented_vector<model::tx_range>>
+      aborted_tx_ranges(model::offset, model::offset) override;
+    const ss::sstring& name() override { return _snapshot_mgr.name(); }
+
+    virtual ss::future<> remove_persistent_state();
 
     ss::future<> make_snapshot();
+    virtual uint64_t get_snapshot_size() const;
     /*
      * Usually start() acts as a barrier and we don't call any methods on the
      * object before start returns control flow.
@@ -117,8 +123,10 @@ public:
      */
     ss::future<> start() override;
 
-    ss::future<bool>
-    wait_no_throw(model::offset offset, model::timeout_clock::duration);
+    ss::future<bool> wait_no_throw(
+      model::offset offset,
+      model::timeout_clock::time_point,
+      std::optional<std::reference_wrapper<ss::abort_source>> = std::nullopt);
 
 private:
     ss::future<> wait_offset_committed(
@@ -132,6 +140,8 @@ protected:
     ss::future<std::optional<stm_snapshot>> load_snapshot();
     ss::future<> wait_for_snapshot_hydrated();
     ss::future<> persist_snapshot(stm_snapshot&&);
+    static ss::future<>
+    persist_snapshot(storage::simple_snapshot_manager&, stm_snapshot&&);
     ss::future<> do_make_snapshot();
 
     /*
@@ -148,9 +158,10 @@ protected:
     bool _is_catching_up{false};
     model::term_id _insync_term;
     model::offset _insync_offset;
+    uint64_t _snapshot_size{0};
     raft::consensus* _c;
     storage::simple_snapshot_manager _snapshot_mgr;
-    ss::logger& _log;
+    prefix_logger _log;
 };
 
 } // namespace cluster

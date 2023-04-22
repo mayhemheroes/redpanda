@@ -15,7 +15,6 @@
 #include "bytes/iobuf_parser.h"
 #include "model/fundamental.h"
 #include "seastarx.h"
-#include "storage/parser.h"
 
 #include <seastar/util/log.hh>
 
@@ -32,10 +31,10 @@ static constexpr uint32_t FOR_buffer_depth = 16;
  */
 struct delta_xor {
     template<class value_t, size_t row_width>
-    uint8_t encode(
+    constexpr uint8_t encode(
       value_t last,
       const std::array<value_t, row_width>& row,
-      std::array<value_t, row_width>& buf) {
+      std::array<value_t, row_width>& buf) const {
         auto p = last;
         uint64_t agg = 0;
         for (uint32_t i = 0; i < row_width; ++i) {
@@ -43,12 +42,13 @@ struct delta_xor {
             agg |= buf[i];
             p = row[i];
         }
-        uint8_t nbits = 64 - (agg == 0 ? 64 : (uint8_t)__builtin_clzll(agg));
+        uint8_t nbits = std::bit_width(agg);
         return nbits;
     }
 
     template<class value_t, size_t row_width>
-    value_t decode(value_t initial, std::array<value_t, row_width>& row) {
+    constexpr value_t
+    decode(value_t initial, std::array<value_t, row_width>& row) const {
         auto p = initial;
         for (unsigned i = 0; i < row_width; i++) {
             row[i] = row[i] ^ p;
@@ -56,6 +56,8 @@ struct delta_xor {
         }
         return p;
     }
+
+    bool operator==(delta_xor const&) const = default;
 };
 
 /*
@@ -70,14 +72,14 @@ struct delta_xor {
  */
 template<class ValueT>
 struct delta_delta {
-    explicit delta_delta(ValueT step)
+    explicit constexpr delta_delta(ValueT step = {0})
       : _step_size(step) {}
 
     template<class value_t, size_t row_width>
-    uint8_t encode(
+    constexpr uint8_t encode(
       value_t last,
       const std::array<value_t, row_width>& row,
-      std::array<value_t, row_width>& buf) {
+      std::array<value_t, row_width>& buf) const {
         auto p = last;
         uint64_t agg = 0;
         for (uint32_t i = 0; i < row_width; ++i) {
@@ -96,12 +98,13 @@ struct delta_delta {
             agg |= buf[i];
             p = row[i];
         }
-        uint8_t nbits = 64 - (agg == 0 ? 64 : (uint8_t)__builtin_clzll(agg));
+        uint8_t nbits = std::bit_width(agg);
         return nbits;
     }
 
     template<class value_t, size_t row_width>
-    value_t decode(value_t initial, std::array<value_t, row_width>& row) {
+    constexpr value_t
+    decode(value_t initial, std::array<value_t, row_width>& row) const {
         auto p = initial;
         for (unsigned i = 0; i < row_width; i++) {
             row[i] = row[i] + p + _step_size;
@@ -111,9 +114,28 @@ struct delta_delta {
     }
 
     ValueT _step_size;
+
+    bool operator==(delta_delta const&) const = default;
 };
 
 } // namespace details
+
+/// Position in the delta_for encoded data stream
+template<class T>
+struct deltafor_stream_pos_t
+  : public serde::envelope<
+      deltafor_stream_pos_t<T>,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    /// Initial value for the next row
+    T initial;
+    /// Offset of the next row
+    uint32_t offset;
+    /// Number of rows before the next row
+    uint32_t num_rows;
+
+    auto serde_fields() { return std::tie(initial, offset, num_rows); }
+};
 
 /** \brief Delta-FOR encoder
  *
@@ -183,28 +205,71 @@ struct delta_delta {
  * The 'DeltaStep' type parameter is a type of the delta encoding
  * step (two implementations are provided, delta XOR and delta-delta).
  */
-template<class TVal, class DeltaStep = details::delta_xor>
-class deltafor_encoder {
+template<
+  class TVal,
+  class DeltaStep = details::delta_xor,
+  bool use_nttp_deltastep = false,
+  DeltaStep delta_alg = DeltaStep{}>
+class deltafor_encoder
+  : public serde::envelope<
+      deltafor_encoder<TVal, DeltaStep, use_nttp_deltastep, delta_alg>,
+      serde::version<0>,
+      serde::compat_version<0>> {
     static constexpr uint32_t row_width = details::FOR_buffer_depth;
 
 public:
-    explicit deltafor_encoder(TVal initial_value, DeltaStep delta = {})
+    explicit deltafor_encoder(
+      TVal initial_value, DeltaStep delta = {}) requires(!use_nttp_deltastep)
       : _initial(initial_value)
       , _last(initial_value)
       , _cnt{0}
       , _delta(delta) {}
+
+    constexpr explicit deltafor_encoder(TVal initial_value) requires
+      use_nttp_deltastep
+      : _initial(initial_value)
+      , _last(initial_value)
+      , _cnt{0}
+      , _delta(delta_alg) {}
+
+    constexpr explicit deltafor_encoder() = default;
 
     deltafor_encoder(
       TVal initial_value,
       uint32_t cnt,
       TVal last_value,
       iobuf data,
-      DeltaStep delta = {})
+      DeltaStep delta = {}) requires(!use_nttp_deltastep)
       : _initial(initial_value)
       , _last(last_value)
       , _data(std::move(data))
       , _cnt(cnt)
       , _delta(delta) {}
+
+    deltafor_encoder(
+      TVal initial_value,
+      uint32_t cnt,
+      TVal last_value,
+      iobuf data) requires use_nttp_deltastep
+      : _initial(initial_value)
+      , _last(last_value)
+      , _data(std::move(data))
+      , _cnt(cnt)
+      , _delta(delta_alg) {}
+
+    // This c-tor creates shallow copy of the encoder.
+    //
+    // The underlying iobuf is shared which makes the operation
+    // relatively lightweiht. The signature is different from
+    // copy c-tor on purpose. The 'other' object is modified
+    // and not just copied. If the c-tor throws the 'other' is
+    // not affected.
+    explicit deltafor_encoder(deltafor_encoder* other)
+      : _initial(other->_initial)
+      , _last(other->_last)
+      , _data(other->_data.share(0, other->_data.size_bytes()))
+      , _cnt(other->_cnt)
+      , _delta(other->_delta) {}
 
     using row_t = std::array<TVal, row_width>;
 
@@ -218,11 +283,47 @@ public:
         _cnt++;
     }
 
+    /// Return ppsition inside the stream
+    deltafor_stream_pos_t<TVal> get_position() const {
+        return {
+          .initial = _last,
+          .offset = uint32_t(_data.size_bytes()),
+          .num_rows = _cnt,
+        };
+    }
+
+    // State of the transaction
+    // The state can be used to append multiple rows
+    // and then commit or rollback.
+    struct tx_state {
+        using self_t
+          = deltafor_encoder<TVal, DeltaStep, use_nttp_deltastep, delta_alg>;
+        self_t uncommitted;
+
+        void add(const row_t& row) { uncommitted.add(row); }
+    };
+
+    // Create tx-state object and start transaction
+    //
+    // Only one transaction at a time is supported but this
+    // is not enforced. Abandoning tx_state object is ok (this
+    // is equivalent for aborting the transaction).
+    tx_state tx_start() { return tx_state{deltafor_encoder{this}}; }
+
+    // Commit changes done to tx_state.
+    // This operation does not throw.
+    void tx_commit(tx_state tx) noexcept {
+        _last = tx.uncommitted._last;
+        _data = std::move(tx.uncommitted._data);
+        _cnt = tx.uncommitted._cnt;
+        _delta = tx.uncommitted._delta;
+    }
+
     /// Copy the underlying iobuf
     iobuf copy() const { return _data.copy(); }
 
     /// Share the underlying iobuf
-    iobuf share() { return _data.share(0, _data.size_bytes()); }
+    iobuf share() const { return _data.share(0, _data.size_bytes()); }
 
     /// Return number of rows stored in the underlying iobuf instance
     uint32_t get_row_count() const noexcept { return _cnt; }
@@ -232,6 +333,16 @@ public:
 
     /// Get last value used to create the encoder
     TVal get_last_value() const noexcept { return _last; }
+
+    size_t mem_use() const { return _data.size_bytes(); }
+
+    auto serde_fields() {
+        if constexpr (use_nttp_deltastep) {
+            return std::tie(_initial, _last, _data, _cnt);
+        } else {
+            return std::tie(_initial, _last, _data, _cnt, _delta);
+        }
+    }
 
 private:
     template<typename T>
@@ -652,11 +763,12 @@ private:
         }
     }
 
-    TVal _initial;
-    TVal _last;
-    iobuf _data;
-    uint32_t _cnt;
-    DeltaStep _delta;
+protected:
+    TVal _initial{};
+    TVal _last{};
+    mutable iobuf _data{};
+    uint32_t _cnt{};
+    DeltaStep _delta{delta_alg};
 };
 
 /** \brief Delta-FOR decoder
@@ -666,7 +778,7 @@ private:
  * it can't be reset to read the sequence again.
  *
  * The initial_value and number of rows should match the corresponding
- * encoder wich was used to compress the data.
+ * encoder which was used to compress the data.
  */
 template<class TVal, class DeltaStep = details::delta_xor>
 class deltafor_decoder {
@@ -694,6 +806,13 @@ public:
         _initial = _delta.decode(_initial, row);
         _pos++;
         return true;
+    }
+
+    /// Skip rows
+    void skip(const deltafor_stream_pos_t<TVal>& st) {
+        _data.skip(st.offset);
+        _initial = st.initial;
+        _pos = st.num_rows;
     }
 
 private:

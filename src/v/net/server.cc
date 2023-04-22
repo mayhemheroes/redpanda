@@ -12,13 +12,14 @@
 #include "config/configuration.h"
 #include "likely.h"
 #include "prometheus/prometheus_sanitize.h"
-#include "rpc/logger.h"
-#include "seastar/core/coroutine.hh"
 #include "ssx/future-util.h"
+#include "ssx/metrics.h"
+#include "ssx/semaphore.h"
 #include "ssx/sformat.h"
 #include "vassert.h"
 #include "vlog.h"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/metrics.hh>
@@ -28,20 +29,26 @@
 
 namespace net {
 
-server::server(server_configuration c)
+server::server(server_configuration c, ss::logger& log)
   : cfg(std::move(c))
-  , _memory(cfg.max_service_memory_per_core) {}
+  , _log(log)
+  , _memory{size_t{static_cast<size_t>(cfg.max_service_memory_per_core)}, "net/server-mem"}
+  , _public_metrics(ssx::metrics::public_metrics_handle) {}
 
-server::server(ss::sharded<server_configuration>* s)
-  : server(s->local()) {}
+server::server(ss::sharded<server_configuration>* s, ss::logger& log)
+  : server(s->local(), log) {}
 
 server::~server() = default;
 
 void server::start() {
-    vassert(_proto, "must have a registered protocol before starting");
     if (!cfg.disable_metrics) {
         setup_metrics();
         _probe.setup_metrics(_metrics, cfg.name.c_str());
+    }
+
+    if (!cfg.disable_public_metrics) {
+        setup_public_metrics();
+        _probe.setup_public_metrics(_public_metrics, cfg.name.c_str());
     }
 
     if (cfg.connection_rate_bindings) {
@@ -83,7 +90,7 @@ void server::start() {
         } catch (...) {
             throw std::runtime_error(fmt::format(
               "{} - Error attempting to listen on {}: {}",
-              _proto->name(),
+              name(),
               endpoint,
               std::current_exception()));
         }
@@ -95,37 +102,74 @@ void server::start() {
     }
 }
 
-static inline void print_exceptional_future(
-  server::protocol* proto,
-  ss::future<> f,
-  const char* ctx,
-  ss::socket_address address) {
+bool is_gate_closed_exception(std::exception_ptr e) {
+    try {
+        if (e) {
+            rethrow_exception(e);
+        }
+    } catch (ss::gate_closed_exception&) {
+        return true;
+    } catch (...) {
+        return false;
+    }
+    __builtin_unreachable();
+}
+
+void server::print_exceptional_future(
+  ss::future<> f, const char* ctx, ss::socket_address address) {
     if (likely(!f.failed())) {
         f.ignore_ready_future();
         return;
     }
 
-    vlog(
-      rpc::rpclog.error,
-      "{} - Error[{}] remote address: {} - {}",
-      proto->name(),
-      ctx,
-      address,
-      f.get_exception());
+    auto ex = f.get_exception();
+
+    if (unlikely(_conn_gate.is_closed() && is_gate_closed_exception(ex))) {
+        vlog(_log.info, "Shutting down while [{}], gate closed.", ctx);
+        return;
+    }
+
+    auto disconnected = is_disconnect_exception(ex);
+
+    if (!disconnected) {
+        if (is_auth_error(ex)) {
+            vlog(
+              _log.warn,
+              "Authentication Failure[{}] remote address: {} - {}",
+              ctx,
+              address,
+              ex);
+        } else {
+            // Authentication exceptions are logged at WARN, not ERROR, because
+            // they generally point to a misbehaving client rather than a fault
+            // in the server.
+            vlog(
+              _log.error,
+              "Error[{}] remote address: {} - {}",
+              ctx,
+              address,
+              ex);
+        }
+    } else {
+        vlog(
+          _log.info,
+          "Disconnected {} ({}, {})",
+          address,
+          ctx,
+          disconnected.value());
+    }
 }
 
-static ss::future<> apply_proto(
-  server::protocol* proto, server::resources&& rs, conn_quota::units cq_units) {
-    auto conn = rs.conn;
-    return proto->apply(std::move(rs))
+ss::future<> server::apply_proto(
+  ss::lw_shared_ptr<net::connection> conn, conn_quota::units cq_units) {
+    return apply(conn)
       .then_wrapped(
-        [proto, conn, cq_units = std::move(cq_units)](ss::future<> f) {
+        [this, conn, cq_units = std::move(cq_units)](ss::future<> f) {
             print_exceptional_future(
-              proto, std::move(f), "applying protocol", conn->addr);
+              std::move(f), "applying protocol", conn->addr);
             return conn->shutdown().then_wrapped(
-              [proto, addr = conn->addr](ss::future<> f) {
-                  print_exceptional_future(
-                    proto, std::move(f), "shutting down", addr);
+              [this, addr = conn->addr](ss::future<> f) {
+                  print_exceptional_future(std::move(f), "shutting down", addr);
               });
         })
       .finally([conn] {});
@@ -134,108 +178,100 @@ static ss::future<> apply_proto(
 ss::future<> server::accept(listener& s) {
     return ss::repeat([this, &s]() mutable {
         return s.socket.accept().then_wrapped(
-          [this, &s](ss::future<ss::accept_result> f_cs_sa) mutable
-          -> ss::future<ss::stop_iteration> {
-              if (_as.abort_requested()) {
-                  f_cs_sa.ignore_ready_future();
-                  co_return ss::stop_iteration::yes;
-              }
-              auto ar = f_cs_sa.get();
-              ar.connection.set_nodelay(true);
-              ar.connection.set_keepalive(true);
-
-              // `s` is a lambda reference argument to a coroutine:
-              // this is the last place we may refer to it before
-              // any scheduling points.
-              auto name = s.name;
-
-              conn_quota::units cq_units;
-              if (cfg.conn_quotas) {
-                  cq_units = co_await cfg.conn_quotas->get().local().get(
-                    ar.remote_address.addr());
-                  if (!cq_units.live()) {
-                      // Connection limit hit, drop this connection.
-                      _probe.connection_rejected();
-                      vlog(
-                        rpc::rpclog.info,
-                        "Connection limit reached, rejecting {}",
-                        ar.remote_address.addr());
-                      co_return ss::stop_iteration::no;
-                  }
-              }
-
-              // Apply socket buffer size settings
-              if (cfg.tcp_recv_buf.has_value()) {
-                  // Explicitly store in an int to decouple the
-                  // config type from the set_sockopt type.
-                  int recv_buf = cfg.tcp_recv_buf.value();
-                  ar.connection.set_sockopt(
-                    SOL_SOCKET, SO_RCVBUF, &recv_buf, sizeof(recv_buf));
-              }
-
-              if (cfg.tcp_send_buf.has_value()) {
-                  int send_buf = cfg.tcp_send_buf.value();
-                  ar.connection.set_sockopt(
-                    SOL_SOCKET, SO_SNDBUF, &send_buf, sizeof(send_buf));
-              }
-
-              if (_connection_rates) {
-                  try {
-                      co_await _connection_rates->maybe_wait(
-                        ar.remote_address.addr());
-                  } catch (const std::exception& e) {
-                      vlog(
-                        rpc::rpclog.trace,
-                        "Timeout while waiting free token for connection rate. "
-                        "addr:{}",
-                        ar.remote_address);
-                      _probe.timeout_waiting_rate_limit();
-                      co_return ss::stop_iteration::no;
-                  }
-              }
-
-              auto conn = ss::make_lw_shared<net::connection>(
-                _connections,
-                name,
-                std::move(ar.connection),
-                ar.remote_address,
-                _probe);
-              vlog(
-                rpc::rpclog.trace,
-                "{} - Incoming connection from {} on \"{}\"",
-                _proto->name(),
-                ar.remote_address,
-                name);
-              if (_conn_gate.is_closed()) {
-                  co_await conn->shutdown();
-                  throw ss::gate_closed_exception();
-              }
-              ssx::spawn_with_gate(
-                _conn_gate,
-                [this, conn, cq_units = std::move(cq_units)]() mutable {
-                    return apply_proto(
-                      _proto.get(), resources(this, conn), std::move(cq_units));
-                });
-              co_return ss::stop_iteration::no;
+          [this, &s](ss::future<ss::accept_result> f_cs_sa) {
+              return accept_finish(s.name, std::move(f_cs_sa));
           });
     });
 }
 
-void server::shutdown_input() {
-    ss::sstring proto_name = _proto ? _proto->name() : "protocol not set";
+ss::future<ss::stop_iteration>
+server::accept_finish(ss::sstring name, ss::future<ss::accept_result> f_cs_sa) {
+    if (_as.abort_requested()) {
+        f_cs_sa.ignore_ready_future();
+        co_return ss::stop_iteration::yes;
+    }
+    auto ar = f_cs_sa.get();
+    ar.connection.set_nodelay(true);
+    ar.connection.set_keepalive(true);
+
+    conn_quota::units cq_units;
+    if (cfg.conn_quotas) {
+        cq_units = co_await cfg.conn_quotas->get().local().get(
+          ar.remote_address.addr());
+        if (!cq_units.live()) {
+            // Connection limit hit, drop this connection.
+            _probe.connection_rejected();
+            vlog(
+              _log.info,
+              "Connection limit reached, rejecting {}",
+              ar.remote_address.addr());
+            co_return ss::stop_iteration::no;
+        }
+    }
+
+    // Apply socket buffer size settings
+    if (cfg.tcp_recv_buf.has_value()) {
+        // Explicitly store in an int to decouple the
+        // config type from the set_sockopt type.
+        int recv_buf = cfg.tcp_recv_buf.value();
+        ar.connection.set_sockopt(
+          SOL_SOCKET, SO_RCVBUF, &recv_buf, sizeof(recv_buf));
+    }
+
+    if (cfg.tcp_send_buf.has_value()) {
+        int send_buf = cfg.tcp_send_buf.value();
+        ar.connection.set_sockopt(
+          SOL_SOCKET, SO_SNDBUF, &send_buf, sizeof(send_buf));
+    }
+
+    if (_connection_rates) {
+        try {
+            co_await _connection_rates->maybe_wait(ar.remote_address.addr());
+        } catch (const std::exception& e) {
+            vlog(
+              _log.trace,
+              "Timeout while waiting free token for connection rate. "
+              "addr:{}",
+              ar.remote_address);
+            _probe.timeout_waiting_rate_limit();
+            co_return ss::stop_iteration::no;
+        }
+    }
+
+    auto conn = ss::make_lw_shared<net::connection>(
+      _connections,
+      name,
+      std::move(ar.connection),
+      ar.remote_address,
+      _probe,
+      cfg.stream_recv_buf);
     vlog(
-      rpc::rpclog.info,
-      "{} - Stopping {} listeners",
-      proto_name,
-      _listeners.size());
+      _log.trace,
+      "{} - Incoming connection from {} on \"{}\"",
+      this->name(),
+      ar.remote_address,
+      name);
+    if (_conn_gate.is_closed()) {
+        co_await conn->shutdown();
+        throw ss::gate_closed_exception();
+    }
+    ssx::spawn_with_gate(
+      _conn_gate, [this, conn, cq_units = std::move(cq_units)]() mutable {
+          return apply_proto(conn, std::move(cq_units));
+      });
+    co_return ss::stop_iteration::no;
+}
+
+void server::shutdown_input() {
+    vlog(_log.info, "{} - Stopping {} listeners", name(), _listeners.size());
     for (auto& l : _listeners) {
         l->socket.abort_accept();
     }
-    vlog(rpc::rpclog.debug, "{} - Service probes {}", proto_name, _probe);
+    vlog(_log.debug, "{} - Service probes {}", name(), _probe);
     vlog(
-      rpc::rpclog.info,
+      _log.info,
       "{} - Shutting down {} connections",
-      proto_name,
+      name(),
       _connections.size());
     _as.request_abort();
     // close the connections and wait for all dispatches to finish
@@ -272,9 +308,6 @@ ss::future<> server::stop() {
 
 void server::setup_metrics() {
     namespace sm = ss::metrics;
-    if (!_proto) {
-        return;
-    }
     _metrics.add_group(
       prometheus_sanitize::metrics_name(cfg.name),
       {sm::make_total_bytes(
@@ -291,6 +324,27 @@ void server::setup_metrics() {
          "dispatch_handler_latency",
          [this] { return _hist.seastar_histogram_logform(); },
          sm::description(ssx::sformat("{}: Latency ", cfg.name)))});
+}
+
+void server::setup_public_metrics() {
+    namespace sm = ss::metrics;
+
+    std::string_view server_name(cfg.name);
+
+    if (server_name.ends_with("_rpc")) {
+        server_name.remove_suffix(4);
+    }
+
+    auto server_label = ssx::metrics::make_namespaced_label("server");
+
+    _public_metrics.add_group(
+      prometheus_sanitize::metrics_name("rpc:request"),
+      {sm::make_histogram(
+         "latency_seconds",
+         sm::description("RPC latency"),
+         {server_label(server_name)},
+         [this] { return ssx::metrics::report_default_histogram(_hist); })
+         .aggregate({sm::shard_label})});
 }
 
 std::ostream& operator<<(std::ostream& o, const server_configuration& c) {

@@ -7,6 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+//go:build !windows
+
 package tuners
 
 import (
@@ -18,8 +20,8 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/irq"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/network"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/utils"
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
+	"go.uber.org/zap"
 )
 
 type NetCheckersFactory interface {
@@ -45,7 +47,7 @@ type netCheckersFactory struct {
 	irqDeviceInfo  irq.DeviceInfo
 	ethtool        ethtool.EthtoolWrapper
 	balanceService irq.BalanceService
-	cpuMasks       irq.CpuMasks
+	cpuMasks       irq.CPUMasks
 }
 
 func NewNetCheckersFactory(
@@ -54,7 +56,7 @@ func NewNetCheckersFactory(
 	irqDeviceInfo irq.DeviceInfo,
 	ethtool ethtool.EthtoolWrapper,
 	balanceService irq.BalanceService,
-	cpuMasks irq.CpuMasks,
+	cpuMasks irq.CPUMasks,
 ) NetCheckersFactory {
 	return &netCheckersFactory{
 		fs:             fs,
@@ -80,7 +82,7 @@ func (f *netCheckersFactory) NewNicIRQAffinityStaticChecker(
 				nic := network.NewNic(f.fs, f.irqProcFile, f.irqDeviceInfo, f.ethtool, ifaceName)
 				nicIRQs, err := network.CollectIRQs(nic)
 				if err != nil {
-					return false, nil
+					return false, err
 				}
 				IRQs = append(IRQs, nicIRQs...)
 			}
@@ -216,7 +218,7 @@ func (f *netCheckersFactory) NewNicNTupleCheckers(
 	return f.forNonVirtualInterfaces(interfaces, f.NewNicNTupleChecker)
 }
 
-func (f *netCheckersFactory) NewNicNTupleChecker(nic network.Nic) Checker {
+func (*netCheckersFactory) NewNicNTupleChecker(nic network.Nic) Checker {
 	return NewEqualityChecker(
 		NicNTupleChecker,
 		fmt.Sprintf("NIC %s NTuple set", nic.Name()),
@@ -279,7 +281,7 @@ func (f *netCheckersFactory) NewNicXpsChecker(nic network.Nic) Checker {
 	)
 }
 
-func (f *netCheckersFactory) NewRfsTableSizeChecker() Checker {
+func (*netCheckersFactory) NewRfsTableSizeChecker() Checker {
 	return NewIntChecker(
 		RfsTableEntriesChecker,
 		"RFS Table entries",
@@ -338,11 +340,11 @@ func isSet(
 	nic network.Nic, hwCheckFunction func(network.Nic) (bool, error),
 ) (bool, error) {
 	if nic.IsHwInterface() {
-		log.Debugf("'%s' is HW interface", nic.Name())
+		zap.L().Sugar().Debugf("'%s' is HW interface", nic.Name())
 		return hwCheckFunction(nic)
 	}
 	if nic.IsBondIface() {
-		log.Debugf("'%s' is bond interface", nic.Name())
+		zap.L().Sugar().Debugf("'%s' is bond interface", nic.Name())
 		slaves, err := nic.Slaves()
 		if err != nil {
 			return false, err
@@ -367,7 +369,7 @@ func (f *netCheckersFactory) forNonVirtualInterfaces(
 	for _, iface := range interfaces {
 		nic := network.NewNic(f.fs, f.irqProcFile, f.irqDeviceInfo, f.ethtool, iface)
 		if !nic.IsHwInterface() && !nic.IsBondIface() {
-			log.Debugf("Skipping '%s' virtual interface", nic.Name())
+			zap.L().Sugar().Debugf("Skipping '%s' virtual interface", nic.Name())
 			continue
 		}
 		chkrs = append(chkrs, checkerFactory(nic))

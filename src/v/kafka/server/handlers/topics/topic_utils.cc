@@ -42,13 +42,13 @@ ss::future<std::vector<model::node_id>> wait_for_leaders(
             continue;
         }
         // collect partitions
-        auto md = md_cache.get_topic_metadata(r.tp_ns);
+        auto md = md_cache.get_topic_metadata_ref(r.tp_ns);
         if (!md) {
             // topic already deleted
             continue;
         }
         // for each partition ask for leader
-        for (auto& pmd : md->partitions) {
+        for (auto& pmd : md->get().get_assignments()) {
             futures.push_back(md_cache.get_leader(
               model::ntp(r.tp_ns.ns, r.tp_ns.tp, pmd.id), timeout));
         }
@@ -58,21 +58,32 @@ ss::future<std::vector<model::node_id>> wait_for_leaders(
 }
 
 ss::future<> wait_for_topics(
+  cluster::metadata_cache& md_cache,
   std::vector<cluster::topic_result> results,
   cluster::controller_api& api,
   model::timeout_clock::time_point timeout) {
     return ss::do_with(
       std::move(results),
-      [&api, timeout](std::vector<cluster::topic_result>& results) {
+      [&md_cache, &api, timeout](std::vector<cluster::topic_result>& results) {
           return ss::parallel_for_each(
-            results, [&api, timeout](cluster::topic_result& r) {
-                if (r.ec != cluster::errc::success) {
-                    return ss::now();
-                }
-                // we discard return here, we do not want to return error even
-                // if waiting for topic wasn't successfull, it was already
-                // created
-                return api.wait_for_topic(r.tp_ns, timeout).discard_result();
+                   results,
+                   [&api, timeout](cluster::topic_result& r) {
+                       if (r.ec != cluster::errc::success) {
+                           return ss::now();
+                       }
+                       // we discard return here, we do not want to return error
+                       // even if waiting for topic wasn't successfull, it was
+                       // already created
+                       return api.wait_for_topic(r.tp_ns, timeout)
+                         .discard_result();
+                   })
+            .then([&md_cache, &results, timeout]() {
+                return wait_for_leaders(md_cache, results, timeout)
+                  .discard_result()
+                  .handle_exception_type([](const ss::timed_out_error&) {
+                      // discard timed out exception, even tho waiting failed
+                      // the topic is created
+                  });
             });
       });
 }

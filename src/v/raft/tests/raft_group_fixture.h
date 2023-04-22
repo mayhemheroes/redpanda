@@ -16,6 +16,7 @@
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/record_batch_reader.h"
+#include "model/tests/random_batch.h"
 #include "net/dns.h"
 #include "net/server.h"
 #include "raft/consensus.h"
@@ -27,14 +28,13 @@
 #include "random/generators.h"
 #include "rpc/backoff_policy.h"
 #include "rpc/connection_cache.h"
-#include "rpc/simple_protocol.h"
+#include "rpc/rpc_server.h"
 #include "rpc/types.h"
 #include "storage/api.h"
 #include "storage/kvstore.h"
 #include "storage/log_manager.h"
 #include "storage/ntp_config.h"
 #include "storage/record_batch_builder.h"
-#include "storage/tests/utils/random_batch.h"
 #include "storage/types.h"
 #include "test_utils/fixture.h"
 
@@ -56,7 +56,7 @@ inline ss::logger tstlog("raft_test");
 
 using namespace std::chrono_literals; // NOLINT
 
-inline static auto heartbeat_interval = 40ms;
+inline static std::chrono::milliseconds heartbeat_interval = 40ms;
 inline static const raft::replicate_options
   default_replicate_opts(raft::consistency_level::quorum_ack);
 
@@ -92,7 +92,6 @@ struct raft_node {
       raft::group_configuration cfg,
       raft::timeout_jitter jit,
       ss::sstring storage_dir,
-      storage::log_config::storage_type storage_type,
       leader_clb_t l_clb,
       model::cleanup_policy_bitflags cleanup_policy,
       size_t segment_size)
@@ -105,6 +104,12 @@ struct raft_node {
             .default_read_buffer_size = config::mock_binding(512_KiB),
           };
       }) {
+        feature_table.start().get();
+        feature_table
+          .invoke_on_all(
+            [](features::feature_table& f) { f.testing_activate_all(); })
+          .get();
+
         cache.start().get();
 
         storage
@@ -116,13 +121,13 @@ struct raft_node {
                   storage_dir,
                   storage::debug_sanitize_files::yes);
             },
-            [storage_type, storage_dir, segment_size]() {
+            [storage_dir, segment_size]() {
                 return storage::log_config(
-                  storage_type,
                   storage_dir,
                   segment_size,
                   storage::debug_sanitize_files::yes);
-            })
+            },
+            std::ref(feature_table))
           .get();
         storage.invoke_on_all(&storage::api::start).get();
 
@@ -141,7 +146,10 @@ struct raft_node {
           storage.local().log_mgr().manage(std::move(ntp_cfg)).get0());
 
         recovery_throttle
-          .start(config::shard_local_cfg().raft_learner_recovery_rate())
+          .start(ss::sharded_parameter([] {
+              return config::shard_local_cfg()
+                .raft_learner_recovery_rate.bind();
+          }))
           .get();
 
         // setup consensus
@@ -155,18 +163,14 @@ struct raft_node {
           raft::scheduling_config(
             seastar::default_scheduling_group(),
             seastar::default_priority_class()),
-          std::chrono::seconds(10),
+          config::mock_binding<std::chrono::milliseconds>(10s),
           raft::make_rpc_client_protocol(self_id, cache),
           [this](raft::leadership_status st) { leader_callback(st); },
           storage.local(),
           recovery_throttle.local(),
-          recovery_mem_quota);
-
-        // create connections to initial nodes
-        consensus->config().for_each_broker(
-          [this, self_id](const model::broker& broker) {
-              create_connection_to(self_id, broker);
-          });
+          recovery_mem_quota,
+          feature_table.local(),
+          std::nullopt);
     }
 
     raft_node(const raft_node&) = delete;
@@ -181,30 +185,30 @@ struct raft_node {
         scfg.addrs.emplace_back(net::resolve_dns(broker.rpc_address()).get());
         scfg.max_service_memory_per_core = 1024 * 1024 * 1024;
         scfg.disable_metrics = net::metrics_disabled::yes;
+        scfg.disable_public_metrics = net::public_metrics_disabled::yes;
         server.start(std::move(scfg)).get0();
         raft_manager.start().get0();
         raft_manager
           .invoke_on(0, [this](test_raft_manager& mgr) { mgr.c = consensus; })
           .get0();
         server
-          .invoke_on_all([this](net::server& s) {
-              auto proto = std::make_unique<rpc::simple_protocol>();
-              proto
-                ->register_service<raft::service<test_raft_manager, raft_node>>(
-                  ss::default_scheduling_group(),
-                  ss::default_smp_service_group(),
-                  raft_manager,
-                  *this,
-                  heartbeat_interval);
-              s.set_protocol(std::move(proto));
+          .invoke_on_all([this](rpc::rpc_server& s) {
+              s.register_service<raft::service<test_raft_manager, raft_node>>(
+                ss::default_scheduling_group(),
+                ss::default_smp_service_group(),
+                raft_manager,
+                *this,
+                heartbeat_interval);
           })
           .get0();
-        server.invoke_on_all(&net::server::start).get0();
+        server.invoke_on_all(&rpc::rpc_server::start).get0();
         hbeats = std::make_unique<raft::heartbeat_manager>(
-          heartbeat_interval,
+          config::mock_binding<std::chrono::milliseconds>(
+            std::chrono::milliseconds(heartbeat_interval)),
           raft::make_rpc_client_protocol(broker.id(), cache),
           broker.id(),
-          heartbeat_interval * 20);
+          config::mock_binding<std::chrono::milliseconds>(
+            heartbeat_interval * 20));
         hbeats->start().get0();
         hbeats->register_group(consensus).get();
         started = true;
@@ -237,6 +241,11 @@ struct raft_node {
               return ss::make_ready_future<>();
           })
           .then([this] {
+              if (hbeats) {
+                  hbeats.reset();
+              }
+          })
+          .then([this] {
               tstlog.info("Stopping raft at {}", broker.id());
               return consensus->stop();
           })
@@ -247,8 +256,19 @@ struct raft_node {
               return ss::now();
           })
           .then([this] {
-              tstlog.info("Raft stopped at node {}", broker.id());
+              tstlog.info(
+                "Raft stopped at node {} {}",
+                broker.id(),
+                consensus.use_count());
               return raft_manager.stop();
+          })
+          .then([this] {
+              tstlog.info(
+                "consensus destroyed at node {} {}",
+                broker.id(),
+                consensus.use_count());
+              consensus = nullptr;
+              return ss::now();
           })
           .then([this] {
               tstlog.info("Stopping cache at node {}", broker.id());
@@ -256,8 +276,10 @@ struct raft_node {
           })
           .then([this] {
               tstlog.info("Stopping storage at node {}", broker.id());
+              log.reset();
               return storage.stop();
           })
+          .then([this] { return feature_table.stop(); })
           .then([this] {
               tstlog.info("Node {} stopped", broker.id());
               started = false;
@@ -296,7 +318,7 @@ struct raft_node {
             cache
               .invoke_on(
                 sh,
-                [&broker, this](rpc::connection_cache& c) {
+                [&broker](rpc::connection_cache& c) {
                     if (c.contains(broker.id())) {
                         return seastar::make_ready_future<>();
                     }
@@ -319,17 +341,18 @@ struct raft_node {
     ss::sharded<raft::recovery_throttle> recovery_throttle;
     std::unique_ptr<storage::log> log;
     ss::sharded<rpc::connection_cache> cache;
-    ss::sharded<net::server> server;
+    ss::sharded<rpc::rpc_server> server;
     ss::sharded<test_raft_manager> raft_manager;
+    leader_clb_t leader_callback;
     raft::recovery_memory_quota recovery_mem_quota;
     std::unique_ptr<raft::heartbeat_manager> hbeats;
     consensus_ptr consensus;
     std::unique_ptr<raft::log_eviction_stm> _nop_stm;
-    leader_clb_t leader_callback;
+    ss::sharded<features::feature_table> feature_table;
     ss::abort_source _as;
 };
 
-static model::ntp node_ntp(raft::group_id gr_id, model::node_id n_id) {
+inline model::ntp node_ntp(raft::group_id gr_id, model::node_id n_id) {
     return model::ntp(
       model::kafka_namespace,
       model::topic(ssx::sformat("group_{}", gr_id())),
@@ -343,13 +366,10 @@ struct raft_group {
     raft_group(
       raft::group_id id,
       int size,
-      storage::log_config::storage_type storage_type
-      = storage::log_config::storage_type::disk,
       model::cleanup_policy_bitflags cleanup_policy
       = model::cleanup_policy_bitflags::deletion,
       size_t segment_size = 100_MiB)
       : _id(id)
-      , _storage_type(storage_type)
       , _storage_dir("test.raft." + random_generators::gen_alphanum_string(6))
       , _cleanup_policy(cleanup_policy)
       , _segment_size(segment_size) {
@@ -376,22 +396,26 @@ struct raft_group {
 
     void enable_node(model::node_id node_id) {
         auto ntp = node_ntp(_id, node_id);
+        auto broker = make_broker(node_id);
         tstlog.info("Enabling node {} in group {}", node_id, _id);
         auto [it, _] = _members.try_emplace(
           node_id,
           ntp,
-          make_broker(node_id),
+          broker,
           _id,
-          raft::group_configuration(_initial_brokers, model::revision_id(0)),
+          get_raft_cfg(),
           raft::timeout_jitter(heartbeat_interval * 10),
           ssx::sformat("{}/{}", _storage_dir, node_id()),
-          _storage_type,
           [this, node_id](raft::leadership_status st) {
               election_callback(node_id, st);
           },
           _cleanup_policy,
           _segment_size);
         it->second.start();
+        for (auto& [_, n] : _members) {
+            n.create_connection_to(n.id(), broker);
+            it->second.create_connection_to(broker.id(), n.broker);
+        }
     }
 
     model::broker create_new_node(model::node_id node_id) {
@@ -403,10 +427,10 @@ struct raft_group {
           ntp,
           broker,
           _id,
-          raft::group_configuration({}, model::revision_id(0)),
+          raft::group_configuration(
+            std::vector<raft::vnode>{}, model::revision_id(0)),
           raft::timeout_jitter(heartbeat_interval * 10),
           ssx::sformat("{}/{}", _storage_dir, node_id()),
-          _storage_type,
           [this, node_id](raft::leadership_status st) {
               election_callback(node_id, st);
           },
@@ -439,7 +463,9 @@ struct raft_group {
     ss::future<model::node_id> wait_for_leader() {
         if (_leader_id) {
             auto it = _members.find(*_leader_id);
-            if (it != _members.end() && it->second.consensus->is_leader()) {
+            if (
+              it != _members.end()
+              && it->second.consensus->is_elected_leader()) {
                 return ss::make_ready_future<model::node_id>(*_leader_id);
             }
             _leader_id = std::nullopt;
@@ -455,7 +481,7 @@ struct raft_group {
     void election_callback(model::node_id src, raft::leadership_status st) {
         if (
           !st.current_leader
-          || st.current_leader && st.current_leader->id() != src) {
+          || (st.current_leader && st.current_leader->id() != src)) {
             // only accept election callbacks from current leader.
             return;
         }
@@ -500,6 +526,16 @@ struct raft_group {
 
     const ss::sstring& get_data_dir() const { return _storage_dir; }
 
+    raft::group_configuration get_raft_cfg() {
+        std::vector<raft::vnode> nodes;
+        nodes.reserve(_initial_brokers.size());
+        for (auto& b : _initial_brokers) {
+            nodes.emplace_back(b.id(), model::revision_id(0));
+        }
+
+        return {std::move(nodes), model::revision_id(0)};
+    }
+
 private:
     uint16_t base_port = 35000;
     raft::group_id _id;
@@ -508,24 +544,23 @@ private:
     ss::condition_variable _election_cond;
     std::optional<model::node_id> _leader_id;
     uint32_t _elections_count{0};
-    storage::log_config::storage_type _storage_type;
     ss::sstring _storage_dir;
     model::cleanup_policy_bitflags _cleanup_policy;
     size_t _segment_size;
 };
 
-static model::record_batch_reader random_batches_reader(int max_batches) {
-    auto batches = storage::test::make_random_batches(
-      storage::test::record_batch_spec{
+inline model::record_batch_reader random_batches_reader(int max_batches) {
+    auto batches = model::test::make_random_batches(
+      model::test::record_batch_spec{
         .offset = model::offset(0),
         .allow_compression = true,
         .count = max_batches});
     return model::make_memory_record_batch_reader(std::move(batches));
 }
 
-static model::record_batch_reader
-random_batch_reader(storage::test::record_batch_spec spec) {
-    auto batch = storage::test::make_random_batch(spec);
+inline model::record_batch_reader
+random_batch_reader(model::test::record_batch_spec spec) {
+    auto batch = model::test::make_random_batch(spec);
     ss::circular_buffer<model::record_batch> batches;
     batches.reserve(1);
     batch.set_term(model::term_id(0));
@@ -533,14 +568,14 @@ random_batch_reader(storage::test::record_batch_spec spec) {
     return model::make_memory_record_batch_reader(std::move(batches));
 }
 
-static model::record_batch_reader
-random_batches_reader(storage::test::record_batch_spec spec) {
-    auto batches = storage::test::make_random_batches(spec);
+inline model::record_batch_reader
+random_batches_reader(model::test::record_batch_spec spec) {
+    auto batches = model::test::make_random_batches(spec);
     return model::make_memory_record_batch_reader(std::move(batches));
 }
 
 template<typename Rep, typename Period, typename Pred>
-static void wait_for(
+inline void wait_for(
   std::chrono::duration<Rep, Period> timeout, Pred&& p, ss::sstring msg) {
     using clock_t = std::chrono::system_clock;
     auto start = clock_t::now();
@@ -556,7 +591,7 @@ static void wait_for(
     }
 }
 
-static void assert_at_most_one_leader(raft_group& gr) {
+inline void assert_at_most_one_leader(raft_group& gr) {
     std::unordered_map<long, int> leaders_per_term;
     for (auto& [_, m] : gr.get_members()) {
         auto term = static_cast<long>(m.consensus->term());
@@ -565,14 +600,14 @@ static void assert_at_most_one_leader(raft_group& gr) {
             leaders_per_term.try_emplace(term, 0);
         }
         auto it = leaders_per_term.find(m.consensus->term());
-        it->second += m.consensus->is_leader();
+        it->second += m.consensus->is_elected_leader();
     }
     for (auto& [term, leaders] : leaders_per_term) {
         BOOST_REQUIRE_LE(leaders, 1);
     }
 }
 
-static bool are_logs_the_same_length(const raft_group::logs_t& logs) {
+inline bool are_logs_the_same_length(const raft_group::logs_t& logs) {
     // if one of the logs is empty all of them have to be empty
     auto empty = std::all_of(
       logs.cbegin(), logs.cend(), [](const raft_group::logs_t::value_type& p) {
@@ -593,7 +628,7 @@ static bool are_logs_the_same_length(const raft_group::logs_t& logs) {
     });
 }
 
-static bool are_all_commit_indexes_the_same(raft_group& gr) {
+inline bool are_all_commit_indexes_the_same(raft_group& gr) {
     auto c_idx = gr.get_members().begin()->second.consensus->committed_offset();
     return std::all_of(
       gr.get_members().begin(),
@@ -605,7 +640,7 @@ static bool are_all_commit_indexes_the_same(raft_group& gr) {
       });
 }
 
-static bool are_all_consumable_offsets_are_the_same(raft_group& gr) {
+inline bool are_all_consumable_offsets_are_the_same(raft_group& gr) {
     auto c_idx
       = gr.get_members().begin()->second.consensus->last_visible_index();
     return std::all_of(
@@ -619,7 +654,7 @@ static bool are_all_consumable_offsets_are_the_same(raft_group& gr) {
       });
 }
 
-static bool are_logs_equivalent(
+inline bool are_logs_equivalent(
   const std::vector<model::record_batch>& a,
   const std::vector<model::record_batch>& b) {
     // both logs are empty - this is ok
@@ -636,8 +671,7 @@ static bool are_logs_equivalent(
     return a_it == a.rbegin() || b_it == b.rbegin();
 }
 
-static bool assert_all_logs_are_the_same(const raft_group::logs_t& logs) {
-    auto it = logs.begin();
+inline bool assert_all_logs_are_the_same(const raft_group::logs_t& logs) {
     auto& reference = logs.begin()->second;
 
     return std::all_of(
@@ -648,7 +682,7 @@ static bool assert_all_logs_are_the_same(const raft_group::logs_t& logs) {
       });
 }
 
-static void validate_logs_replication(raft_group& gr) {
+inline void validate_logs_replication(raft_group& gr) {
     auto logs = gr.read_all_logs();
     wait_for(
       10s,
@@ -662,17 +696,17 @@ static void validate_logs_replication(raft_group& gr) {
 }
 
 template<typename T>
-static model::timeout_clock::time_point timeout(std::chrono::duration<T> d) {
+model::timeout_clock::time_point timeout(std::chrono::duration<T> d) {
     return model::timeout_clock::now() + d;
 }
 
-static model::node_id wait_for_group_leader(raft_group& gr) {
+inline model::node_id wait_for_group_leader(raft_group& gr) {
     auto leader_id = gr.wait_for_leader().get0();
     assert_at_most_one_leader(gr);
     return leader_id;
 }
 
-static void
+inline void
 assert_stable_leadership(const raft_group& gr, int number_of_intervals = 5) {
     auto before = gr.get_elections_count();
     ss::sleep(heartbeat_interval * number_of_intervals).get0();
@@ -732,7 +766,7 @@ ss::future<bool> retry_with_leader(
       .then([meta] { return meta->success; });
 }
 
-static ss::future<bool> replicate_random_batches(
+inline ss::future<bool> replicate_random_batches(
   raft_group& gr,
   int count,
   raft::consistency_level c_lvl = raft::consistency_level::quorum_ack,
@@ -752,7 +786,7 @@ static ss::future<bool> replicate_random_batches(
       });
 }
 
-static ss::future<bool> replicate_random_batches(
+inline ss::future<bool> replicate_random_batches(
   model::term_id expected_term,
   raft_group& gr,
   int count,
@@ -777,7 +811,7 @@ static ss::future<bool> replicate_random_batches(
 /**
  * Makes compactible batches, having one record per batch
  */
-static model::record_batch_reader
+inline model::record_batch_reader
 make_compactible_batches(int keys, size_t batches, model::timestamp ts) {
     ss::circular_buffer<model::record_batch> ret;
     for (size_t b = 0; b < batches; b++) {
@@ -800,7 +834,7 @@ make_compactible_batches(int keys, size_t batches, model::timestamp ts) {
     return model::make_memory_record_batch_reader(std::move(ret));
 }
 
-static ss::future<bool> replicate_compactible_batches(
+inline ss::future<bool> replicate_compactible_batches(
   raft_group& gr,
   model::timestamp ts,
   model::timeout_clock::duration tout = 1s) {
@@ -818,7 +852,7 @@ static ss::future<bool> replicate_compactible_batches(
     });
 }
 
-static void validate_offset_translation(raft_group& gr) {
+inline void validate_offset_translation(raft_group& gr) {
     // build reference map
     if (gr.get_members().size() == 1) {
         return;
@@ -864,6 +898,9 @@ struct raft_test_fixture {
         ss::smp::invoke_on_all([] {
             config::shard_local_cfg().get("disable_metrics").set_value(true);
             config::shard_local_cfg()
+              .get("disable_public_metrics")
+              .set_value(true);
+            config::shard_local_cfg()
               .get("raft_heartbeat_disconnect_failures")
               .set_value((size_t)0);
         }).get();
@@ -875,5 +912,18 @@ struct raft_test_fixture {
             leader_id.emplace(wait_for_group_leader(gr));
         }
         return gr.get_member(*leader_id).consensus;
+    }
+
+    uint64_t get_snapshot_size_from_disk(raft_node& node) const {
+        std::filesystem::path snapshot_file_path
+          = std::filesystem::path(node.log->config().work_directory())
+            / storage::simple_snapshot_manager::default_snapshot_filename;
+        bool snapshot_file_exists
+          = ss::file_exists(snapshot_file_path.string()).get();
+        if (snapshot_file_exists) {
+            return ss::file_size(snapshot_file_path.string()).get();
+        } else {
+            return 0;
+        }
     }
 };

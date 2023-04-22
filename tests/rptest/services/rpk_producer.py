@@ -16,10 +16,12 @@ class RpkProducer(BackgroundThreadService):
                  topic: str,
                  msg_size: int,
                  msg_count: int,
-                 acks: Optional[bool] = None,
+                 acks: Optional[int] = None,
                  printable=False,
                  quiet: bool = False,
-                 produce_timeout: Optional[int] = None):
+                 produce_timeout: Optional[int] = None,
+                 *,
+                 partition: Optional[int] = None):
         super(RpkProducer, self).__init__(context, num_nodes=1)
         self._redpanda = redpanda
         self._topic = topic
@@ -29,13 +31,20 @@ class RpkProducer(BackgroundThreadService):
         self._printable = printable
         self._stopping = Event()
         self._quiet = quiet
+        self._output_line_count = 0
+        self._partition = partition
 
         if produce_timeout is None:
             produce_timeout = 10
         self._produce_timeout = produce_timeout
 
     def _worker(self, _idx, node):
-        rpk_binary = self._redpanda.find_binary("rpk")
+        # NOTE: since this runs on separate nodes from the service, the binary
+        # path used by each node may differ from that returned by
+        # redpanda.find_binary(), e.g. if using a RedpandaInstaller.
+        rp_install_path_root = self._redpanda._context.globals.get(
+            "rp_install_path_root", None)
+        rpk_binary = f"{rp_install_path_root}/bin/rpk"
         key_size = 16
         cmd = f"dd if=/dev/urandom bs={self._msg_size + key_size} count={self._msg_count}"
 
@@ -51,11 +60,15 @@ class RpkProducer(BackgroundThreadService):
             # Suppress default "Produced to..." output lines by setting output template to empty string
             cmd += " -o \"\""
 
+        if self._partition is not None:
+            cmd += f" -p {self._partition}"
+
         self._stopping.clear()
         try:
             for line in node.account.ssh_capture(
                     cmd, timeout_sec=self._produce_timeout):
                 self.logger.debug(line.rstrip())
+                self._output_line_count += 1
         except RemoteCommandError:
             if self._stopping.is_set():
                 pass
@@ -64,6 +77,10 @@ class RpkProducer(BackgroundThreadService):
 
         self._redpanda.logger.debug(
             f"Finished sending {self._msg_count} messages")
+
+    @property
+    def output_line_count(self):
+        return self._output_line_count
 
     def stop_node(self, node):
         self._stopping.set()

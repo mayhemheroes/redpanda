@@ -24,51 +24,42 @@
 
 namespace kafka {
 
-struct add_partitions_to_txn_response;
-
-struct add_partitions_to_txn_api final {
-    using response_type = add_partitions_to_txn_response;
-
-    static constexpr const char* name = "add partitions to txn";
-    static constexpr api_key key = api_key(24);
-};
-
 struct add_partitions_to_txn_request final {
     using api_type = add_partitions_to_txn_api;
 
     add_partitions_to_txn_request_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const add_partitions_to_txn_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const add_partitions_to_txn_request& r) {
+        return os << r.data;
+    }
+};
 
 struct add_partitions_to_txn_response final {
     using api_type = add_partitions_to_txn_api;
 
     add_partitions_to_txn_response_data data;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
-};
 
-inline std::ostream&
-operator<<(std::ostream& os, const add_partitions_to_txn_response& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const add_partitions_to_txn_response& r) {
+        return os << r.data;
+    }
+};
 
 } // namespace kafka

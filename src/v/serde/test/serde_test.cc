@@ -9,17 +9,25 @@
 
 #include "hashing/crc32c.h"
 #include "model/fundamental.h"
+#include "model/metadata.h"
+#include "random/generators.h"
 #include "serde/envelope.h"
 #include "serde/serde.h"
+#include "tristate.h"
 #include "utils/fragmented_vector.h"
 
 #include <seastar/core/scheduling.hh>
+#include <seastar/core/sstring.hh>
+#include <seastar/net/inet_address.hh>
 #include <seastar/testing/thread_test_case.hh>
 
+#include <boost/functional/hash.hpp>
 #include <boost/test/unit_test.hpp>
 
 #include <chrono>
 #include <limits>
+#include <optional>
+#include <ratio>
 
 struct custom_read_write {
     friend inline void read_nested(
@@ -48,11 +56,15 @@ SEASTAR_THREAD_TEST_CASE(custom_read_write_test) {
 
 struct test_msg0
   : serde::envelope<test_msg0, serde::version<1>, serde::compat_version<0>> {
+    bool operator==(const test_msg0&) const = default;
+
     char _i, _j;
 };
 
 struct test_msg1
   : serde::envelope<test_msg1, serde::version<4>, serde::compat_version<0>> {
+    bool operator==(const test_msg1&) const = default;
+
     int _a;
     test_msg0 _m;
     int _b, _c;
@@ -60,12 +72,16 @@ struct test_msg1
 
 struct test_msg1_imcompatible
   : serde::envelope<test_msg1, serde::version<5>, serde::compat_version<5>> {
+    bool operator==(const test_msg1_imcompatible&) const = default;
+
     test_msg0 _m;
 };
 
 struct test_msg1_new
   : serde::
       envelope<test_msg1_new, serde::version<10>, serde::compat_version<5>> {
+    bool operator==(const test_msg1_new&) const = default;
+
     int _a;
     test_msg0 _m;
     int _b, _c;
@@ -84,10 +100,10 @@ struct test_msg1_new_manual {
 };
 
 struct not_an_envelope {};
-static_assert(!serde::is_envelope_v<not_an_envelope>);
-static_assert(serde::is_envelope_v<test_msg1>);
-static_assert(serde::inherits_from_envelope_v<test_msg1_new>);
-static_assert(!serde::inherits_from_envelope_v<test_msg1_new_manual>);
+static_assert(!serde::is_envelope<not_an_envelope>);
+static_assert(serde::is_envelope<test_msg1>);
+static_assert(serde::inherits_from_envelope<test_msg1_new>);
+static_assert(!serde::inherits_from_envelope<test_msg1_new_manual>);
 static_assert(test_msg1::redpanda_serde_version == 4);
 static_assert(test_msg1::redpanda_serde_compat_version == 0);
 
@@ -130,6 +146,8 @@ SEASTAR_THREAD_TEST_CASE(envelope_too_big_test) {
     struct big
       : public serde::
           envelope<big, serde::version<0>, serde::compat_version<0>> {
+        bool operator==(const big&) const = default;
+
         std::vector<char> data_;
     };
 
@@ -142,6 +160,8 @@ SEASTAR_THREAD_TEST_CASE(envelope_too_big_test) {
 SEASTAR_THREAD_TEST_CASE(simple_envelope_test) {
     struct msg
       : serde::envelope<msg, serde::version<1>, serde::compat_version<0>> {
+        bool operator==(const msg&) const = default;
+
         int32_t _i, _j;
     };
 
@@ -219,16 +239,24 @@ SEASTAR_THREAD_TEST_CASE(vector_test) {
 // vector length may take different size (vint)
 // vector data may have different size (_ints.size() * sizeof(int))
 struct inner_differing_sizes
-  : serde::envelope<inner_differing_sizes, serde::version<1>> {
+  : serde::envelope<
+      inner_differing_sizes,
+      serde::version<1>,
+      serde::compat_version<1>> {
+    bool operator==(const inner_differing_sizes&) const = default;
+
     std::vector<int32_t> _ints;
 };
 
-struct complex_msg : serde::envelope<complex_msg, serde::version<3>> {
+struct complex_msg
+  : serde::envelope<complex_msg, serde::version<3>, serde::compat_version<3>> {
     std::vector<inner_differing_sizes> _vec;
+    bool operator==(const complex_msg&) const = default;
+
     int32_t _x;
 };
 
-static_assert(serde::is_envelope_v<complex_msg>);
+static_assert(serde::is_envelope<complex_msg>);
 
 SEASTAR_THREAD_TEST_CASE(complex_msg_test) {
     auto b = iobuf();
@@ -370,8 +398,10 @@ struct test_snapshot_header
       test_snapshot_header,
       serde::version<1>,
       serde::compat_version<0>> {
-    ss::future<> serde_async_read(iobuf_parser&, serde::header const&);
+    ss::future<> serde_async_read(iobuf_parser&, serde::header const);
     ss::future<> serde_async_write(iobuf&) const;
+
+    bool operator==(const test_snapshot_header&) const = default;
 
     model::ns ns_;
     int32_t header_crc;
@@ -380,19 +410,21 @@ struct test_snapshot_header
     int32_t metadata_size;
 };
 
-static_assert(serde::is_envelope_v<test_snapshot_header>);
+static_assert(serde::is_envelope<test_snapshot_header>);
 static_assert(serde::has_serde_async_read<test_snapshot_header>);
 static_assert(serde::has_serde_async_write<test_snapshot_header>);
 
 ss::future<> test_snapshot_header::serde_async_read(
-  iobuf_parser& in, serde::header const& h) {
-    ns_ = serde::read_nested<decltype(ns_)>(in, h._bytes_left_limit);
-    header_crc = serde::read_nested<decltype(header_crc)>(
+  iobuf_parser& in, serde::header const h) {
+    ns_ = co_await serde::read_async_nested<decltype(ns_)>(
       in, h._bytes_left_limit);
-    metadata_crc = serde::read_nested<decltype(metadata_crc)>(
+    header_crc = co_await serde::read_async_nested<decltype(header_crc)>(
       in, h._bytes_left_limit);
-    version = serde::read_nested<decltype(version)>(in, h._bytes_left_limit);
-    metadata_size = serde::read_nested<decltype(metadata_size)>(
+    metadata_crc = co_await serde::read_async_nested<decltype(metadata_crc)>(
+      in, h._bytes_left_limit);
+    version = co_await serde::read_async_nested<decltype(version)>(
+      in, h._bytes_left_limit);
+    metadata_size = co_await serde::read_async_nested<decltype(metadata_size)>(
       in, h._bytes_left_limit);
 
     vassert(metadata_size >= 0, "Invalid metadata size {}", metadata_size);
@@ -403,51 +435,67 @@ ss::future<> test_snapshot_header::serde_async_read(
     crc.extend(ss::cpu_to_le(metadata_size));
 
     if (header_crc != crc.value()) {
-        return ss::make_exception_future<>(std::runtime_error(fmt::format(
+        throw std::runtime_error(fmt::format(
           "Corrupt snapshot. Failed to verify header crc: {} != "
           "{}: path?",
           crc.value(),
-          header_crc)));
+          header_crc));
     }
-
-    return ss::make_ready_future<>();
 }
 
 ss::future<> test_snapshot_header::serde_async_write(iobuf& out) const {
-    serde::write(out, ns_);
-    serde::write(out, header_crc);
-    serde::write(out, metadata_crc);
-    serde::write(out, version);
-    serde::write(out, metadata_size);
-    return ss::make_ready_future<>();
+    co_await serde::write_async(out, ns_);
+    co_await serde::write_async(out, header_crc);
+    co_await serde::write_async(out, metadata_crc);
+    co_await serde::write_async(out, version);
+    co_await serde::write_async(out, metadata_size);
 }
 
 SEASTAR_THREAD_TEST_CASE(snapshot_test) {
-    auto b = iobuf();
-    auto write_future = serde::write_async(
-      b,
-      test_snapshot_header{
-        .header_crc = 1, .metadata_crc = 2, .version = 3, .metadata_size = 4});
-    write_future.wait();
-    auto parser = iobuf_parser{std::move(b)};
-    auto read_future = serde::read_async<test_snapshot_header>(parser);
-    read_future.wait();
-    BOOST_CHECK(read_future.failed());
-    try {
-        std::rethrow_exception(read_future.get_exception());
-    } catch (std::exception const& e) {
+    {
+        auto obj = test_snapshot_header{
+          .metadata_crc = 2, .version = 3, .metadata_size = 4};
+        crc::crc32c header_crc;
+        header_crc.extend(ss::cpu_to_le(obj.metadata_crc));
+        header_crc.extend(ss::cpu_to_le(obj.version));
+        header_crc.extend(ss::cpu_to_le(obj.metadata_size));
+        obj.header_crc = header_crc.value();
+
+        auto b = iobuf();
+        serde::write_async(b, obj).get();
+
+        auto parser = iobuf_parser{std::move(b)};
         BOOST_CHECK(
-          std::string_view{e.what()}.starts_with("Corrupt snapshot."));
+          obj == serde::read_async<test_snapshot_header>(parser).get());
+    }
+
+    {
+        auto obj_with_bad_crc = test_snapshot_header{
+          .header_crc = 1, .metadata_crc = 2, .version = 3, .metadata_size = 4};
+        auto b = iobuf();
+        serde::write_async(b, obj_with_bad_crc).get();
+
+        auto parser = iobuf_parser{std::move(b)};
+        try {
+            serde::read_async<test_snapshot_header>(parser).get();
+        } catch (std::exception const& e) {
+            BOOST_CHECK(
+              std::string_view{e.what()}.starts_with("Corrupt snapshot."));
+        }
     }
 }
 
 struct small
   : public serde::envelope<small, serde::version<0>, serde::compat_version<0>> {
+    bool operator==(const small&) const = default;
+
     int a, b, c;
 };
 
 struct big
   : public serde::envelope<big, serde::version<1>, serde::compat_version<0>> {
+    bool operator==(const big&) const = default;
+
     int a, b, c, d{0x1234};
 };
 
@@ -503,11 +551,14 @@ SEASTAR_THREAD_TEST_CASE(compat_test_half_field_1) {
           serde::version<1>,
           serde::compat_version<
             0 /* Actually not compatible! Just to catch errors. */>> {
+        bool operator==(const half_field_1&) const = default;
+
         int a, b;
         short c;
     };
 
     auto b = serde::to_iobuf(half_field_1{.a = 1, .b = 2, .c = 3});
+    // NOLINTNEXTLINE(bugprone-use-after-move)
     BOOST_CHECK_THROW(serde::from_iobuf<small>(std::move(b)), std::exception);
 }
 
@@ -515,6 +566,8 @@ SEASTAR_THREAD_TEST_CASE(compat_test_half_field_2) {
     struct half_field_2
       : public serde::
           envelope<half_field_2, serde::version<1>, serde::compat_version<0>> {
+        bool operator==(const half_field_2&) const = default;
+
         int a, b, c;
         short d;
     };
@@ -527,6 +580,7 @@ SEASTAR_THREAD_TEST_CASE(compat_test_half_field_2) {
 
     auto b1 = serde::to_iobuf(
       half_field_2{.a = 1, .b = 2, .c = 3, .d = 0x1234});
+    // NOLINTNEXTLINE(bugprone-use-after-move)
     BOOST_CHECK_THROW(serde::from_iobuf<big>(std::move(b1)), std::exception);
 }
 
@@ -536,6 +590,8 @@ SEASTAR_THREAD_TEST_CASE(serde_checksum_envelope_test) {
           checksummed,
           serde::version<3>,
           serde::compat_version<2>> {
+        bool operator==(const checksummed&) const = default;
+
         std::vector<test_msg1_new_manual> data_;
     };
 
@@ -555,6 +611,8 @@ SEASTAR_THREAD_TEST_CASE(serde_checksum_envelope_test) {
 struct old_no_cs
   : public serde::
       envelope<old_no_cs, serde::version<3>, serde::compat_version<2>> {
+    bool operator==(const old_no_cs&) const = default;
+
     std::vector<test_msg1_new_manual> data_;
 };
 struct new_cs
@@ -577,6 +635,8 @@ struct new_cs
             break;
         }
     }
+
+    bool operator==(const new_cs&) const = default;
 
     std::vector<test_msg1_new_manual> data_;
 };
@@ -612,11 +672,17 @@ struct old_cs
       old_no_cs,
       serde::version<3>,
       serde::compat_version<2>> {
+    bool operator==(const old_cs&) const = default;
+
     std::vector<test_msg1_new_manual> data_;
 };
 struct new_no_cs
   : public serde::
       envelope<new_cs, serde::version<4>, serde::compat_version<3>> {
+    bool operator==(const new_no_cs& other) const {
+        return data_ == other.data_;
+    }
+
     serde::checksum_t unchecked_dummy_checksum_{0U};
     std::vector<test_msg1_new_manual> data_;
 };
@@ -652,7 +718,11 @@ struct serde_fields_test_struct
       envelope<test_msg1_new, serde::version<10>, serde::compat_version<5>> {
     serde_fields_test_struct() = default;
     explicit serde_fields_test_struct(int a)
-      : _a{a} {}
+      : _a{a}
+      , _m{test_msg0{._i = 11, ._j = 22}}
+      , _b{333}
+      , _c{444} {}
+    bool operator==(const serde_fields_test_struct&) const = default;
     auto serde_fields() { return std::tie(_a, _m, _b, _c); }
     int _a;
     test_msg0 _m;
@@ -693,5 +763,286 @@ SEASTAR_THREAD_TEST_CASE(fragmented_vector_test) {
         BOOST_REQUIRE_EQUAL(v_out.size(), v_in_copy.size());
         BOOST_REQUIRE_EQUAL_COLLECTIONS(
           v_out.begin(), v_out.end(), v_in_copy.begin(), v_in_copy.end());
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(serde_topic_namespace_test) {
+    iobuf b;
+    {
+        model::topic_namespace tn{model::ns{"abc"}, model::topic{"def"}};
+        b = serde::to_iobuf(std::move(tn));
+    }
+
+    auto tn = serde::from_iobuf<model::topic_namespace>(std::move(b));
+    BOOST_CHECK_EQUAL(tn.ns, "abc");
+    BOOST_CHECK_EQUAL(tn.tp, "def");
+}
+
+SEASTAR_THREAD_TEST_CASE(serde_bytes_test) {
+    iobuf b;
+    bytes bt = random_generators::get_bytes(128);
+
+    b = serde::to_iobuf(bt);
+
+    auto result = serde::from_iobuf<bytes>(std::move(b));
+    BOOST_CHECK_EQUAL(bt, result);
+}
+
+SEASTAR_THREAD_TEST_CASE(serde_tristate_test) {
+    tristate<ss::sstring> disabled{};
+    tristate<ss::sstring> empty(std::nullopt);
+    tristate<ss::sstring> set("test-tristate-value");
+
+    iobuf disabled_buf = serde::to_iobuf(disabled);
+    iobuf empty_buf = serde::to_iobuf(empty);
+    iobuf set_buf = serde::to_iobuf(set);
+
+    BOOST_CHECK_EQUAL(
+      disabled,
+      // NOLINTNEXTLINE(bugprone-use-after-move)
+      serde::from_iobuf<tristate<ss::sstring>>(std::move(disabled_buf)));
+    BOOST_CHECK_EQUAL(
+      empty,
+      // NOLINTNEXTLINE(bugprone-use-after-move)
+      serde::from_iobuf<tristate<ss::sstring>>(std::move(empty_buf)));
+    BOOST_CHECK_EQUAL(
+      set,
+      // NOLINTNEXTLINE(bugprone-use-after-move)
+      serde::from_iobuf<tristate<ss::sstring>>(std::move(set_buf)));
+}
+
+SEASTAR_THREAD_TEST_CASE(seastar_inet_address_test) {
+    ss::net::inet_address ipv4("192.168.1.0");
+    ss::net::inet_address ipv6("2001:0db8:85a3:0000:0000:8a2e:0370:7334");
+    iobuf ipv4_buf = serde::to_iobuf(ipv4);
+    iobuf ipv6_buf = serde::to_iobuf(ipv6);
+    BOOST_CHECK_EQUAL(
+      ipv4,
+      // NOLINTNEXTLINE(bugprone-use-after-move)
+      serde::from_iobuf<ss::net::inet_address>(std::move(ipv4_buf)));
+    BOOST_CHECK_EQUAL(
+      ipv6,
+      // NOLINTNEXTLINE(bugprone-use-after-move)
+      serde::from_iobuf<ss::net::inet_address>(std::move(ipv6_buf)));
+}
+
+template<template<class...> class T>
+void map_test() {
+    T<ss::sstring, int32_t> a = {
+      {"asdf", 33},
+      {"fooo", 44},
+    };
+
+    T<int32_t, int32_t> b = {
+      {123, 32},
+      {456, 66},
+      {959, 11},
+    };
+
+    iobuf a_buf = serde::to_iobuf(a);
+    iobuf b_buf = serde::to_iobuf(b);
+
+    auto a_from = serde::from_iobuf<T<ss::sstring, int32_t>>(std::move(a_buf));
+
+    auto b_from = serde::from_iobuf<T<int32_t, int32_t>>(std::move(b_buf));
+
+    BOOST_REQUIRE(a == a_from);
+    BOOST_REQUIRE(b == b_from);
+}
+
+template<template<class...> class T>
+void set_test() {
+    T<ss::sstring> a = {
+      "asdf",
+      "fooo",
+    };
+
+    T<int32_t> b = {
+      123,
+      456,
+      959,
+    };
+
+    iobuf a_buf = serde::to_iobuf(a);
+    iobuf b_buf = serde::to_iobuf(b);
+
+    auto a_from = serde::from_iobuf<T<ss::sstring>>(std::move(a_buf));
+
+    auto b_from = serde::from_iobuf<T<int32_t>>(std::move(b_buf));
+
+    BOOST_REQUIRE(a == a_from);
+    BOOST_REQUIRE(b == b_from);
+}
+
+SEASTAR_THREAD_TEST_CASE(std_unordered_map) { map_test<std::unordered_map>(); }
+
+SEASTAR_THREAD_TEST_CASE(absl_node_hash_map) {
+    map_test<absl::node_hash_map>();
+}
+
+SEASTAR_THREAD_TEST_CASE(absl_flat_hash_map) {
+    map_test<absl::flat_hash_map>();
+}
+
+SEASTAR_THREAD_TEST_CASE(absl_node_hash_set) {
+    set_test<absl::node_hash_set>();
+}
+
+SEASTAR_THREAD_TEST_CASE(absl_btree_set) { set_test<absl::btree_set>(); }
+
+struct foo_bar {};
+
+SEASTAR_THREAD_TEST_CASE(type_str) {
+    BOOST_CHECK_EQUAL(serde::type_str<int>(), "int");
+    BOOST_CHECK_EQUAL(serde::type_str<void>(), "void");
+    // the type part of a parameter in __PRETTY_FUNCTION__ may vary when it
+    // comes to a specialization of a template in standard library, but
+    // std::basic_string<char> should always have "string" in its name
+    BOOST_CHECK_NE(
+      serde::type_str<std::string>().find("string"), std::string_view::npos);
+    BOOST_CHECK_EQUAL(serde::type_str<foo_bar>(), "foo_bar");
+}
+// Utility to serialize and deserialize back an input.
+template<class T>
+T serde_input(T input) {
+    return serde::from_iobuf<T>(serde::to_iobuf(std::move(input)));
+}
+
+SEASTAR_THREAD_TEST_CASE(duration_type_test) {
+    using namespace std::chrono;
+    constexpr hours h(1);
+    constexpr milliseconds ms{3};
+    constexpr milliseconds ms_neg{-1};
+    constexpr duration<int, std::kilo> ks(3);
+    constexpr duration<int16_t> int16t_d(10);
+    constexpr duration<int16_t> int32t_d(10);
+    constexpr duration<int64_t, std::pico> int64t_pico(100000);
+    constexpr auto max_ns = nanoseconds::max();
+    constexpr auto min_ns = nanoseconds::min();
+
+    BOOST_REQUIRE(h == serde_input(h));
+    BOOST_REQUIRE(ms == serde_input(ms));
+    BOOST_REQUIRE(ms_neg == serde_input(ms_neg));
+    BOOST_REQUIRE(ks == serde_input(ks));
+    BOOST_REQUIRE(max_ns == serde_input(max_ns));
+    BOOST_REQUIRE(int16t_d == serde_input(int16t_d));
+    BOOST_REQUIRE(int32t_d == serde_input(int16t_d));
+    BOOST_REQUIRE(int64t_pico == serde_input(int64t_pico));
+    // Overflows, clamped to ns:max().
+    constexpr auto max_ms = milliseconds::max();
+    constexpr auto max_ns_in_ms = std::chrono::duration_cast<milliseconds>(
+      max_ns);
+    constexpr auto max_hrs = hours::max();
+    constexpr auto max_ns_in_hrs = std::chrono::duration_cast<hours>(max_ns);
+    BOOST_REQUIRE(max_ns_in_ms == serde_input(max_ms));
+    BOOST_REQUIRE(max_ns_in_hrs == serde_input(max_hrs));
+    // Underflows, clamped to ns::min()
+    constexpr auto min_ms = milliseconds::min();
+    constexpr auto min_ns_in_ms = std::chrono::duration_cast<milliseconds>(
+      min_ns);
+    BOOST_REQUIRE(min_ns_in_ms == serde_input(min_ms));
+
+    constexpr auto min_hrs = hours::min();
+    constexpr auto min_ns_in_hrs = std::chrono::duration_cast<hours>(min_ns);
+    BOOST_REQUIRE(min_ns_in_hrs == serde_input(min_hrs));
+}
+
+struct no_default_ctor
+  : public serde::
+      envelope<no_default_ctor, serde::version<0>, serde::compat_version<0>> {
+    no_default_ctor() = delete;
+
+    no_default_ctor(int x)
+      : x(x) {}
+
+    auto serde_fields() { return std::tie(x); }
+
+    bool operator==(const no_default_ctor&) const = default;
+
+    static no_default_ctor
+    serde_direct_read(iobuf_parser& in, size_t const bytes_left_limit) {
+        using serde::read_nested;
+        int x;
+        read_nested(in, x, bytes_left_limit);
+        return no_default_ctor(x);
+    }
+
+    int x;
+};
+
+static_assert(serde::has_serde_direct_read<no_default_ctor>);
+
+SEASTAR_THREAD_TEST_CASE(no_default_ctor_test) {
+    BOOST_CHECK_EQUAL(serde_input(no_default_ctor(37)).x, 37);
+}
+
+SEASTAR_THREAD_TEST_CASE(no_default_ctor_vector_test) {
+    BOOST_CHECK_EQUAL(
+      serde_input(std::vector<no_default_ctor>({no_default_ctor(37)})).at(0).x,
+      37);
+}
+
+struct async_checksummed
+  : public serde::checksum_envelope<
+      async_checksummed,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    test_msg0 msg;
+    ss::sstring str;
+
+    bool operator==(const async_checksummed&) const = default;
+
+    ss::future<> serde_async_read(iobuf_parser& in, serde::header const h) {
+        msg = co_await serde::read_async_nested<decltype(msg)>(
+          in, h._bytes_left_limit);
+        str = co_await serde::read_async_nested<decltype(str)>(
+          in, h._bytes_left_limit);
+    }
+
+    ss::future<> serde_async_write(iobuf& out) const {
+        co_await serde::write_async(out, msg);
+        co_await serde::write_async(out, str);
+    }
+};
+
+static_assert(serde::is_envelope<async_checksummed>);
+static_assert(serde::is_checksum_envelope<async_checksummed>);
+static_assert(serde::has_serde_async_read<async_checksummed>);
+static_assert(serde::has_serde_async_write<async_checksummed>);
+
+SEASTAR_THREAD_TEST_CASE(test_async_checksummed) {
+    auto obj = async_checksummed{
+        .msg = test_msg0{
+            ._i = 12,
+            ._j = 34,
+        },
+        .str = "hello",
+    };
+
+    {
+        auto b = iobuf{};
+        serde::write_async(b, obj).get();
+        auto parser = iobuf_parser{std::move(b)};
+        BOOST_CHECK(obj == serde::read_async<async_checksummed>(parser).get());
+    }
+
+    {
+        auto b = iobuf{};
+        serde::write_async(b, obj).get();
+
+        // corrupt the buffer
+        BOOST_REQUIRE(b.size_bytes() > 0);
+        auto& last_frag = *b.rbegin();
+        BOOST_REQUIRE(last_frag.size() > 0);
+        last_frag.get_write()[last_frag.size() - 1] += 1;
+
+        auto parser = iobuf_parser{std::move(b)};
+        BOOST_CHECK_EXCEPTION(
+          serde::read_async<async_checksummed>(parser).get(),
+          serde::serde_exception,
+          [](const serde::serde_exception& ex) {
+              return std::string_view{ex.what()}.find("bad checksum")
+                     != std::string_view::npos;
+          });
     }
 }

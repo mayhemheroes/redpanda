@@ -29,6 +29,9 @@ deb_deps=(
   clang
   curl
   git
+  golang-go
+  libkrb5-dev
+  libgssapi-krb5-2
   libsnappy-dev
   libxxhash-dev
   libzstd-dev
@@ -40,12 +43,17 @@ deb_deps=(
   python3-venv
   rapidjson-dev
   zip
+  unzip
+  libre2-dev
 )
 fedora_deps=(
   ccache
   clang
   curl
   git
+  golang
+  krb5-libs
+  krb5-devel
   libzstd-devel
   libzstd-static
   llvm
@@ -56,15 +64,19 @@ fedora_deps=(
   python3-virtualenv
   rapidjson-devel
   snappy-devel
+  which
   xxhash-devel
   xz
   zip
+  unzip
+  re2-devel
 )
 arch_deps=(
   ccache
   clang
   curl
   git
+  go
   zstd
   llvm
   lld
@@ -74,9 +86,11 @@ arch_deps=(
   python-virtualenv
   rapidjson
   snappy
+  which
   xxhash
   xz
   zip
+  unzip
 )
 
 case "$ID" in
@@ -87,7 +101,7 @@ case "$ID" in
   fedora)
     dnf install -y "${fedora_deps[@]}"
     ;;
-  arch)
+  arch | manjaro)
     pacman -Sy --needed --noconfirm "${arch_deps[@]}"
     ;;
   *)
@@ -98,31 +112,3 @@ esac
 # needed for unit tests
 sysctl -w fs.aio-max-nr=10485760 || true
 curl -1sLf "https://raw.githubusercontent.com/redpanda-data/seastar/master/install-dependencies.sh" | bash
-
-set -e
-
-if [[ -z ${DEPOT_TOOLS_DIR} ]]; then
-  DEPOT_TOOLS_DIR=/opt/depot_tools
-fi
-
-rm -rf $DEPOT_TOOLS_DIR
-mkdir -p $DEPOT_TOOLS_DIR
-cd $(dirname $DEPOT_TOOLS_DIR)
-git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
-cd $DEPOT_TOOLS_DIR
-git checkout ecdc362593cfee1ade115ead7be6c3e96b2e7384
-mkdir $DEPOT_TOOLS_DIR/installed-gn
-
-# Download gn (git_revision:e0c476ffc83dc10897cb90b45c03ae2539352c5c)
-case $(uname -m) in
-  x86_64)
-    link_for_gn="https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-amd64/+/COENCtFXQmybPdz3KQBjmuSaCK4qdzmzwuCJHQKxovEC"
-    ;;
-  *)
-    link_for_gn="https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-arm64/+/QckR7eHEDkvAVMi-h0_7w4D38fWeo-wdfI7Nfxy3jfEC"
-    ;;
-esac
-
-curl -L $link_for_gn --output $DEPOT_TOOLS_DIR/gn_zip
-unzip -d $DEPOT_TOOLS_DIR/installed-gn/ $DEPOT_TOOLS_DIR/gn_zip
-chmod -R 777 $DEPOT_TOOLS_DIR

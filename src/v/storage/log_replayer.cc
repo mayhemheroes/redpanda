@@ -9,7 +9,6 @@
 
 #include "storage/log_replayer.h"
 
-#include "bytes/utils.h"
 #include "hashing/crc32c.h"
 #include "likely.h"
 #include "model/record.h"
@@ -63,6 +62,8 @@ public:
         if (is_valid_batch_crc()) {
             _cfg.last_offset = _header.last_offset();
             _cfg.truncate_file_pos = _file_pos_to_end_of_batch;
+            _cfg.last_max_timestamp = std::max(
+              _header.first_timestamp, _header.max_timestamp);
             const auto physical_base_offset = _file_pos_to_end_of_batch
                                               - _header.size_bytes;
             _seg->index().maybe_track(_header, physical_base_offset);
@@ -95,13 +96,12 @@ log_replayer::checkpoint
 log_replayer::recover_in_thread(const ss::io_priority_class& prio) {
     vlog(stlog.debug, "Recovering segment {}", *_seg);
     // explicitly not using the index to recover the full file
-    auto data_stream = _seg->reader().data_stream(0, prio);
+    auto data_stream = _seg->reader().data_stream(0, prio).get();
     auto consumer = std::make_unique<checksumming_consumer>(_seg, _ckpt);
     auto parser = continuous_batch_parser(
-      std::move(consumer), std::move(data_stream));
+      std::move(consumer), std::move(data_stream), true);
     try {
         parser.consume().get();
-        parser.close().get();
     } catch (...) {
         vlog(
           stlog.warn,
@@ -110,6 +110,7 @@ log_replayer::recover_in_thread(const ss::io_priority_class& prio) {
           _ckpt,
           std::current_exception());
     }
+    parser.close().get();
     return _ckpt;
 }
 

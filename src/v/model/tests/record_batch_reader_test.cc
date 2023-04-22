@@ -9,7 +9,7 @@
 
 #include "model/record.h"
 #include "model/record_batch_reader.h"
-#include "storage/tests/utils/random_batch.h"
+#include "model/tests/random_batch.h"
 
 #include <seastar/core/thread.hh>
 #include <seastar/testing/thread_test_case.hh>
@@ -76,15 +76,15 @@ public:
     }
 
 private:
+    size_t _depth;
     int _init_count;
     ss::circular_buffer<record_batch> _result;
-    size_t _depth;
 };
 
 template<typename... Offsets>
 ss::circular_buffer<model::record_batch> make_batches(Offsets... o) {
     ss::circular_buffer<model::record_batch> batches;
-    (batches.emplace_back(storage::test::make_random_batch(o, 1, true)), ...);
+    (batches.emplace_back(model::test::make_random_batch(o, 1, true)), ...);
     return batches;
 }
 

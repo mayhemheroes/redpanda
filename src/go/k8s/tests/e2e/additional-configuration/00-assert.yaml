@@ -2,7 +2,6 @@ apiVersion: redpanda.vectorized.io/v1alpha1
 kind: Cluster
 metadata:
   name: additional-configuration
-  namespace: default
 status:
   replicas: 1
   restarting: false
@@ -12,7 +11,4 @@ status:
 apiVersion: kuttl.dev/v1beta1
 kind: TestAssert
 collectors:
-- type: pod
-  selector: app.kubernetes.io/name=redpanda
-  tail: -1
-  namespace: default
+- command: ../../../hack/get-redpanda-info.sh

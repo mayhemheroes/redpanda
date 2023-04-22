@@ -28,6 +28,8 @@ import (
 )
 
 // reconcileConfiguration ensures that the cluster configuration is synchronized with expected data
+//
+//nolint:funlen // splitting makes it difficult to follow
 func (r *ClusterReconciler) reconcileConfiguration(
 	ctx context.Context,
 	redpandaCluster *redpandav1alpha1.Cluster,
@@ -37,11 +39,11 @@ func (r *ClusterReconciler) reconcileConfiguration(
 	fqdn string,
 	log logr.Logger,
 ) error {
+	errorWithContext := newErrorWithContext(redpandaCluster.Namespace, redpandaCluster.Name)
 	if !featuregates.CentralizedConfiguration(redpandaCluster.Spec.Version) {
 		log.Info("Cluster is not using centralized configuration, skipping...")
 		return nil
 	}
-	errorWithContext := newErrorWithContext(redpandaCluster.Namespace, redpandaCluster.Name)
 
 	if added, err := r.ensureConditionPresent(ctx, redpandaCluster, log); err != nil || added {
 		// If condition is added or error returned, we wait for another reconcile loop
@@ -76,12 +78,25 @@ func (r *ClusterReconciler) reconcileConfiguration(
 		}
 	}
 
-	adminAPI, err := r.AdminAPIClientFactory(ctx, r, redpandaCluster, fqdn, pki.AdminAPINodeCert(), pki.AdminAPIClientCert())
+	adminAPI, err := r.AdminAPIClientFactory(ctx, r, redpandaCluster, fqdn, pki.AdminAPIConfigProvider())
 	if err != nil {
 		return errorWithContext(err, "error creating the admin API client")
 	}
 
-	schema, clusterConfig, status, err := r.retrieveClusterState(redpandaCluster, adminAPI)
+	// Checking if the feature is active because in the initial stages of cluster creation, it takes time for the feature to be activated
+	// and the API returns the same error (400) that is returned in case of malformed input, which causes a stop of the reconciliation
+	var centralConfigActive bool
+	if centralConfigActive, err = adminutils.IsFeatureActive(ctx, adminAPI, adminutils.CentralConfigFeatureName); err != nil {
+		return errorWithContext(err, "could not determine if central config is active in the cluster")
+	} else if !centralConfigActive {
+		log.Info("Waiting for the centralized configuration feature to be active in the cluster")
+		return &resources.RequeueAfterError{
+			RequeueAfter: resources.RequeueDuration,
+			Msg:          "centralized configuration feature not active",
+		}
+	}
+
+	schema, clusterConfig, status, err := r.retrieveClusterState(ctx, redpandaCluster, adminAPI)
 	if err != nil {
 		return err
 	}
@@ -179,7 +194,7 @@ func (r *ClusterReconciler) applyPatchIfNeeded(
 	}
 
 	log.Info("Applying patch to the cluster configuration", "patch", patch.String())
-	_, err = adminAPI.PatchClusterConfig(patch.Upsert, patch.Remove)
+	wr, err := adminAPI.PatchClusterConfig(ctx, patch.Upsert, patch.Remove)
 	if err != nil {
 		var conditionData *redpandav1alpha1.ClusterCondition
 		conditionData, err = tryMapErrorToCondition(err)
@@ -206,24 +221,28 @@ func (r *ClusterReconciler) applyPatchIfNeeded(
 		// Patch issue is due to user error, so it's unrecoverable
 		return false, nil
 	}
+	log.Info("Patch written to the cluster", "config_version", wr.ConfigVersion)
 	return true, nil
 }
 
 func (r *ClusterReconciler) retrieveClusterState(
-	redpandaCluster *redpandav1alpha1.Cluster, adminAPI adminutils.AdminAPIClient,
+	ctx context.Context,
+	redpandaCluster *redpandav1alpha1.Cluster,
+	adminAPI adminutils.AdminAPIClient,
 ) (admin.ConfigSchema, admin.Config, admin.ConfigStatusResponse, error) {
 	errorWithContext := newErrorWithContext(redpandaCluster.Namespace, redpandaCluster.Name)
 
-	schema, err := adminAPI.ClusterConfigSchema()
+	schema, err := adminAPI.ClusterConfigSchema(ctx)
 	if err != nil {
 		return nil, nil, nil, errorWithContext(err, "could not get centralized configuration schema")
 	}
-	clusterConfig, err := adminAPI.Config()
+	clusterConfig, err := adminAPI.Config(ctx, true)
 	if err != nil {
 		return nil, nil, nil, errorWithContext(err, "could not get current centralized configuration from cluster")
 	}
 
-	status, err := adminAPI.ClusterConfigStatus()
+	// We always send requests for config status to the leader to avoid inconsistencies due to config propagation delays.
+	status, err := adminAPI.ClusterConfigStatus(ctx, true)
 	if err != nil {
 		return nil, nil, nil, errorWithContext(err, "could not get current centralized configuration status from cluster")
 	}
@@ -295,25 +314,31 @@ func (r *ClusterReconciler) synchronizeStatusWithCluster(
 	log logr.Logger,
 ) (*redpandav1alpha1.ClusterCondition, error) {
 	errorWithContext := newErrorWithContext(redpandaCluster.Namespace, redpandaCluster.Name)
-	// Check status again using admin API
-	status, err := adminAPI.ClusterConfigStatus()
+	// Check status again on the leader using admin API
+	status, err := adminAPI.ClusterConfigStatus(ctx, true)
 	if err != nil {
 		return nil, errorWithContext(err, "could not get config status from admin API")
 	}
 	conditionData := mapStatusToCondition(status)
 	conditionChanged := redpandaCluster.Status.SetCondition(conditionData.Type, conditionData.Status, conditionData.Reason, conditionData.Message)
-	stsNeedsRestart := needsRestart(status)
-	if conditionChanged || (stsNeedsRestart && !redpandaCluster.Status.IsRestarting()) {
-		// Trigger restart here if needed
-		if stsNeedsRestart {
+	clusterNeedsRestart := needsRestart(status, log)
+	clusterSafeToRestart := isSafeToRestart(status, log)
+	restartingCluster := clusterNeedsRestart && clusterSafeToRestart
+
+	log.Info("Synchronizing configuration state for cluster",
+		"status", conditionData.Status,
+		"reason", conditionData.Reason,
+		"message", conditionData.Message,
+		"needs_restart", clusterNeedsRestart,
+		"restarting", restartingCluster,
+	)
+	if conditionChanged || (restartingCluster && !redpandaCluster.Status.IsRestarting()) {
+		log.Info("Updating configuration state for cluster")
+		// Trigger restart here if needed and safe to do it
+		if restartingCluster {
 			redpandaCluster.Status.SetRestarting(true)
 		}
-		log.Info("Updating configuration state for cluster",
-			"status", conditionData.Status,
-			"reason", conditionData.Reason,
-			"message", conditionData.Message,
-			"restarting", redpandaCluster.Status.IsRestarting(),
-		)
+
 		if err := r.Status().Update(ctx, redpandaCluster); err != nil {
 			return nil, errorWithContext(err, "could not update condition on cluster")
 		}
@@ -321,12 +346,12 @@ func (r *ClusterReconciler) synchronizeStatusWithCluster(
 	return redpandaCluster.Status.GetCondition(conditionData.Type), nil
 }
 
-// nolint:gocritic // I like this if else chain
+//nolint:gocritic // I like this if else chain
 func mapStatusToCondition(
 	clusterStatus admin.ConfigStatusResponse,
 ) redpandav1alpha1.ClusterCondition {
 	var condition *redpandav1alpha1.ClusterCondition
-	var configVersion int64
+	var configVersion int64 = -1
 	for _, nodeStatus := range clusterStatus {
 		if len(nodeStatus.Invalid) > 0 {
 			condition = &redpandav1alpha1.ClusterCondition{
@@ -347,9 +372,9 @@ func mapStatusToCondition(
 				Type:    redpandav1alpha1.ClusterConfiguredConditionType,
 				Status:  corev1.ConditionFalse,
 				Reason:  redpandav1alpha1.ClusterConfiguredReasonUpdating,
-				Message: fmt.Sprintf("Node %d needs restart", nodeStatus.NodeId),
+				Message: fmt.Sprintf("Node %d needs restart", nodeStatus.NodeID),
 			}
-		} else if configVersion != 0 && nodeStatus.ConfigVersion != configVersion {
+		} else if configVersion >= 0 && nodeStatus.ConfigVersion != configVersion {
 			condition = &redpandav1alpha1.ClusterCondition{
 				Type:    redpandav1alpha1.ClusterConfiguredConditionType,
 				Status:  corev1.ConditionFalse,
@@ -371,13 +396,28 @@ func mapStatusToCondition(
 	return *condition
 }
 
-func needsRestart(clusterStatus admin.ConfigStatusResponse) bool {
+func needsRestart(
+	clusterStatus admin.ConfigStatusResponse, log logr.Logger,
+) bool {
+	nodeNeedsRestart := false
 	for i := range clusterStatus {
+		log.Info(fmt.Sprintf("Node %d restart status is %v", clusterStatus[i].NodeID, clusterStatus[i].Restart))
 		if clusterStatus[i].Restart {
-			return true
+			nodeNeedsRestart = true
 		}
 	}
-	return false
+	return nodeNeedsRestart
+}
+
+func isSafeToRestart(
+	clusterStatus admin.ConfigStatusResponse, log logr.Logger,
+) bool {
+	configVersions := make(map[int64]bool)
+	for i := range clusterStatus {
+		log.Info(fmt.Sprintf("Node %d is using config version %d", clusterStatus[i].NodeID, clusterStatus[i].ConfigVersion))
+		configVersions[clusterStatus[i].ConfigVersion] = true
+	}
+	return len(configVersions) == 1
 }
 
 // tryMapErrorToCondition tries to map validation errors received from the cluster to a condition
@@ -385,7 +425,7 @@ func needsRestart(clusterStatus admin.ConfigStatusResponse) bool {
 func tryMapErrorToCondition(
 	err error,
 ) (*redpandav1alpha1.ClusterCondition, error) {
-	var httpErr *admin.HttpError
+	var httpErr *admin.HTTPResponseError
 	if errors.As(err, &httpErr) {
 		if httpErr.Response != nil && httpErr.Response.StatusCode == http.StatusBadRequest {
 			return &redpandav1alpha1.ClusterCondition{

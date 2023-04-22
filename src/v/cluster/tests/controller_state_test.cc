@@ -39,14 +39,14 @@ FIXTURE_TEST(test_creating_same_topic_twice, cluster_test_fixture) {
     // add three nodes
     auto node_0 = create_node_application(model::node_id{0});
     wait_for_controller_leadership(node_0->controller->self()).get();
-    auto node_1 = create_node_application(model::node_id{1});
-    auto node_2 = create_node_application(model::node_id{2});
+    create_node_application(model::node_id{1});
+    create_node_application(model::node_id{2});
 
     // wait for cluster to be stable
     tests::cooperative_spin_wait_with_timeout(5s, [this] {
-        return get_local_cache(model::node_id{0}).all_brokers().size() == 3
-               && get_local_cache(model::node_id{1}).all_brokers().size() == 3
-               && get_local_cache(model::node_id{2}).all_brokers().size() == 3;
+        return get_local_cache(model::node_id{0}).node_count() == 3
+               && get_local_cache(model::node_id{1}).node_count() == 3
+               && get_local_cache(model::node_id{2}).node_count() == 3;
     }).get0();
 
     std::vector<ss::future<std::vector<cluster::topic_result>>> futures;

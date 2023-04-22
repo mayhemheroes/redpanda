@@ -33,10 +33,10 @@ using namespace std::chrono_literals;
 ss::future<append_entries_request> replicate_entries_stm::share_request() {
     // one extra copy is needed for retries
     return with_semaphore(_share_sem, 1, [this] {
-        return details::foreign_share_n(std::move(_req->batches), 2)
+        return details::foreign_share_n(std::move(_req->batches()), 2)
           .then([this](std::vector<model::record_batch_reader> readers) {
               // keep a copy around until the end
-              _req->batches = std::move(readers.back());
+              _req->batches() = std::move(readers.back());
               readers.pop_back();
               return append_entries_request(
                 _req->node_id,
@@ -102,7 +102,7 @@ replicate_entries_stm::send_append_entries_request(
 
     auto f = _ptr->_fstats.get_append_entries_unit(n).then_wrapped(
       [this, req = std::move(req), opts = std::move(opts), n](
-        ss::future<ss::semaphore_units<>> f) mutable {
+        ss::future<ssx::semaphore_units> f) mutable {
           // we want to signal dispatch semaphore after calling append entries.
           // When dispatch semaphore is released the append_entries_stm releases
           // op_lock so next append entries request can be dispatched to the
@@ -118,9 +118,10 @@ replicate_entries_stm::send_append_entries_request(
 
           return _ptr->_client_protocol
             .append_entries(n.id(), std::move(req), std::move(opts))
-            .then([this](result<append_entries_reply> reply) {
+            .then([this, target_node_id = n.id()](
+                    result<append_entries_reply> reply) {
                 return _ptr->validate_reply_target_node(
-                  "append_entries_replicate", std::move(reply));
+                  "append_entries_replicate", reply, target_node_id);
             })
             .finally([this, n, u = std::move(u)] {
                 _ptr->_fstats.return_append_entries_units(n);
@@ -188,7 +189,7 @@ replicate_entries_stm::append_to_self() {
             = _req->flush ? consistency_level::quorum_ack
                           : consistency_level::leader_ack;
           return _ptr->disk_append(
-            std::move(req.batches),
+            std::move(req.batches()),
             _req->flush ? consensus::update_last_quorum_index::yes
                         : consensus::update_last_quorum_index::no);
       })
@@ -230,10 +231,10 @@ inline bool replicate_entries_stm::should_skip_follower_request(vnode id) {
     if (auto it = _ptr->_fstats.find(id); it != _ptr->_fstats.end()) {
         const auto timeout = clock_type::now()
                              - _ptr->_replicate_append_timeout;
-        if (it->second.last_received_append_entries_reply_timestamp < timeout) {
+        if (it->second.last_received_reply_timestamp < timeout) {
             vlog(
               _ctxlog.trace,
-              "Skipping sending append request to {} - didn'r  receive "
+              "Skipping sending append request to {} - didn't receive "
               "follower heartbeat",
               id);
             return true;
@@ -284,10 +285,9 @@ ss::future<result<replicate_result>> replicate_entries_stm::apply(units_t u) {
         }
         if (rni != _ptr->self()) {
             auto it = _ptr->_fstats.find(rni);
-            if (it == _ptr->_fstats.end()) {
-                return;
+            if (it != _ptr->_fstats.end()) {
+                it->second.last_sent_offset = _dirty_offset;
             }
-            it->second.last_sent_offset = _dirty_offset;
         }
         ++_requests_count;
         (void)dispatch_one(rni); // background
@@ -295,12 +295,13 @@ ss::future<result<replicate_result>> replicate_entries_stm::apply(units_t u) {
 
     // wait for the requests to be dispatched in background and then release
     // units
-    (void)ss::with_gate(_req_bg, [this]() -> ss::future<> {
+    (void)ss::with_gate(_req_bg, [this]() {
         // Wait until all RPCs will be dispatched
-        co_await _dispatch_sem.wait(_requests_count);
-        // release memory reservations, and destroy data
-        _req.reset();
-        _units.release();
+        return _dispatch_sem.wait(_requests_count).then([this] {
+            // release memory reservations, and destroy data
+            _req.reset();
+            _units.release();
+        });
     });
 
     co_return build_replicate_result();
@@ -419,7 +420,7 @@ replicate_entries_stm::replicate_entries_stm(
   : _ptr(p)
   , _req(std::make_unique<append_entries_request>(std::move(r)))
   , _followers_seq(std::move(seqs))
-  , _share_sem(1)
+  , _share_sem(1, "raft/repl-entries")
   , _ctxlog(_ptr->_ctxlog) {}
 
 replicate_entries_stm::~replicate_entries_stm() {

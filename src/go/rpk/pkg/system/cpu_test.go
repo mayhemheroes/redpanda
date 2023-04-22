@@ -69,7 +69,7 @@ power management:
 			fs,
 			"/proc/cpuinfo",
 			[]byte(contents),
-			0755,
+			0o755,
 		)
 	}
 	tests := []struct {
@@ -88,7 +88,7 @@ power management:
 				fs,
 				"/proc/cpuinfo",
 				[]byte(""),
-				0755,
+				0o755,
 			)
 		},
 	}, {
@@ -109,7 +109,7 @@ power management:
 			if tt.before != nil {
 				require.NoError(st, tt.before(fs))
 			}
-			cpus, err := system.CpuInfo(fs)
+			cpus, err := system.GetCPUInfo(fs)
 			if tt.expectedErrMsg != "" {
 				require.Error(st, err)
 				require.Contains(st, err.Error(), tt.expectedErrMsg)

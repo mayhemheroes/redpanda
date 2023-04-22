@@ -15,6 +15,7 @@ from rptest.services.rpk_producer import RpkProducer
 from rptest.services.compatibility.example_runner import ExampleRunner
 import rptest.services.compatibility.sarama_examples as SaramaExamples
 from rptest.tests.redpanda_test import RedpandaTest
+from rptest.services.redpanda import SecurityConfig
 from rptest.clients.types import TopicSpec
 
 
@@ -27,7 +28,9 @@ class SaramaTest(RedpandaTest):
     topics = (TopicSpec(), )
 
     def __init__(self, test_context):
-        super(SaramaTest, self).__init__(test_context=test_context)
+        super(SaramaTest, self).__init__(
+            test_context=test_context,
+            extra_rp_conf={'auto_create_topics_enabled': True})
 
         self._ctx = test_context
 
@@ -46,7 +49,9 @@ class SaramaTest(RedpandaTest):
         # Start the example
         example.start()
 
-        example.wait()
+        wait_until(example.condition_met,
+                   timeout_sec=self._timeout,
+                   backoff_sec=1)
 
     @cluster(num_nodes=4)
     def test_sarama_http_server(self):
@@ -59,7 +64,9 @@ class SaramaTest(RedpandaTest):
         example.start()
 
         # Wait for the server to load
-        example.wait()
+        wait_until(example.condition_met,
+                   timeout_sec=self._timeout,
+                   backoff_sec=1)
 
         # Get the node the server is on and
         # a ducktape node
@@ -120,7 +127,9 @@ class SaramaTest(RedpandaTest):
         example.start()
 
         # Wait until the example is OK to terminate
-        example.wait()
+        wait_until(example.condition_met,
+                   timeout_sec=self._timeout,
+                   backoff_sec=1)
 
 
 class SaramaScramTest(RedpandaTest):
@@ -132,9 +141,9 @@ class SaramaScramTest(RedpandaTest):
     topics = (TopicSpec(), )
 
     def __init__(self, test_context):
-        extra_rp_conf = dict(enable_sasl=True, )
-        super(SaramaScramTest, self).__init__(test_context,
-                                              extra_rp_conf=extra_rp_conf)
+        security = SecurityConfig()
+        security.enable_sasl = True
+        super(SaramaScramTest, self).__init__(test_context, security=security)
 
     @cluster(num_nodes=3)
     def test_sarama_sasl_scram(self):

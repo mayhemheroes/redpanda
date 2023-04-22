@@ -17,10 +17,8 @@
 #include "raft/consensus_client_protocol.h"
 #include "raft/group_configuration.h"
 #include "raft/types.h"
-#include "rpc/connection_cache.h"
 #include "utils/mutex.h"
 
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/util/log.hh>
 
@@ -123,10 +121,10 @@ public:
     };
 
     heartbeat_manager(
-      duration_type interval,
+      config::binding<std::chrono::milliseconds>,
       consensus_client_protocol,
       model::node_id,
-      duration_type);
+      config::binding<std::chrono::milliseconds>);
 
     ss::future<> register_group(ss::lw_shared_ptr<consensus>);
     ss::future<> deregister_group(raft::group_id);
@@ -164,8 +162,8 @@ private:
 
     mutex _lock;
     clock_type::time_point _hbeat = clock_type::now();
-    duration_type _heartbeat_interval;
-    duration_type _heartbeat_timeout;
+    config::binding<std::chrono::milliseconds> _heartbeat_interval;
+    config::binding<std::chrono::milliseconds> _heartbeat_timeout;
     timer_type _heartbeat_timer;
     /// \brief used to wait for background ops before shutting down
     ss::gate _bghbeats;

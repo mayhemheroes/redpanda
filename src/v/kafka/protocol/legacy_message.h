@@ -67,31 +67,34 @@ struct legacy_message {
               fmt::format("Unknown compression value: {}", value));
         }
     }
-};
 
-inline std::ostream& operator<<(std::ostream& os, const legacy_message& m) {
-    fmt::print(
-      os,
-      "{{offset {} length {} crc {} magic {} attrs {}:{} ts {} key {} value "
-      "{}}}",
-      m.base_offset,
-      m.batch_length,
-      static_cast<uint32_t>(m.batch_crc),
-      m.magic,
-      m.attributes,
-      m.compression(),
-      m.timestamp,
-      m.key,
-      m.value);
-    return os;
-}
+    friend std::ostream& operator<<(std::ostream& os, const legacy_message& m) {
+        fmt::print(
+          os,
+          "{{offset {} length {} crc {} magic {} attrs {}:{} ts {} key {} "
+          "value "
+          "{}}}",
+          m.base_offset,
+          m.batch_length,
+          static_cast<uint32_t>(m.batch_crc),
+          m.magic,
+          m.attributes,
+          m.compression(),
+          m.timestamp,
+          m.key,
+          m.value);
+        return os;
+    }
+};
 
 inline std::optional<legacy_message> decode_legacy_batch(iobuf_parser& parser) {
     auto base_offset = model::offset(parser.consume_be_type<int64_t>());
     auto batch_length = parser.consume_be_type<int32_t>();
     auto expected_crc = parser.consume_be_type<int32_t>();
-    // bytes covered by crc start immediately after the crc value
-    auto crc_parser = iobuf_parser(parser.share_no_consume(batch_length));
+    // bytes covered by crc start immediately after the crc value, but not
+    // including it
+    auto crc_parser = iobuf_parser(
+      parser.share_no_consume(batch_length - sizeof(int32_t)));
     auto magic = parser.consume_type<int8_t>();
     if (unlikely(magic != 0 && magic != 1)) {
         vlog(klog.error, "Expected magic 0 or 1 got {}", magic);

@@ -23,15 +23,6 @@
 
 namespace kafka {
 
-struct sync_group_response;
-
-struct sync_group_api final {
-    using response_type = sync_group_response;
-
-    static constexpr const char* name = "sync group";
-    static constexpr api_key key = api_key(14);
-};
-
 struct sync_group_request final {
     using api_type = sync_group_api;
 
@@ -40,11 +31,11 @@ struct sync_group_request final {
     // set during request processing after mapping group to ntp
     model::ntp ntp;
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
-    void decode(request_reader& reader, api_version version) {
+    void decode(protocol::decoder& reader, api_version version) {
         data.decode(reader, version);
     }
 
@@ -59,11 +50,12 @@ struct sync_group_request final {
           });
         return res;
     }
-};
 
-inline std::ostream& operator<<(std::ostream& os, const sync_group_request& r) {
-    return os << r.data;
-}
+    friend std::ostream&
+    operator<<(std::ostream& os, const sync_group_request& r) {
+        return os << r.data;
+    }
+};
 
 struct sync_group_response final {
     using api_type = sync_group_api;
@@ -84,22 +76,18 @@ struct sync_group_response final {
     sync_group_response(const sync_group_request&, error_code error)
       : sync_group_response(error) {}
 
-    void encode(response_writer& writer, api_version version) {
+    void encode(protocol::encoder& writer, api_version version) {
         data.encode(writer, version);
     }
 
     void decode(iobuf buf, api_version version) {
         data.decode(std::move(buf), version);
     }
+
+    friend std::ostream&
+    operator<<(std::ostream& os, const sync_group_response& r) {
+        return os << r.data;
+    }
 };
-
-inline ss::future<sync_group_response> make_sync_error(error_code error) {
-    return ss::make_ready_future<sync_group_response>(error);
-}
-
-inline std::ostream&
-operator<<(std::ostream& os, const sync_group_response& r) {
-    return os << r.data;
-}
 
 } // namespace kafka

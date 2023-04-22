@@ -10,6 +10,7 @@
 package admin
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -45,7 +46,7 @@ func TestAdminAPI(t *testing.T) {
 			name:     "delete user in 1 node cluster",
 			nNodes:   1,
 			leaderID: 0,
-			action:   func(t *testing.T, a *AdminAPI) error { return a.DeleteUser("Milo") },
+			action:   func(t *testing.T, a *AdminAPI) error { return a.DeleteUser(context.Background(), "Milo") },
 			leader:   []string{"/v1/security/users/Milo"},
 			none:     []string{"/v1/partitions/redpanda/controller/0", "/v1/node_config"},
 		},
@@ -53,7 +54,7 @@ func TestAdminAPI(t *testing.T) {
 			name:     "delete user in 3 node cluster",
 			nNodes:   3,
 			leaderID: 1,
-			action:   func(t *testing.T, a *AdminAPI) error { return a.DeleteUser("Lola") },
+			action:   func(t *testing.T, a *AdminAPI) error { return a.DeleteUser(context.Background(), "Lola") },
 			all:      []string{"/v1/node_config"},
 			any:      []string{"/v1/partitions/redpanda/controller/0"},
 			leader:   []string{"/v1/security/users/Lola"},
@@ -62,10 +63,12 @@ func TestAdminAPI(t *testing.T) {
 			name:     "create user in 3 node cluster",
 			nNodes:   3,
 			leaderID: 1,
-			action:   func(t *testing.T, a *AdminAPI) error { return a.CreateUser("Joss", "momorocks", ScramSha256) },
-			all:      []string{"/v1/node_config"},
-			any:      []string{"/v1/partitions/redpanda/controller/0"},
-			leader:   []string{"/v1/security/users"},
+			action: func(t *testing.T, a *AdminAPI) error {
+				return a.CreateUser(context.Background(), "Joss", "momorocks", ScramSha256)
+			},
+			all:    []string{"/v1/node_config"},
+			any:    []string{"/v1/partitions/redpanda/controller/0"},
+			leader: []string{"/v1/security/users"},
 		},
 		{
 			name:     "list users in 3 node cluster",
@@ -78,7 +81,7 @@ func TestAdminAPI(t *testing.T) {
 				},
 			},
 			action: func(t *testing.T, a *AdminAPI) error {
-				users, err := a.ListUsers()
+				users, err := a.ListUsers(context.Background())
 				require.NoError(t, err)
 				require.Len(t, users, 4)
 				return nil
@@ -90,16 +93,21 @@ func TestAdminAPI(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-
 			urls := []string{}
 			calls := []testCall{}
 			mutex := sync.Mutex{}
-
+			tServers := []*httptest.Server{}
 			for i := 0; i < tt.nNodes; i += 1 {
 				ts := httptest.NewServer(handlerForNode(t, i, tt, &calls, &mutex))
-				defer ts.Close()
+				tServers = append(tServers, ts)
 				urls = append(urls, ts.URL)
 			}
+
+			defer func() {
+				for _, ts := range tServers {
+					ts.Close()
+				}
+			}()
 
 			adminClient, err := NewAdminAPI(urls, BasicCredentials{}, nil)
 			require.NoError(t, err)
@@ -112,7 +120,7 @@ func TestAdminAPI(t *testing.T) {
 				checkCallToAnyNode(t, calls, path, tt.nNodes)
 			}
 			for _, path := range tt.leader {
-				checkCallToLeader(t, calls, path, tt.nNodes, tt.leaderID)
+				checkCallToLeader(t, calls, path, tt.leaderID)
 			}
 			for _, path := range tt.none {
 				checkCallNone(t, calls, path, tt.nNodes)
@@ -162,6 +170,7 @@ func checkCallToAllNodes(
 		}
 	}
 }
+
 func checkCallToAnyNode(
 	t *testing.T, calls []testCall, path string, nNodes int,
 ) {
@@ -172,8 +181,9 @@ func checkCallToAnyNode(
 	}
 	require.Fail(t, fmt.Sprintf("path (%s) was expected to be called in any node but it wasn't called", path))
 }
+
 func checkCallToLeader(
-	t *testing.T, calls []testCall, path string, nNodes, leaderID int,
+	t *testing.T, calls []testCall, path string, leaderID int,
 ) {
 	if len(callsForPathAndNodeID(calls, path, leaderID)) == 0 {
 		require.Fail(t, fmt.Sprintf("path (%s) was expected to be called in the leader node but it wasn't", path))

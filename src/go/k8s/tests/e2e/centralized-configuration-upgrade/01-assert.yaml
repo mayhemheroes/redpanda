@@ -13,7 +13,7 @@ metadata:
 spec:
   containers:
   - name: redpanda
-    image: "vectorized/redpanda:v21.11.11"
+    image: "vectorized/redpanda:v22.1.11"
 status:
   phase: "Running"
 ---
@@ -25,6 +25,12 @@ metadata:
 spec:
   containers:
     - name: redpanda
-      image: "vectorized/redpanda:v21.11.11"
+      image: "vectorized/redpanda:v22.1.11"
 status:
   phase: "Running"
+---
+
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+collectors:
+  - command: ../../../hack/get-redpanda-info.sh

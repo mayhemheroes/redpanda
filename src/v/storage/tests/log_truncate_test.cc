@@ -107,8 +107,10 @@ FIXTURE_TEST(test_truncate_in_the_middle_of_batch, storage_test_fixture) {
     auto log
       = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get0();
 
-    append_batch(log, test::make_random_batch(model::offset{0}, 10, true));
-    append_batch(log, test::make_random_batch(model::offset{0}, 5, true));
+    append_batch(
+      log, model::test::make_random_batch(model::offset{0}, 10, true));
+    append_batch(
+      log, model::test::make_random_batch(model::offset{0}, 5, true));
 
     auto truncate_at = [log](model::offset o) mutable {
         log.truncate(storage::truncate_config(o, ss::default_priority_class()))
@@ -291,12 +293,21 @@ FIXTURE_TEST(test_truncate_last_single_record_batch, storage_test_fixture) {
     auto ntp = model::ntp("default", "test", 0);
     auto log
       = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get0();
-    auto headers = append_random_batches(log, 15, model::term_id(0), [] {
-        ss::circular_buffer<model::record_batch> ret;
-        ret.push_back(
-          storage::test::make_random_batch(model::offset(0), 1, true));
-        return ret;
-    });
+    auto headers = append_random_batches(
+      log,
+      15,
+      model::term_id(0),
+      [](std::optional<model::timestamp> ts = std::nullopt) {
+          ss::circular_buffer<model::record_batch> ret;
+          ret.push_back(model::test::make_random_batch(
+            model::offset(0),
+            1,
+            true,
+            model::record_batch_type::raft_data,
+            std::nullopt,
+            ts));
+          return ret;
+      });
     log.flush().get0();
 
     for (auto lstats = log.offsets(); lstats.dirty_offset > model::offset{};
@@ -321,7 +332,6 @@ FIXTURE_TEST(
   test_truncate_whole_log_when_logs_are_garbadge_collected,
   storage_test_fixture) {
     auto cfg = default_log_config(test_dir);
-    cfg.stype = storage::log_config::storage_type::disk;
     storage::log_manager mgr = make_log_manager(cfg);
     info("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get0(); });
@@ -340,14 +350,18 @@ FIXTURE_TEST(
     append_random_batches(log, 10, model::term_id(0));
     append_random_batches(log, 10, model::term_id(0));
     log.flush().get0();
-    auto ts = model::timestamp::now();
+    auto ts = now();
     append_random_batches(log, 10, model::term_id(0));
     log.flush().get0();
     // garbadge collect first append series
     ss::abort_source as;
     log
-      .compact(
-        compaction_config(ts, std::nullopt, ss::default_priority_class(), as))
+      .compact(compaction_config(
+        ts,
+        std::nullopt,
+        model::offset::max(),
+        ss::default_priority_class(),
+        as))
       .get0();
     // truncate at 0, offset earlier then the one present in log
     log
@@ -411,7 +425,6 @@ FIXTURE_TEST(test_truncate, storage_test_fixture) {
 
 FIXTURE_TEST(truncated_segment_recovery, storage_test_fixture) {
     auto cfg = default_log_config(test_dir);
-    cfg.stype = storage::log_config::storage_type::disk;
     auto ntp = model::ntp("default", "test", 0);
     std::vector<model::offset> truncate_offsets;
 
@@ -491,7 +504,6 @@ FIXTURE_TEST(truncated_segment_recovery, storage_test_fixture) {
 
 FIXTURE_TEST(test_concurrent_prefix_truncate_and_gc, storage_test_fixture) {
     auto cfg = default_log_config(test_dir);
-    cfg.stype = storage::log_config::storage_type::disk;
     storage::log_manager mgr = make_log_manager(cfg);
     info("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get0(); });
@@ -514,21 +526,25 @@ FIXTURE_TEST(test_concurrent_prefix_truncate_and_gc, storage_test_fixture) {
     append_random_batches(log, 10, model::term_id(1));
     log.flush().get0();
 
-    auto ts = model::timestamp::now();
-    auto new_lstats = log.offsets();
-    log.set_collectible_offset(new_lstats.dirty_offset);
+    auto ts = now();
 
     append_random_batches(log, 10, model::term_id(2));
     log.flush().get0();
-    // garbadge collect first append series
     ss::abort_source as;
 
-    // truncate at 0, offset earlier then the one present in log
-    auto f1 = log.compact(
-      compaction_config(ts, std::nullopt, ss::default_priority_class(), as));
+    // The call to 'compact' simply triggers a notification
+    // for the log eviction stm with an offset until which
+    // to evict. The test does not listen for the notification,
+    // so this call is basically a no-op.
+    auto f1 = log.compact(compaction_config(
+      ts,
+      std::nullopt,
+      model::offset::max(),
+      ss::default_priority_class(),
+      as));
 
     auto f2 = log.truncate_prefix(storage::truncate_prefix_config(
-      lstats.dirty_offset, ss::default_priority_class()));
+      model::next_offset(lstats.dirty_offset), ss::default_priority_class()));
 
     f1.get0();
     f2.get0();
@@ -550,8 +566,10 @@ FIXTURE_TEST(
     auto log
       = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get0();
 
-    append_batch(log, test::make_random_batch(model::offset{0}, 10, true));
-    append_batch(log, test::make_random_batch(model::offset{0}, 5, true));
+    append_batch(
+      log, model::test::make_random_batch(model::offset{0}, 10, true));
+    append_batch(
+      log, model::test::make_random_batch(model::offset{0}, 5, true));
 
     auto truncate_at = [log](model::offset o) mutable {
         log
@@ -591,8 +609,10 @@ FIXTURE_TEST(test_prefix_truncate_then_truncate_all, storage_test_fixture) {
     auto log
       = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get0();
 
-    append_batch(log, test::make_random_batch(model::offset{0}, 10, true));
-    append_batch(log, test::make_random_batch(model::offset{0}, 5, true));
+    append_batch(
+      log, model::test::make_random_batch(model::offset{0}, 10, true));
+    append_batch(
+      log, model::test::make_random_batch(model::offset{0}, 5, true));
 
     log
       .truncate_prefix(storage::truncate_prefix_config(
@@ -608,10 +628,67 @@ FIXTURE_TEST(test_prefix_truncate_then_truncate_all, storage_test_fixture) {
     BOOST_CHECK_EQUAL(log.offsets().start_offset, model::offset{10});
     BOOST_CHECK_EQUAL(read_and_validate_all_batches(log).size(), 0);
 
-    append_batch(log, test::make_random_batch(model::offset{0}, 3, true));
+    append_batch(
+      log, model::test::make_random_batch(model::offset{0}, 3, true));
     BOOST_CHECK_EQUAL(log.offsets().start_offset, model::offset{10});
     auto read_batches = read_and_validate_all_batches(log);
     BOOST_REQUIRE_EQUAL(read_batches.size(), 1);
     BOOST_CHECK_EQUAL(read_batches[0].base_offset(), model::offset{10});
     BOOST_CHECK_EQUAL(read_batches[0].last_offset(), model::offset{12});
+}
+
+FIXTURE_TEST(test_index_max_timestamp_update, storage_test_fixture) {
+    auto cfg = default_log_config(test_dir);
+    storage::log_manager mgr = make_log_manager(cfg);
+    info("config: {}", mgr.config());
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get0(); });
+    auto ntp = model::ntp("default", "test", 0);
+    auto log
+      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get0();
+    append_batch(
+      log,
+      model::test::make_random_batch(
+        model::offset{0},
+        10,
+        true,
+        model::record_batch_type::raft_data,
+        std::vector<size_t>(10, 1024),
+        model::timestamp(10000)));
+    // The max timestamp for this batch will be 20009
+    // as there are 10 records in it and the base is 20000.
+    append_batch(
+      log,
+      model::test::make_random_batch(
+        model::offset{10},
+        10,
+        true,
+        model::record_batch_type::raft_data,
+        std::vector<size_t>(10, 1024),
+        model::timestamp(20000)));
+    append_batch(
+      log,
+      model::test::make_random_batch(
+        model::offset{20},
+        10,
+        true,
+        model::record_batch_type::raft_data,
+        std::vector<size_t>(10, 1024),
+        model::timestamp(30000)));
+
+    log
+      .truncate(storage::truncate_config(
+        model::offset{20}, ss::default_priority_class()))
+      .get();
+
+    storage::disk_log_impl& impl = *reinterpret_cast<storage::disk_log_impl*>(
+      log.get_impl());
+
+    // The maximum timestamp in the index should be the maximum
+    // timestamp of the batch preceeding the batch where the truncation
+    // occurred. In this case, truncation happened in the last batch,
+    // so we require the max timestmap to be that of the previous second
+    // batch.
+    BOOST_REQUIRE(impl.segment_count() == 1);
+    const auto& seg = impl.segments().front();
+    BOOST_REQUIRE(seg->index().max_timestamp() == model::timestamp{20009});
 }

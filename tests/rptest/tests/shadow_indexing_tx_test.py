@@ -7,23 +7,19 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+from ducktape.mark import matrix
 from rptest.services.cluster import cluster
-from rptest.services.redpanda import SISettings
-from ducktape.utils.util import wait_until
+from rptest.services.redpanda import CloudStorageType, SISettings, get_cloud_storage_type
 from rptest.clients.rpk import RpkTool
 from rptest.clients.types import TopicSpec
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.clients.kafka_cli_tools import KafkaCliTools
+from rptest.utils.mode_checks import skip_debug_mode
 from rptest.util import (
     segments_count,
-    wait_for_segments_removal,
+    wait_for_local_storage_truncate,
 )
-
-import confluent_kafka as ck
-
-import uuid
-import random
-from itertools import zip_longest
+from rptest.services.kgo_verifier_services import KgoVerifierProducer, KgoVerifierSeqConsumer
 
 
 class ShadowIndexingTxTest(RedpandaTest):
@@ -34,13 +30,12 @@ class ShadowIndexingTxTest(RedpandaTest):
 
     def __init__(self, test_context):
         extra_rp_conf = dict(
-            enable_idempotence=True,
-            enable_transactions=True,
             enable_leader_balancer=False,
-            enable_auto_rebalance_on_node_add=False,
+            partition_autobalancing_mode="off",
+            group_initial_rebalance_delay=300,
         )
 
-        si_settings = SISettings(cloud_storage_reconciliation_interval_ms=500,
+        si_settings = SISettings(test_context,
                                  cloud_storage_max_connections=5,
                                  log_segment_size=self.segment_size)
 
@@ -55,118 +50,55 @@ class ShadowIndexingTxTest(RedpandaTest):
             rpk.alter_topic_config(topic.name, 'redpanda.remote.write', 'true')
             rpk.alter_topic_config(topic.name, 'redpanda.remote.read', 'true')
 
-    @cluster(num_nodes=3)
-    def test_shadow_indexing_aborted_txs(self):
+    @cluster(num_nodes=4)
+    @matrix(cloud_storage_type=get_cloud_storage_type())
+    @skip_debug_mode
+    def test_shadow_indexing_aborted_txs(self, cloud_storage_type):
         """Check that messages belonging to aborted transaction are not seen by clients
         when fetching from remote segments."""
-        topic = self.topics[0]
+        msg_size = 16384
+        msg_count = 10000
+        per_transaction = 10
+        producer = KgoVerifierProducer(self.test_context,
+                                       self.redpanda,
+                                       self.topic,
+                                       msg_size=msg_size,
+                                       msg_count=msg_count,
+                                       use_transactions=True,
+                                       transaction_abort_rate=0.1,
+                                       msgs_per_transaction=per_transaction,
+                                       debug_logs=True)
+        producer.start()
+        producer.wait()
+        pstatus = producer.produce_status
+        self.logger.info(f"Produce status: {pstatus}")
+        committed_messages = pstatus.acked - pstatus.aborted_transaction_messages
+        assert pstatus.acked == msg_count
+        assert 0 < committed_messages < msg_count
 
-        class Producer:
-            def __init__(self, brokers, logger):
-                self.keys = []
-                self.cur_offset = 0
-                self.brokers = brokers
-                self.logger = logger
-                self.num_aborted = 0
-                self.reconnect()
-
-            def reconnect(self):
-                self.producer = ck.Producer({
-                    'bootstrap.servers':
-                    self.brokers,
-                    'transactional.id':
-                    'shadow-indexing-tx-test',
-                })
-                self.producer.init_transactions()
-
-            def produce(self, topic):
-                """produce some messages inside a transaction with increasing keys
-                and random values. Then randomly commit/abort the transaction."""
-
-                n_msgs = random.randint(50, 100)
-                keys = []
-
-                self.producer.begin_transaction()
-                for _ in range(n_msgs):
-                    val = ''.join(
-                        map(chr, (random.randint(0, 256)
-                                  for _ in range(random.randint(100, 1000)))))
-                    self.producer.produce(topic.name, val,
-                                          str(self.cur_offset))
-                    keys.append(str(self.cur_offset).encode('utf8'))
-                    self.cur_offset += 1
-
-                self.logger.info(
-                    f"writing {len(keys)} msgs: {keys[0]}-{keys[-1]}...")
-                self.producer.flush()
-                if random.random() < 0.1:
-                    self.producer.abort_transaction()
-                    self.num_aborted += 1
-                    self.logger.info("aborted txn")
-                else:
-                    self.producer.commit_transaction()
-                    self.keys.extend(keys)
-
-        producer = Producer(self.redpanda.brokers(), self.logger)
-
-        def done():
-            for _ in range(100):
-                try:
-                    producer.produce(topic)
-                except ck.KafkaException as err:
-                    self.logger.warn(f"producer error: {err}")
-                    producer.reconnect()
-            self.logger.info("producer iteration complete")
-            topic_partitions = segments_count(self.redpanda,
-                                              topic.name,
-                                              partition_idx=0)
-            partitions = []
-            for p in topic_partitions:
-                partitions.append(p >= 10)
-            return all(partitions)
-
-        wait_until(done,
-                   timeout_sec=120,
-                   backoff_sec=1,
-                   err_msg="producing failed")
-
-        assert producer.num_aborted > 0
+        # Re-use node for consumer later
+        traffic_node = producer.nodes[0]
 
         kafka_tools = KafkaCliTools(self.redpanda)
+        local_retention = 3 * self.segment_size
         kafka_tools.alter_topic_config(
             self.topic,
-            {
-                TopicSpec.PROPERTY_RETENTION_BYTES: 3 * self.segment_size,
-            },
+            {TopicSpec.PROPERTY_RETENTION_LOCAL_TARGET_BYTES: local_retention},
         )
-        wait_for_segments_removal(redpanda=self.redpanda,
-                                  topic=self.topic,
-                                  partition_idx=0,
-                                  count=6)
+        wait_for_local_storage_truncate(self.redpanda,
+                                        self.topic,
+                                        target_bytes=local_retention)
 
-        consumer = ck.Consumer(
-            {
-                'bootstrap.servers': self.redpanda.brokers(),
-                'group.id': 'shadow-indexing-tx-test',
-                'auto.offset.reset': 'earliest',
-            },
-            logger=self.logger)
-        consumer.subscribe([topic.name])
+        consumer = KgoVerifierSeqConsumer(self.test_context,
+                                          self.redpanda,
+                                          self.topic,
+                                          msg_size,
+                                          loop=False,
+                                          nodes=[traffic_node])
+        consumer.start(clean=False)
+        consumer.wait()
+        status = consumer.consumer_status
 
-        consumed = []
-        while True:
-            msgs = consumer.consume(timeout=5.0)
-            if len(msgs) == 0:
-                break
-            consumed.extend([(m.key(), m.offset()) for m in msgs])
-
-        first_mismatch = ''
-        for p_key, (c_key, c_offset) in zip_longest(producer.keys, consumed):
-            if p_key != c_key:
-                first_mismatch = f"produced: {p_key}, consumed: {c_key} (offset: {c_offset})"
-                break
-
-        assert (not first_mismatch), (
-            f"produced and consumed messages differ, "
-            f"produced length: {len(producer.keys)}, consumed length: {len(consumed)}, "
-            f"first mismatch: {first_mismatch}")
+        assert status.validator.valid_reads == committed_messages
+        assert status.validator.invalid_reads == 0
+        assert status.validator.out_of_scope_invalid_reads == 0

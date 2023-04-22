@@ -18,7 +18,6 @@
 #include "kafka/protocol/schemata/describe_configs_request.h"
 #include "kafka/protocol/schemata/describe_configs_response.h"
 #include "kafka/protocol/schemata/incremental_alter_configs_request.h"
-#include "kafka/server/handlers/details/data_policy.h"
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/types.h"
 #include "model/fundamental.h"
@@ -337,24 +336,26 @@ FIXTURE_TEST(
     std::vector<ss::sstring> all_properties = {
       "retention.ms",
       "retention.bytes",
-      "replication_factor",
-      "partition_count",
       "segment.bytes",
       "cleanup.policy",
       "compression.type",
       "message.timestamp.type",
-      "redpanda.datapolicy",
       "redpanda.remote.read",
-      "redpanda.remote.write"};
+      "redpanda.remote.write",
+      "max.message.bytes",
+      "retention.local.target.bytes",
+      "retention.local.target.ms",
+      "redpanda.remote.delete",
+      "segment.ms"};
 
-    // All properies_request
+    // All properties_request
     auto all_describe_resp = describe_configs(test_tp);
     assert_properties_amount(test_tp, all_describe_resp, all_properties.size());
     for (const auto& property : all_properties) {
         assert_property_presented(test_tp, property, all_describe_resp, true);
     }
 
-    // Single properies_request
+    // Single properties_request
     for (const auto& request_property : all_properties) {
         std::vector<ss::sstring> request_properties = {request_property};
         auto single_describe_resp = describe_configs(
@@ -373,17 +374,12 @@ FIXTURE_TEST(
     std::vector<ss::sstring> first_group_config_properties = {
       "retention.ms",
       "retention.bytes",
-      "replication_factor",
-      "partition_count",
       "segment.bytes",
       "redpanda.remote.read",
       "redpanda.remote.write"};
 
     std::vector<ss::sstring> second_group_config_properties = {
-      "cleanup.policy",
-      "compression.type",
-      "message.timestamp.type",
-      "redpanda.datapolicy"};
+      "cleanup.policy", "compression.type", "message.timestamp.type"};
 
     auto first_group_describe_resp = describe_configs(
       test_tp, std::make_optional(first_group_config_properties));
@@ -431,6 +427,7 @@ FIXTURE_TEST(test_alter_single_topic_config, alter_config_test_fixture) {
     properties.emplace("retention.ms", "1234");
     properties.emplace("cleanup.policy", "compact");
     properties.emplace("redpanda.remote.read", "true");
+    properties.emplace("replication.factor", "1");
 
     auto resp = alter_configs(
       {make_alter_topic_config_resource(test_tp, properties)});
@@ -441,7 +438,8 @@ FIXTURE_TEST(test_alter_single_topic_config, alter_config_test_fixture) {
     BOOST_REQUIRE_EQUAL(resp.data.responses[0].resource_name, test_tp);
 
     auto describe_resp = describe_configs(test_tp);
-    assert_property_value(test_tp, "retention.ms", "1234", describe_resp);
+    assert_property_value(
+      test_tp, "retention.ms", fmt::format("{}", 1234ms), describe_resp);
     assert_property_value(test_tp, "cleanup.policy", "compact", describe_resp);
     assert_property_value(
       test_tp, "redpanda.remote.read", "true", describe_resp);
@@ -457,9 +455,11 @@ FIXTURE_TEST(test_alter_multiple_topics_config, alter_config_test_fixture) {
     absl::flat_hash_map<ss::sstring, ss::sstring> properties_1;
     properties_1.emplace("retention.ms", "1234");
     properties_1.emplace("cleanup.policy", "compact");
+    properties_1.emplace("replication.factor", "1");
 
     absl::flat_hash_map<ss::sstring, ss::sstring> properties_2;
     properties_2.emplace("retention.bytes", "4096");
+    properties_2.emplace("replication.factor", "1");
 
     auto resp = alter_configs({
       make_alter_topic_config_resource(topic_1, properties_1),
@@ -475,7 +475,8 @@ FIXTURE_TEST(test_alter_multiple_topics_config, alter_config_test_fixture) {
     BOOST_REQUIRE_EQUAL(resp.data.responses[1].resource_name, topic_2);
 
     auto describe_resp_1 = describe_configs(topic_1);
-    assert_property_value(topic_1, "retention.ms", "1234", describe_resp_1);
+    assert_property_value(
+      topic_1, "retention.ms", fmt::format("{}", 1234ms), describe_resp_1);
     assert_property_value(
       topic_1, "cleanup.policy", "compact", describe_resp_1);
 
@@ -491,6 +492,7 @@ FIXTURE_TEST(
 
     absl::flat_hash_map<ss::sstring, ss::sstring> properties;
     properties.emplace("unclean.leader.election.enable", "true");
+    properties.emplace("replication.factor", "1");
 
     auto resp = alter_configs(
       {make_alter_topic_config_resource(test_tp, properties)});
@@ -526,6 +528,7 @@ FIXTURE_TEST(
      */
     absl::flat_hash_map<ss::sstring, ss::sstring> properties;
     properties.emplace("retention.ms", "1234");
+    properties.emplace("replication.factor", "1");
 
     auto resp = alter_configs(
       {make_alter_topic_config_resource(test_tp, properties)});
@@ -536,13 +539,15 @@ FIXTURE_TEST(
     BOOST_REQUIRE_EQUAL(resp.data.responses[0].resource_name, test_tp);
 
     auto describe_resp = describe_configs(test_tp);
-    assert_property_value(test_tp, "retention.ms", "1234", describe_resp);
+    assert_property_value(
+      test_tp, "retention.ms", fmt::format("{}", 1234ms), describe_resp);
 
     /**
      * Set custom retention.bytes, previous settings should be overriden
      */
     absl::flat_hash_map<ss::sstring, ss::sstring> new_properties;
     new_properties.emplace("retention.bytes", "4096");
+    new_properties.emplace("replication.factor", "1");
 
     alter_configs({make_alter_topic_config_resource(test_tp, new_properties)});
 
@@ -552,8 +557,7 @@ FIXTURE_TEST(
       test_tp,
       "retention.ms",
       fmt::format(
-        "{}",
-        config::shard_local_cfg().delete_retention_ms().value_or(-1ms).count()),
+        "{}", config::shard_local_cfg().delete_retention_ms().value_or(-1ms)),
       new_describe_resp);
     assert_property_value(
       test_tp, "retention.bytes", "4096", new_describe_resp);
@@ -581,7 +585,8 @@ FIXTURE_TEST(test_incremental_alter_config, alter_config_test_fixture) {
     BOOST_REQUIRE_EQUAL(resp.data.responses[0].resource_name, test_tp);
 
     auto describe_resp = describe_configs(test_tp);
-    assert_property_value(test_tp, "retention.ms", "1234", describe_resp);
+    assert_property_value(
+      test_tp, "retention.ms", fmt::format("{}", 1234ms), describe_resp);
 
     /**
      * Set custom retention.bytes, only this property should be updated
@@ -600,7 +605,7 @@ FIXTURE_TEST(test_incremental_alter_config, alter_config_test_fixture) {
     auto new_describe_resp = describe_configs(test_tp);
     // retention.ms should stay untouched
     assert_property_value(
-      test_tp, "retention.ms", fmt::format("1234"), new_describe_resp);
+      test_tp, "retention.ms", fmt::format("{}", 1234ms), new_describe_resp);
     assert_property_value(
       test_tp, "retention.bytes", "4096", new_describe_resp);
 }
@@ -649,7 +654,8 @@ FIXTURE_TEST(test_incremental_alter_config_remove, alter_config_test_fixture) {
     BOOST_REQUIRE_EQUAL(resp.data.responses[0].resource_name, test_tp);
 
     auto describe_resp = describe_configs(test_tp);
-    assert_property_value(test_tp, "retention.ms", "1234", describe_resp);
+    assert_property_value(
+      test_tp, "retention.ms", fmt::format("{}", 1234ms), describe_resp);
 
     /**
      * Remove retention.bytes
@@ -671,197 +677,6 @@ FIXTURE_TEST(test_incremental_alter_config_remove, alter_config_test_fixture) {
       test_tp,
       "retention.ms",
       fmt::format(
-        "{}",
-        config::shard_local_cfg().delete_retention_ms().value_or(-1ms).count()),
+        "{}", config::shard_local_cfg().delete_retention_ms().value_or(-1ms)),
       new_describe_resp);
-}
-
-FIXTURE_TEST(test_single_data_policy_alter_config, alter_config_test_fixture) {
-    wait_for_controller_leadership().get();
-    model::topic test_tp{"topic-1"};
-    create_topic(test_tp, 3);
-
-    v8_engine::data_policy dp1("1", "2");
-
-    absl::flat_hash_map<ss::sstring, ss::sstring> properties1;
-    properties1.emplace(
-      "redpanda.datapolicy.function.name", dp1.function_name());
-
-    auto resp = alter_configs(
-      {make_alter_topic_config_resource(test_tp, properties1)});
-
-    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
-    BOOST_REQUIRE_EQUAL(
-      resp.data.responses[0].error_code, kafka::error_code::invalid_config);
-
-    absl::flat_hash_map<ss::sstring, ss::sstring> properties2;
-    properties2.emplace("redpanda.datapolicy.script.name", dp1.script_name());
-
-    resp = alter_configs(
-      {make_alter_topic_config_resource(test_tp, properties2)});
-
-    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
-    BOOST_REQUIRE_EQUAL(
-      resp.data.responses[0].error_code, kafka::error_code::invalid_config);
-
-    absl::flat_hash_map<ss::sstring, ss::sstring> properties3;
-    properties3.emplace(
-      "redpanda.datapolicy.function.name", dp1.function_name());
-    properties3.emplace("redpanda.datapolicy.script.name", dp1.script_name());
-
-    resp = alter_configs(
-      {make_alter_topic_config_resource(test_tp, properties3)});
-
-    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
-    BOOST_REQUIRE_EQUAL(
-      resp.data.responses[0].error_code, kafka::error_code::invalid_config);
-}
-
-FIXTURE_TEST(
-  test_alter_config_does_not_rewrite_data_policy, alter_config_test_fixture) {
-    wait_for_controller_leadership().get();
-    model::topic test_tp{"topic-1"};
-    create_topic(test_tp, 3);
-
-    v8_engine::data_policy dp1("1", "1");
-
-    absl::flat_hash_map<
-      ss::sstring,
-      std::pair<std::optional<ss::sstring>, kafka::config_resource_operation>>
-      incremental_alter_config_properties;
-
-    incremental_alter_config_properties.insert_or_assign(
-      "redpanda.datapolicy.function.name",
-      std::make_pair(
-        dp1.function_name(), kafka::config_resource_operation::set));
-    incremental_alter_config_properties.insert_or_assign(
-      "redpanda.datapolicy.script.name",
-      std::make_pair(dp1.script_name(), kafka::config_resource_operation::set));
-
-    auto resp = incremental_alter_configs(
-      {make_incremental_alter_topic_config_resource(
-        test_tp, incremental_alter_config_properties)});
-
-    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
-    BOOST_REQUIRE_EQUAL(
-      resp.data.responses[0].error_code, kafka::error_code::none);
-    BOOST_REQUIRE_EQUAL(resp.data.responses[0].resource_name, test_tp);
-
-    auto describe_resp = describe_configs(test_tp);
-    std::ostringstream stream1;
-    stream1 << dp1;
-    assert_property_value(
-      test_tp, "redpanda.datapolicy", stream1.str(), describe_resp);
-
-    absl::flat_hash_map<ss::sstring, ss::sstring> alter_config_properties;
-    alter_config_properties.emplace("retention.ms", "1234");
-
-    auto resp_alter = alter_configs(
-      {make_alter_topic_config_resource(test_tp, alter_config_properties)});
-
-    BOOST_REQUIRE_EQUAL(resp_alter.data.responses.size(), 1);
-    BOOST_REQUIRE_EQUAL(
-      resp_alter.data.responses[0].error_code, kafka::error_code::none);
-    BOOST_REQUIRE_EQUAL(resp_alter.data.responses[0].resource_name, test_tp);
-
-    auto alter_config_describe_resp = describe_configs(test_tp);
-    assert_property_value(
-      test_tp, "retention.ms", "1234", alter_config_describe_resp);
-
-    std::ostringstream stream2;
-    stream2 << dp1;
-    assert_property_value(
-      test_tp,
-      "redpanda.datapolicy",
-      stream2.str(),
-      alter_config_describe_resp);
-}
-
-FIXTURE_TEST(
-  test_data_policy_incremental_alter_config, alter_config_test_fixture) {
-    wait_for_controller_leadership().get();
-    model::topic test_tp{"topic-1"};
-    create_topic(test_tp, 3);
-
-    v8_engine::data_policy dp1("1", "1");
-
-    // set data-policy
-    absl::flat_hash_map<
-      ss::sstring,
-      std::pair<std::optional<ss::sstring>, kafka::config_resource_operation>>
-      properties;
-
-    properties.emplace(
-      "redpanda.datapolicy.function.name",
-      std::make_pair(
-        dp1.function_name(), kafka::config_resource_operation::set));
-    properties.emplace(
-      "redpanda.datapolicy.script.name",
-      std::make_pair(
-        dp1.script_name(), kafka::config_resource_operation::remove));
-
-    auto resp = incremental_alter_configs(
-      {make_incremental_alter_topic_config_resource(test_tp, properties)});
-
-    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
-    BOOST_REQUIRE_EQUAL(
-      resp.data.responses[0].error_code, kafka::error_code::invalid_config);
-
-    properties.insert_or_assign(
-      "redpanda.datapolicy.function.name",
-      std::make_pair(
-        dp1.function_name(), kafka::config_resource_operation::set));
-    properties.insert_or_assign(
-      "redpanda.datapolicy.script.name",
-      std::make_pair(dp1.script_name(), kafka::config_resource_operation::set));
-
-    resp = incremental_alter_configs(
-      {make_incremental_alter_topic_config_resource(test_tp, properties)});
-
-    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
-    BOOST_REQUIRE_EQUAL(
-      resp.data.responses[0].error_code, kafka::error_code::none);
-    BOOST_REQUIRE_EQUAL(resp.data.responses[0].resource_name, test_tp);
-
-    auto describe_resp = describe_configs(test_tp);
-    std::ostringstream stream;
-    stream << dp1;
-    assert_property_value(
-      test_tp, "redpanda.datapolicy", stream.str(), describe_resp);
-
-    // remove data-policy
-    properties.insert_or_assign(
-      "redpanda.datapolicy.function.name",
-      std::make_pair(std::nullopt, kafka::config_resource_operation::remove));
-    properties.insert_or_assign(
-      "redpanda.datapolicy.script.name",
-      std::make_pair(std::nullopt, kafka::config_resource_operation::remove));
-
-    incremental_alter_configs(
-      {make_incremental_alter_topic_config_resource(test_tp, properties)});
-
-    // create new data-policy
-    v8_engine::data_policy dp2("2", "2");
-    properties.insert_or_assign(
-      "redpanda.datapolicy.function.name",
-      std::make_pair(
-        dp2.function_name(), kafka::config_resource_operation::set));
-    properties.insert_or_assign(
-      "redpanda.datapolicy.script.name",
-      std::make_pair(dp2.script_name(), kafka::config_resource_operation::set));
-
-    resp = incremental_alter_configs(
-      {make_incremental_alter_topic_config_resource(test_tp, properties)});
-
-    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
-    BOOST_REQUIRE_EQUAL(
-      resp.data.responses[0].error_code, kafka::error_code::none);
-    BOOST_REQUIRE_EQUAL(resp.data.responses[0].resource_name, test_tp);
-
-    describe_resp = describe_configs(test_tp);
-
-    std::ostringstream stream2;
-    stream2 << dp2;
-    assert_property_value(
-      test_tp, "redpanda.datapolicy", stream2.str(), describe_resp);
 }

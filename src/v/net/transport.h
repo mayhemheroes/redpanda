@@ -28,6 +28,13 @@
 namespace net {
 
 /*
+ * Wrapper around a network socket that encapsulates setting up an initial
+ * connection with some credentials.
+ *
+ * This class only provides an interface with which to establish a connection
+ * with the socket. As such, superclasses must provide interfaces with which to
+ * send and receive bytes using the socket.
+ *
  * TODO:
  *  - client_probe needs to be split apart from simple_protocol
  *  - allow subclasses to provide logger
@@ -38,6 +45,8 @@ public:
         unresolved_address server_addr;
         ss::shared_ptr<ss::tls::certificate_credentials> credentials;
         net::metrics_disabled disable_metrics = net::metrics_disabled::no;
+        net::public_metrics_disabled disable_public_metrics
+          = net::public_metrics_disabled::no;
         /// Optional server name indication (SNI) for TLS connection
         std::optional<ss::sstring> tls_sni_hostname;
     };
@@ -54,12 +63,18 @@ public:
 
     // override this method to reset internal state when connection attempt is
     // being made
-    virtual void reset_state() {}
+    virtual void reset_state() {
+        _fd.reset();
+        _shutdown = false;
+    }
 
     ss::future<> stop();
     void shutdown() noexcept;
+    ss::future<> wait_input_shutdown();
 
-    [[gnu::always_inline]] bool is_valid() const { return _fd && !_in.eof(); }
+    [[gnu::always_inline]] bool is_valid() const {
+        return _fd && !_shutdown && !_in.eof();
+    }
 
     const unresolved_address& server_address() const { return _server_addr; }
 
@@ -78,6 +93,9 @@ private:
     unresolved_address _server_addr;
     ss::shared_ptr<ss::tls::certificate_credentials> _creds;
     std::optional<ss::sstring> _tls_sni_hostname;
+
+    // Track if shutdown was called on the current `_fd`
+    bool _shutdown{false};
 };
 
 } // namespace net

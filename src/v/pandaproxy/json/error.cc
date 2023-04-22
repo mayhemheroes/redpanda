@@ -11,8 +11,6 @@
 
 #include "error.h"
 
-#include "pandaproxy/error.h"
-
 namespace pandaproxy::json {
 
 namespace {
@@ -23,16 +21,10 @@ struct error_category final : std::error_category {
         switch (static_cast<error_code>(ev)) {
         case error_code::invalid_json:
             return "invalid json";
+        case error_code::unable_to_serialize:
+            return "unable to serialize";
         }
         return "(unrecognized error)";
-    }
-    std::error_condition
-    default_error_condition(int ec) const noexcept override {
-        switch (static_cast<error_code>(ec)) {
-        case error_code::invalid_json:
-            return reply_error_code::unprocessable_entity;
-        }
-        return {};
     }
 };
 

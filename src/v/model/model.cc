@@ -202,13 +202,12 @@ std::ostream& operator<<(std::ostream& o, const model::broker& b) {
     fmt::print(
       o,
       "{{id: {}, kafka_advertised_listeners: {}, rpc_address: {}, rack: {}, "
-      "properties: {}, membership_state: {}}}",
+      "properties: {}}}",
       b.id(),
       b.kafka_advertised_listeners(),
       b.rpc_address(),
       b.rack(),
-      b.properties(),
-      b.get_membership_state());
+      b.properties());
     return o;
 }
 
@@ -352,6 +351,10 @@ std::ostream& operator<<(std::ostream& o, record_batch_type bt) {
         return o << "batch_type::cluster_config_cmd";
     case record_batch_type::feature_update:
         return o << "batch_type::feature_update";
+    case record_batch_type::cluster_bootstrap_cmd:
+        return o << "batch_type::cluster_bootstrap_cmd";
+    case record_batch_type::version_fence:
+        return o << "batch_type::version_fence";
     }
 
     return o << "batch_type::unknown{" << static_cast<int>(bt) << "}";
@@ -367,6 +370,30 @@ std::ostream& operator<<(std::ostream& o, membership_state st) {
         return o << "removed";
     }
     return o << "unknown membership state {" << static_cast<int>(st) << "}";
+}
+
+std::ostream& operator<<(std::ostream& o, maintenance_state st) {
+    switch (st) {
+    case maintenance_state::active:
+        return o << "active";
+    case maintenance_state::inactive:
+        return o << "inactive";
+    }
+
+    __builtin_unreachable();
+}
+
+std::ostream& operator<<(std::ostream& os, const cloud_credentials_source& cs) {
+    switch (cs) {
+    case cloud_credentials_source::config_file:
+        return os << "config_file";
+    case cloud_credentials_source::aws_instance_metadata:
+        return os << "aws_instance_metadata";
+    case cloud_credentials_source::sts:
+        return os << "sts";
+    case cloud_credentials_source::gcp_instance_metadata:
+        return os << "gcp_instance_metadata";
+    }
 }
 
 std::ostream& operator<<(std::ostream& o, const shadow_indexing_mode& si) {
@@ -394,6 +421,26 @@ std::ostream& operator<<(std::ostream& o, const shadow_indexing_mode& si) {
         break;
     }
     return o;
+}
+
+std::ostream& operator<<(std::ostream& o, leader_balancer_mode lbt) {
+    o << leader_balancer_mode_to_string(lbt);
+    return o;
+}
+
+std::istream& operator>>(std::istream& i, leader_balancer_mode& lbt) {
+    ss::sstring s;
+    i >> s;
+    lbt = string_switch<leader_balancer_mode>(s)
+            .match(
+              leader_balancer_mode_to_string(
+                leader_balancer_mode::random_hill_climbing),
+              leader_balancer_mode::random_hill_climbing)
+            .match(
+              leader_balancer_mode_to_string(
+                leader_balancer_mode::greedy_balanced_shards),
+              leader_balancer_mode::greedy_balanced_shards);
+    return i;
 }
 
 } // namespace model

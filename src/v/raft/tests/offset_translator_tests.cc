@@ -26,10 +26,17 @@
 using namespace std::chrono_literals; // NOLINT
 
 static model::record_batch create_batch(
-  model::record_batch_type type, model::offset o, size_t length = 1) {
+  model::record_batch_type type,
+  model::offset o,
+  size_t length = 1,
+  size_t data_size = 0) {
     storage::record_batch_builder b(type, o);
     for (size_t i = 0; i < length; ++i) {
-        b.add_raw_kv(iobuf{}, iobuf{});
+        iobuf value;
+        if (data_size > 0) {
+            value = random_generators::make_iobuf(data_size);
+        }
+        b.add_raw_kv(iobuf{}, std::move(value));
     }
     return std::move(b).build();
 }
@@ -38,10 +45,16 @@ struct base_fixture {
     base_fixture()
       : _test_dir(
         fmt::format("test_{}", random_generators::gen_alphanum_string(6))) {
+        _feature_table.start().get();
+        _feature_table
+          .invoke_on_all(
+            [](features::feature_table& f) { f.testing_activate_all(); })
+          .get();
         _api
           .start(
             [this]() { return make_kv_cfg(); },
-            [this]() { return make_log_cfg(); })
+            [this]() { return make_log_cfg(); },
+            std::ref(_feature_table))
           .get();
         _api.invoke_on_all(&storage::api::start).get();
     }
@@ -56,10 +69,7 @@ struct base_fixture {
 
     storage::log_config make_log_cfg() const {
         return storage::log_config(
-          storage::log_config::storage_type::disk,
-          _test_dir,
-          100_MiB,
-          storage::debug_sanitize_files::yes);
+          _test_dir, 100_MiB, storage::debug_sanitize_files::yes);
     }
 
     raft::offset_translator make_offset_translator() {
@@ -74,9 +84,13 @@ struct base_fixture {
     model::ntp test_ntp = model::ntp(
       model::ns("test"), model::topic("tp"), model::partition_id(0));
     ss::sstring _test_dir;
+    ss::sharded<features::feature_table> _feature_table;
     ss::sharded<storage::api> _api;
 
-    ~base_fixture() { _api.stop().get(); }
+    ~base_fixture() {
+        _api.stop().get();
+        _feature_table.stop().get();
+    }
 };
 
 void validate_translation(
@@ -274,14 +288,6 @@ FIXTURE_TEST(immutability_test, offset_translator_fixture) {
     validate_offsets_immutable(truncate_at + 1);
 }
 
-static model::offset next_offset(model::offset o) {
-    if (o() < 0) {
-        return model::offset{0};
-    } else {
-        return o + model::offset{1};
-    }
-}
-
 static ss::future<std::vector<model::offset>>
 collect_base_offsets(storage::log log) {
     struct consumer {
@@ -304,11 +310,10 @@ collect_base_offsets(storage::log log) {
 
 struct fuzz_checker {
     fuzz_checker(
-      model::ntp ntp,
+      storage::log log,
       std::function<raft::offset_translator()>&& make_offset_translator)
       : _make_offset_translator(std::move(make_offset_translator))
-      , _log(storage::make_memory_backed_log(
-          storage::ntp_config(ntp, "test.dir"))) {}
+      , _log(std::move(log)) {}
 
     ss::future<> start() {
         _tr.emplace(_make_offset_translator());
@@ -327,10 +332,7 @@ struct fuzz_checker {
 
             size_t batch_length = random_generators::get_int(1, 3);
             auto batch = create_batch(
-              batch_type, model::offset{0}, batch_length);
-            // fake batch size so that offset_translator does checkpoints more
-            // often.
-            batch.header().size_bytes = 10_MiB;
+              batch_type, model::offset{0}, batch_length, 512_KiB);
             batches.push_back(std::move(batch));
         }
 
@@ -377,7 +379,7 @@ struct fuzz_checker {
 
         if (_tr) {
             (void)ss::with_gate(
-              _gate, [this] { return _tr->maybe_checkpoint(); });
+              _gate, [this] { return _tr->maybe_checkpoint(2_MiB); });
         }
     }
 
@@ -488,7 +490,7 @@ struct fuzz_checker {
             BOOST_REQUIRE_EQUAL(hwm_lo, _tr->state()->to_log_offset(hwm_ko));
         }
 
-        int64_t start_log_offset = next_offset(_snapshot_offset)();
+        int64_t start_log_offset = model::next_offset(_snapshot_offset)();
         if (start_log_offset >= _kafka_offsets.size()) {
             // empty log
             return;
@@ -550,8 +552,13 @@ FIXTURE_TEST(fuzz_operations_test, base_fixture) {
     };
 
     for (size_t i_run = 0; i_run < number_of_runs; ++i_run) {
-        fuzz_checker checker(
-          test_ntp, [this] { return make_offset_translator(); });
+        auto ntp = test_ntp;
+        ntp.tp.topic = model::topic(fmt::format("{}_{}", ntp.tp.topic, i_run));
+        auto log = _api.local()
+                     .log_mgr()
+                     .manage(storage::ntp_config(ntp, _test_dir))
+                     .get();
+        fuzz_checker checker(log, [this] { return make_offset_translator(); });
         checker.start().get();
 
         for (size_t i_op = 0; i_op < number_of_ops; ++i_op) {
@@ -646,16 +653,26 @@ FIXTURE_TEST(test_moving_persistent_state, base_fixture) {
             raft::group_id(0),
             ntp,
             api.local()};
-          co_await remote_ot.start(
-            raft::offset_translator::must_reset::no,
-            raft::offset_translator::bootstrap_state{});
-
-          validate_translation(remote_ot, model::offset(0), model::offset(0));
-          validate_translation(remote_ot, model::offset(1), model::offset(1));
-          validate_translation(remote_ot, model::offset(7), model::offset(2));
-          validate_translation(remote_ot, model::offset(9), model::offset(3));
-          validate_translation(remote_ot, model::offset(10), model::offset(4));
-          validate_translation(remote_ot, model::offset(11), model::offset(5));
+          return ss::do_with(std::move(remote_ot), [](auto& remote_ot) {
+              return remote_ot
+                .start(
+                  raft::offset_translator::must_reset::no,
+                  raft::offset_translator::bootstrap_state{})
+                .then([&remote_ot] {
+                    validate_translation(
+                      remote_ot, model::offset(0), model::offset(0));
+                    validate_translation(
+                      remote_ot, model::offset(1), model::offset(1));
+                    validate_translation(
+                      remote_ot, model::offset(7), model::offset(2));
+                    validate_translation(
+                      remote_ot, model::offset(9), model::offset(3));
+                    validate_translation(
+                      remote_ot, model::offset(10), model::offset(4));
+                    validate_translation(
+                      remote_ot, model::offset(11), model::offset(5));
+                });
+          });
       })
       .get();
 

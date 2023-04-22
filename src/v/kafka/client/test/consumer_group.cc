@@ -26,12 +26,11 @@
 #include "kafka/protocol/list_offsets.h"
 #include "kafka/protocol/metadata.h"
 #include "kafka/protocol/offset_fetch.h"
-#include "kafka/protocol/request_reader.h"
-#include "kafka/protocol/response_writer.h"
 #include "kafka/protocol/schemata/join_group_request.h"
 #include "kafka/protocol/schemata/join_group_response.h"
 #include "kafka/protocol/schemata/offset_fetch_response.h"
 #include "kafka/protocol/sync_group.h"
+#include "kafka/protocol/wire.h"
 #include "kafka/server/group.h"
 #include "kafka/types.h"
 #include "model/fundamental.h"
@@ -149,19 +148,16 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
 
     info("Waiting for group coordinator");
     kafka::describe_groups_response desc_res{};
-    tests::cooperative_spin_wait_with_timeout(
-      10s,
-      [this, &group_id, &client, &desc_res] {
-          return client.dispatch(describe_group_request_builder())
-            .then([&desc_res](kafka::describe_groups_response res) {
-                desc_res = std::move(res);
-                info("Describe group res: {}", desc_res);
-                return desc_res.data.groups.size() == 1
-                       && desc_res.data.groups[0].error_code
-                            != kafka::error_code::not_coordinator;
-            });
-      })
-      .get();
+    tests::cooperative_spin_wait_with_timeout(10s, [&client, &desc_res] {
+        return client.dispatch(describe_group_request_builder())
+          .then([&desc_res](kafka::describe_groups_response res) {
+              desc_res = std::move(res);
+              info("Describe group res: {}", desc_res);
+              return desc_res.data.groups.size() == 1
+                     && desc_res.data.groups[0].error_code
+                          != kafka::error_code::not_coordinator;
+          });
+    }).get();
 
     auto check_group_response = [](
                                   const kafka::describe_groups_response& res,

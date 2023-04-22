@@ -7,6 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+//go:build !windows
+
 package filesystem
 
 import (
@@ -19,15 +21,15 @@ import (
 
 func DirectoryIsWriteable(fs afero.Fs, path string) (bool, error) {
 	if exists, _ := afero.Exists(fs, path); !exists {
-		err := fs.MkdirAll(path, 0755)
+		err := fs.MkdirAll(path, 0o755)
 		if err != nil {
-			return false, nil
+			return false, err
 		}
 	}
 	testFile := filepath.Join(path, "test_file")
-	err := afero.WriteFile(fs, testFile, []byte{0}, 0644)
+	err := afero.WriteFile(fs, testFile, []byte{0}, 0o644)
 	if err != nil {
-		return false, nil
+		return false, err
 	}
 	err = fs.Remove(testFile)
 	if err != nil {

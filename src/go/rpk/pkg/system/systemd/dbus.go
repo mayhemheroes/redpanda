@@ -10,9 +10,10 @@
 package systemd
 
 import (
+	"context"
+
 	"github.com/coreos/go-systemd/v22/dbus"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/utils"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
 )
 
@@ -21,7 +22,7 @@ type dbusClient struct {
 }
 
 func NewDbusClient() (Client, error) {
-	conn, err := dbus.New()
+	conn, err := dbus.NewWithContext(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -34,24 +35,20 @@ func (c *dbusClient) Shutdown() error {
 }
 
 func (c *dbusClient) StartUnit(name string) error {
-	_, err := c.conn.StartUnit(name, "replace", nil)
-	if err != nil {
-
-		logrus.Error("ERROR Starting unit ", err)
-	}
+	_, err := c.conn.StartUnitContext(context.Background(), name, "replace", nil)
 	return err
 }
 
 func (c *dbusClient) UnitState(name string) (LoadState, ActiveState, error) {
-	loadState, err := c.conn.GetUnitProperty(name, "LoadState")
+	loadState, err := c.conn.GetUnitPropertyContext(context.Background(), name, "LoadState")
 	if err != nil {
-		return LoadStateUnknown, ActiveStateUnknown, nil
+		return LoadStateUnknown, ActiveStateUnknown, err
 	}
-	activeState, err := c.conn.GetUnitProperty(name, "ActiveState")
+	activeState, err := c.conn.GetUnitPropertyContext(context.Background(), name, "ActiveState")
 	if err != nil {
 		return toLoadState(loadState.Value.String()),
 			ActiveStateUnknown,
-			nil
+			err
 	}
 
 	return toLoadState(loadState.Value.String()),
@@ -64,5 +61,5 @@ func (c *dbusClient) LoadUnit(fs afero.Fs, body, name string) error {
 	if err != nil {
 		return err
 	}
-	return c.conn.Reload()
+	return c.conn.ReloadContext(context.Background())
 }

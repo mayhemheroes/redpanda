@@ -11,6 +11,8 @@
 
 #include "bytes/details/io_iterator_consumer.h"
 #include "bytes/iobuf.h"
+#include "bytes/scattered_message.h"
+#include "config/base_property.h"
 #include "http/logger.h"
 #include "ssx/sformat.h"
 #include "vlog.h"
@@ -22,7 +24,6 @@
 #include <seastar/core/iostream.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/timed_out_error.hh>
@@ -32,12 +33,20 @@
 #include <boost/beast/core/buffer_traits.hpp>
 #include <boost/beast/core/error.hpp>
 #include <boost/beast/core/impl/error.hpp>
-#include <boost/system/detail/error_code.hpp>
 
 #include <chrono>
 #include <exception>
 #include <limits>
 #include <stdexcept>
+
+namespace {
+using field_type = std::variant<boost::beast::http::field, std::string>;
+
+const std::unordered_set<field_type> redacted_fields{
+  boost::beast::http::field::authorization,
+  "x-amz-content-sha256",
+  "x-amz-security-token"};
+} // namespace
 
 namespace http {
 
@@ -77,10 +86,12 @@ ss::future<client::request_response_t> client::make_request(
     auto verb = header.method();
     auto target = header.target();
     ss::sstring target_str(target.data(), target.size());
-    auto req = ss::make_shared<request_stream>(this, std::move(header));
-    auto res = ss::make_shared<response_stream>(this, verb, target_str);
     prefix_logger ctxlog(http_log, ssx::sformat("[{}]", target_str));
     vlog(ctxlog.trace, "client.make_request {}", header);
+
+    auto req = ss::make_shared<request_stream>(this, std::move(header));
+    auto res = ss::make_shared<response_stream>(this, verb, target_str);
+
     auto now = ss::lowres_clock::now();
     auto age = _last_response == ss::lowres_clock::time_point::min()
                  ? ss::lowres_clock::duration::max()
@@ -185,6 +196,7 @@ ss::future<ss::temporary_buffer<char>> client::receive() {
 ss::future<> client::send(ss::scattered_message<char> msg) {
     _probe->add_outbound_bytes(msg.size());
     return _out.write(std::move(msg))
+      .discard_result()
       .handle_exception([this](std::exception_ptr e) {
           _probe->register_transport_error();
           return ss::make_exception_future<>(e);
@@ -208,7 +220,7 @@ static client_probe::verb convert_to_pverb(client::response_stream::verb v) {
 client::response_stream::response_stream(
   client* client, client::response_stream::verb v, ss::sstring target)
   : _client(client)
-  , _ctxlog(http_log, ssx::sformat("{{}}", std::move(target)))
+  , _ctxlog(http_log, ssx::sformat("{}", std::move(target)))
   , _parser()
   , _buffer()
   , _sprobe(client->_probe->create_request_subprobe(convert_to_pverb(v))) {
@@ -270,7 +282,11 @@ ss::future<> client::response_stream::prefetch_headers() {
 }
 
 ss::future<iobuf> client::response_stream::recv_some() {
-    _client->check();
+    try {
+        _client->check();
+    } catch (...) {
+        return ss::current_exception_as_future<iobuf>();
+    }
     if (!_prefetch.empty()) {
         // This code will only be executed if 'prefetch_headers' was called. It
         // can only be called once.
@@ -350,8 +366,23 @@ ss::future<iobuf> client::response_stream::recv_some() {
           return _client->stop().then(
             [err] { return ss::make_exception_future<iobuf>(err); });
       })
+      .handle_exception_type([this](const boost::system::system_error& ec) {
+          vlog(_ctxlog.warn, "receive error {}", ec);
+          try {
+              _client->check();
+          } catch (...) {
+              return ss::make_exception_future<iobuf>(std::current_exception());
+          }
+          _client->shutdown();
+          return ss::make_exception_future<iobuf>(ec);
+      })
       .handle_exception_type([this](const std::system_error& ec) {
           vlog(_ctxlog.warn, "receive error {}", ec);
+          try {
+              _client->check();
+          } catch (...) {
+              return ss::make_exception_future<iobuf>(std::current_exception());
+          }
           _client->shutdown();
           return ss::make_exception_future<iobuf>(ec);
       });
@@ -396,7 +427,11 @@ client::request_stream::send_some(ss::temporary_buffer<char>&& buf) {
 }
 
 ss::future<> client::request_stream::send_some(iobuf&& seq) {
-    _client->check();
+    try {
+        _client->check();
+    } catch (...) {
+        return ss::current_exception_as_future();
+    }
     vlog(_ctxlog.trace, "request_stream.send_some {}", seq.size_bytes());
     if (_serializer.is_header_done()) {
         // Fast path
@@ -554,7 +589,7 @@ ss::future<client::response_stream_ref> client::request(
               fsend = ss::do_with(
                 request->as_output_stream(),
                 [&input](ss::output_stream<char>& output) {
-                    return ss::copy(input, output).then([&output] {
+                    return ss::copy(input, output).finally([&output] {
                         return output.close();
                     });
                 });
@@ -588,6 +623,21 @@ ss::input_stream<char> client::response_stream::as_input_stream() {
     auto ds = ss::data_source(
       std::make_unique<response_data_source>(shared_from_this()));
     return ss::input_stream<char>(std::move(ds));
+}
+
+client::request_header redacted_header(client::request_header original) {
+    auto h{std::move(original)};
+    for (const auto& field : redacted_fields) {
+        std::visit(
+          [&h](const auto& f) {
+              if (h.find(f) != h.end()) {
+                  h.set(f, std::string{config::secret_placeholder});
+              }
+          },
+          field);
+    }
+
+    return h;
 }
 
 } // namespace http

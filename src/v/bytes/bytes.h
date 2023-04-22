@@ -22,12 +22,12 @@
 #include <iosfwd>
 
 // cannot be a `std::byte` because that's not sizeof(char)
+constexpr size_t bytes_inline_size = 31;
 using bytes = ss::basic_sstring<
   uint8_t,  // Must be different from char to not leak to std::string_view
   uint32_t, // size type - 4 bytes - 4GB max - don't use a size_t or any 64-bit
-  31, // NOLINT(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
-      // short string optimization size
-  false // not null terminated
+  bytes_inline_size, // short string optimization size
+  false              // not null terminated
   >;
 
 using bytes_view = std::basic_string_view<uint8_t>;
@@ -47,12 +47,10 @@ struct bytes_type_hash {
     size_t operator()(const bytes_view&) const;
 };
 
-// clang-format off
 template<typename R, R (*HashFunction)(bytes::const_pointer, size_t)>
-CONCEPT(requires requires(bytes::const_pointer data, size_t len) {
+requires requires(bytes::const_pointer data, size_t len) {
     { HashFunction(data, len) } -> std::same_as<R>;
-})
-// clang-format on
+}
 struct bytes_hasher {
     using is_transparent = std::true_type;
 

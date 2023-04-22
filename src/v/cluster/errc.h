@@ -35,6 +35,7 @@ enum class errc : int16_t {
     not_leader,
     partition_already_exists,
     waiting_for_recovery,
+    waiting_for_reconfiguration_finish,
     update_in_progress,
     user_exists,
     user_does_not_exist,
@@ -55,10 +56,17 @@ enum class errc : int16_t {
     data_policy_not_exists,
     source_topic_not_exists,
     source_topic_still_in_use,
-    wating_for_partition_shutdown,
+    waiting_for_partition_shutdown,
     error_collecting_health_report,
     leadership_changed,
     feature_disabled,
+    invalid_request,
+    no_update_in_progress,
+    unknown_update_interruption_error,
+    throttling_quota_exceeded,
+    cluster_already_exists,
+    no_partition_assignments,
+    failed_to_create_partition,
 };
 struct errc_category final : public std::error_category {
     const char* name() const noexcept final { return "cluster::errc"; }
@@ -83,8 +91,7 @@ struct errc_category final : public std::error_category {
         case errc::topic_already_exists:
             return "The topic has already been created";
         case errc::replication_error:
-            return "Controller was unable to replicate given state across "
-                   "cluster nodes";
+            return "Unable to replicate given state across cluster nodes";
         case errc::shutting_down:
             return "Application is shutting down";
         case errc::no_leader_controller:
@@ -111,6 +118,8 @@ struct errc_category final : public std::error_category {
             return "Requested partition already exists";
         case errc::waiting_for_recovery:
             return "Waiting for partition to recover";
+        case errc::waiting_for_reconfiguration_finish:
+            return "Waiting for partition recovery to be finished";
         case errc::update_in_progress:
             return "Partition configuration update in progress";
         case errc::user_exists:
@@ -156,7 +165,7 @@ struct errc_category final : public std::error_category {
         case errc::source_topic_still_in_use:
             return "Cannot delete source topic for which there still are "
                    "materialized topics for";
-        case errc::wating_for_partition_shutdown:
+        case errc::waiting_for_partition_shutdown:
             return "Partition update on current core can not be finished since "
                    "backend is waiting for the partition to be shutdown on its "
                    "originating core";
@@ -167,6 +176,21 @@ struct errc_category final : public std::error_category {
                    "to finish";
         case errc::feature_disabled:
             return "Requested feature is disabled";
+        case errc::invalid_request:
+            return "Invalid request";
+        case errc::no_update_in_progress:
+            return "Partition configuration is not being updated";
+        case errc::unknown_update_interruption_error:
+            return "Error while cancelling partition reconfiguration";
+        case errc::throttling_quota_exceeded:
+            return "Request declined due to exceeded requests quotas";
+        case errc::cluster_already_exists:
+            return "Node is a part of a cluster already, new cluster is not "
+                   "created";
+        case errc::no_partition_assignments:
+            return "No replica assignments for the requested partition";
+        case errc::failed_to_create_partition:
+            return "Failed to create partition replica instance";
         }
         return "cluster::errc::unknown";
     }

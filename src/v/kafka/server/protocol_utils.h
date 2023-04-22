@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "kafka/protocol/types.h"
 #include "kafka/server/request_context.h"
 #include "kafka/server/response.h"
 #include "kafka/types.h"
@@ -25,9 +26,6 @@ namespace kafka {
 
 // TODO: move to iobuf_parser
 ss::future<std::optional<request_header>> parse_header(ss::input_stream<char>&);
-
-size_t parse_size_buffer(ss::temporary_buffer<char>);
-ss::future<std::optional<size_t>> parse_size(ss::input_stream<char>&);
 
 ss::scattered_message<char> response_as_scattered(response_ptr response);
 

@@ -1,6 +1,7 @@
 #pragma once
 #include "resource_mgmt/memory_groups.h"
 #include "seastarx.h"
+#include "ssx/semaphore.h"
 #include "storage/logger.h"
 #include "storage/segment_appender_chunk.h"
 #include "vassert.h"
@@ -9,7 +10,6 @@
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
-#include <seastar/core/semaphore.hh>
 #include <seastar/util/later.hh>
 
 #include <boost/iterator/counting_iterator.hpp>
@@ -28,7 +28,7 @@ public:
      * same device and file system. For convenience we use the fail safe size
      * specified by seastar, and dynamically verify compatibility for each file.
      */
-    static constexpr const size_t alignment = 4_KiB;
+    static constexpr const alignment alignment{4_KiB};
 
     chunk_cache() noexcept
       : _size_target(memory_groups::chunk_cache_min_memory())
@@ -72,8 +72,10 @@ public:
             return do_get();
         }
         return ss::get_units(_sem, 1).then(
-          [this](ss::semaphore_units<>) { return do_get(); });
+          [this](ssx::semaphore_units) { return do_get(); });
     }
+
+    size_t chunk_size() const { return _chunk_size; }
 
 private:
     ss::future<chunk_ptr> do_get() {
@@ -81,7 +83,7 @@ private:
             return ss::make_ready_future<chunk_ptr>(c);
         }
         return ss::get_units(_sem, 1).then(
-          [this](ss::semaphore_units<>) { return do_get(); });
+          [this](ssx::semaphore_units) { return do_get(); });
     }
 
     chunk_ptr pop_or_allocate() {
@@ -105,7 +107,7 @@ private:
     }
 
     ss::chunked_fifo<chunk_ptr> _chunks;
-    ss::semaphore _sem{0};
+    ssx::semaphore _sem{0, "s/chunk-cache"};
     size_t _size_available{0};
     size_t _size_total{0};
     const size_t _size_target;

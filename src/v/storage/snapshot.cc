@@ -10,7 +10,7 @@
 #include "storage/snapshot.h"
 
 #include "bytes/iobuf_parser.h"
-#include "bytes/utils.h"
+#include "bytes/iostream.h"
 #include "hashing/crc32c.h"
 #include "random/generators.h"
 #include "reflection/adl.h"
@@ -18,9 +18,12 @@
 #include "utils/directory_walker.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/seastar.hh>
 
+#include <cstdint>
+#include <filesystem>
 #include <regex>
 
 namespace storage {
@@ -46,6 +49,14 @@ snapshot_manager::open_snapshot(ss::sstring filename) {
     });
 }
 
+ss::future<uint64_t> snapshot_manager::get_snapshot_size(ss::sstring filename) {
+    auto path = snapshot_path(std::move(filename));
+    return ss::file_size(path.string())
+      .handle_exception([](const std::exception_ptr&) {
+          return ss::make_ready_future<uint64_t>(0);
+      });
+}
+
 ss::future<snapshot_writer>
 snapshot_manager::start_snapshot(ss::sstring target) {
     // the random suffix is added because the lowres clock doesn't produce
@@ -53,7 +64,7 @@ snapshot_manager::start_snapshot(ss::sstring target) {
     auto filename = fmt::format(
       "{}.partial.{}.{}",
       _partial_prefix,
-      std::chrono::milliseconds(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
         ss::lowres_system_clock::now().time_since_epoch())
         .count(),
       random_generators::gen_alphanum_string(4));
@@ -99,7 +110,26 @@ ss::future<> snapshot_manager::remove_partial_snapshots() {
 
 ss::future<> snapshot_manager::remove_snapshot(ss::sstring target) {
     if (co_await ss::file_exists(snapshot_path(target).string())) {
-        co_await ss::remove_file(snapshot_path(target).string());
+        const auto path = snapshot_path(target).string();
+        vlog(
+          stlog.info,
+          "removing snapshot file: {}",
+          snapshot_path(target).string());
+        try {
+            co_await ss::remove_file(path);
+        } catch (const std::filesystem::filesystem_error& e) {
+            if (e.code() == std::errc::no_such_file_or_directory) {
+                // This can happen if an STM tries to remove the same
+                // snapshot twice in parallel, e.g. in issue
+                // https://github.com/redpanda-data/redpanda/issues/9091
+                vlog(
+                  stlog.error,
+                  "Raced removing snapshot {} (file not found)",
+                  target);
+            } else {
+                throw;
+            }
+        }
     }
 
     co_return;

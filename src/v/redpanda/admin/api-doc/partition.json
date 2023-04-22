@@ -12,7 +12,7 @@
             "operations": [
                 {
                     "method": "GET",
-                    "summary": "Get a list of partitions",
+                    "summary": "Get list of partition replicas hosted by current node. (IMPORTANT: this API returns only those partitions which replicas are present on the queried node, not all partitions in the cluster)",
                     "type": "array",
                     "items": {
                         "type": "partition_summary"
@@ -26,15 +26,27 @@
             ]
         },
         {
+            "path": "/v1/partitions/local_summary",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Summarize the status of partitions with a replica on this node",
+                    "type": "partition_local_summary",
+                    "nickname": "get_partitions_local_summary",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
             "path": "/v1/partitions/{namespace}/{topic}/{partition}",
             "operations": [
                 {
                     "method": "GET",
                     "summary": "Get detailed partition information",
-                    "type": "array",
-                    "items": {
-                        "type": "partition"
-                    },
+                    "type": "partition",
                     "nickname": "get_partition",
                     "produces": [
                         "application/json"
@@ -57,6 +69,37 @@
                             "in": "path",
                             "required": true,
                             "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/{namespace}/{topic}",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get topic partition information",
+                    "type": "array",
+                    "items": {
+                        "type": "partition"
+                    },
+                    "nickname": "get_topic_partitions",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
                         }
                     ]
                 }
@@ -127,10 +170,108 @@
                             "type": "integer"
                         },
                         {
-                            "name":"target",
-                            "in":"query",
-                            "required":false,
-                            "type":"integer"
+                            "name": "target",
+                            "in": "query",
+                            "required": false,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/{namespace}/{topic}/{partition}/cancel_reconfiguration",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Cancel ongoing partition reconfiguration",
+                    "type": "void",
+                    "nickname": "cancel_partition_reconfiguration",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/reconfigurations",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "List ongoing partition reconfigurations",
+                    "type": "void",
+                    "nickname": "get_partition_reconfigurations",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/rebalance",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Execute on demand partition rebalance",
+                    "type": "void",
+                    "nickname": "trigger_partitions_rebalance",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/{namespace}/{topic}/{partition}/unclean_abort_reconfiguration",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Forcibly abort ongoing partition reconfiguration",
+                    "type": "void",
+                    "nickname": "unclean_abort_partition_reconfiguration",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
                         }
                     ]
                 }
@@ -248,6 +389,24 @@
                 }
             }
         },
+        "partitions_local_summary": {
+            "id": "partitions_local_summary",
+            "description": "Summarize status of partitions with a replica on this node",
+            "properties": {
+                "count": {
+                    "type": "long",
+                    "description": "Number of partitions with a replica on this node"
+                },
+                "leaderless": {
+                    "type": "long",
+                    "description": "Number of partitions with a replica on this node that report no known raft leader"
+                },
+                "under_replicated": {
+                    "type": "long",
+                    "description": "Number of partitions with leadership on this node, reporting one or more under-replicated followers"
+                }
+            }
+        },
         "assignment": {
             "id": "assignment",
             "description": "Replica assignment",
@@ -356,6 +515,57 @@
                         "type": "transaction"
                     },
                     "description": "Expired transactions"
+                }
+            }
+        },
+        "reconfiguration": {
+            "id": "reconfiguration",
+            "description": "Partition reconfiguration details",
+            "properties": {
+                "ns": {
+                    "type": "string",
+                    "description": "Namespace"
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic"
+                },
+                "partition": {
+                    "type": "long",
+                    "description": "Partition id"
+                },
+                "previous_replicas": {
+                    "type": "array",
+                    "items": {
+                        "type": "assignment"
+                    },
+                    "description": "Previous replica set"
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Reconfiguration status"
+                }
+            }
+        },
+        "partition_result": {
+            "id": "partition_result",
+            "description": "Partition result",
+            "properties": {
+                "ns": {
+                    "type": "string",
+                    "description": "Namespace"
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic"
+                },
+                "partition": {
+                    "type": "long",
+                    "description": "Partition id"
+                },
+                "result": {
+                    "type": "string",
+                    "description": "Status of operation"
                 }
             }
         }

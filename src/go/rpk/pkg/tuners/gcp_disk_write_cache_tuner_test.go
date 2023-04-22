@@ -31,7 +31,7 @@ func (v *vendorMock) Init() (vendor.InitializedVendor, error) {
 	return v.init()
 }
 
-func (v *vendorMock) Name() string {
+func (*vendorMock) Name() string {
 	return "none"
 }
 
@@ -39,7 +39,7 @@ func (v *currentVendor) Name() string {
 	return v.name
 }
 
-func (v *currentVendor) VmType() (string, error) {
+func (*currentVendor) VMType() (string, error) {
 	return "", nil
 }
 
@@ -63,7 +63,7 @@ func TestDeviceWriteCacheTuner_Tune(t *testing.T) {
 		},
 	}
 	fs := afero.NewMemMapFs()
-	fs.MkdirAll(devicePath+"/queue", 0644)
+	fs.MkdirAll(devicePath+"/queue", 0o644)
 	tuner := NewDeviceGcpWriteCacheTuner(fs, "fake", deviceFeatures, v, executors.NewDirectExecutor())
 	// when
 	tuner.Tune()

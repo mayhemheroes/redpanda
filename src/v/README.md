@@ -11,11 +11,11 @@ platform        | Machine dependent settings like ssse3 instructions |
 coproc          | WASM / Coprocessor engine for lambda transforms |
 resource_mgmt   | CPU and IO priority | 
 utils           | code utils |
-hashing         | hashing utility adaptors often used in cryptography or checksuming |
+hashing         | hashing utility adaptors often used in cryptography or checksumming |
 storage         | low level bits of the storage api |
 redpanda        | high level program - main entry point |
 finjector       | failure injector framework for testing and correctness |
-json            | json manipulation utlities |
+json            | json manipulation utilities |
 http            | HTTP conversion and utilities |
 kafka           | Kafka compatibility protocol layer |
 compression     | utilities for supporting multiple compressor types |
@@ -27,7 +27,6 @@ syschecks       | system sanity checks |
 rpc             | remote procedure call protocol for machine-to-machine communication |
 pandaproxy      | HTTP Gateway module | 
 reflection      | C++ static reflection and type traversal utils |
-dashboard       | Javascript code to render a node local HTTP dashboard |
 s3              | Amazon S3 object storage integration |
 
 

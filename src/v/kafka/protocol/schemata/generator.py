@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+#
 # Copyright 2020 Redpanda Data, Inc.
 #
 # Use of this software is governed by the Business Source License
@@ -21,26 +23,25 @@
 #   path_type_map to override types, it would be more efficient to specify the
 #   same mapping using the field_name_type_map + a whitelist of request types.
 #
-#   - The current version does not handle flexible versions. It will be some
-#   time before we encounter clients requiring this, but in principle this
-#   generator should be extensible (see type maps below). Note that when the
-#   time comes to support flexible versions, there is a filter in the templates
-#   within this file that ignores such fields, and that filter should be
-#   removed.
-#
 #   - Handle ignorable fields. Currently we handle nullable fields properly. The
 #   ignorable flag on a field doesn't change the wire protocol, but gives
 #   instruction on how things should behave when there is missing data.
 #
+#   - Build a more robust way to define messages and their contents as
+#   sensitive. The current approach relies on a list of root structs to
+#   generate stream operators that don't contain sensitive information. We
+#   should strongly consider leveraging the C++ type system to generate code
+#   that forces users to explicitly "unwrap" sensitive fields before use, to
+#   make it easier to audit where sensitive information is used.
 import io
 import json
-import functools
 import pathlib
 import re
 import sys
 import textwrap
 import jsonschema
 import jinja2
+import enum
 
 # Type overrides
 # ==============
@@ -81,6 +82,7 @@ path_type_map = {
             },
         },
         "MemberId": ("kafka::member_id", "string"),
+        "GroupInstanceId": ("kafka::group_instance_id", "string"),
     },
     "AddPartitionsToTxnRequestData": {
         "Topics": {
@@ -94,7 +96,26 @@ path_type_map = {
             }
         }
     },
+    "OffsetDeleteRequestData": {
+        "GroupId": ("kafka::group_id", "string"),
+        "Topics": {
+            "Partitions": {
+                "PartitionIndex": ("model::partition_id", "int32")
+            }
+        }
+    },
+    "OffsetDeleteResponseData": {
+        "ErrorCode": ("kafka::error_code", "int16"),
+        "Topics": {
+            "Partitions": {
+                "PartitionIndex": ("model::partition_id", "int32"),
+                "ErrorCode": ("kafka::error_code", "int16"),
+            }
+        }
+    },
     "TxnOffsetCommitRequestData": {
+        "MemberId": ("kafka::member_id", "string"),
+        "GroupInstanceId": ("kafka::group_instance_id", "string"),
         "Topics": {
             "Partitions": {
                 "PartitionIndex": ("model::partition_id", "int32"),
@@ -158,6 +179,14 @@ path_type_map = {
             },
         },
     },
+    "CreateTopicsResponseData": {
+        "Topics": {
+            "Configs": {
+                "ConfigSource": ("kafka::describe_configs_source", "int8"),
+            },
+            "TopicConfigErrorCode": ("kafka::error_code", "int16"),
+        },
+    },
     "FindCoordinatorRequestData": {
         "KeyType": ("kafka::coordinator_type", "int8"),
     },
@@ -199,6 +228,7 @@ path_type_map = {
             "ResourceType": ("kafka::config_resource_type", "int8"),
             "Configs": {
                 "ConfigSource": ("kafka::describe_configs_source", "int8"),
+                "ConfigType": ("kafka::describe_configs_type", "int8"),
             },
         },
     },
@@ -275,6 +305,46 @@ path_type_map = {
                 "EndOffset": ("model::offset", "int64"),
             }
         }
+    },
+    "AlterPartitionReassignmentsRequestData": {
+        "TimeoutMs": ("std::chrono::milliseconds", "int32"),
+        "Topics": {
+            "Partitions": {
+                "PartitionIndex": ("model::partition_id", "int32"),
+            },
+        }
+    },
+    "AlterPartitionReassignmentsResponseData": {
+        "ThrottleTimeMs": ("std::chrono::milliseconds", "int32"),
+        "Responses": {
+            "Partitions": {
+                "PartitionIndex": ("model::partition_id", "int32"),
+            },
+        }
+    },
+    "ListPartitionReassignmentsRequestData": {
+        "TimeoutMs": ("std::chrono::milliseconds", "int32"),
+        "Topics": {
+            "PartitionIndexes": ("model::partition_id", "int32"),
+        }
+    },
+    "ListPartitionReassignmentsResponseData": {
+        "ThrottleTimeMs": ("std::chrono::milliseconds", "int32"),
+        "Topics": {
+            "Partitions": {
+                "PartitionIndex": ("model::partition_id", "int32"),
+            },
+        }
+    },
+    "DescribeProducersRequestData": {
+        "Topics": {
+            "PartitionIndexes": ("model::partition_id", "int32"),
+        }
+    },
+    "DescribeTransactionsResponseData": {
+        "Topics": {
+            "Partitions": ("model::partition_id", "int32"),
+        }
     }
 }
 
@@ -283,6 +353,7 @@ entity_type_map = dict(
     groupId=("kafka::group_id", "string"),
     transactionalId=("kafka::transactional_id", "string"),
     topicName=("model::topic", "string"),
+    uuid=("kafka::uuid", "uuid"),
     brokerId=("model::node_id", "int32"),
     producerId=("kafka::producer_id", "int64"),
 )
@@ -297,16 +368,34 @@ field_name_type_map = {
 
 # primitive types
 basic_type_map = dict(
-    string=("ss::sstring", "read_string()", "read_nullable_string()"),
-    bytes=("bytes", "read_bytes()"),
+    string=("ss::sstring", "read_string_with_control_check()",
+            "read_nullable_string_with_control_check()",
+            "read_flex_string_with_control_check()",
+            "read_nullable_flex_string_with_control_check()"),
+    bytes=("bytes", "read_bytes()", None, "read_flex_bytes()", None),
     bool=("bool", "read_bool()"),
     int8=("int8_t", "read_int8()"),
     int16=("int16_t", "read_int16()"),
     int32=("int32_t", "read_int32()"),
     int64=("int64_t", "read_int64()"),
-    iobuf=("iobuf", None, "read_fragmented_nullable_bytes()"),
-    fetch_record_set=("batch_reader", None, "read_nullable_batch_reader()"),
+    uuid=("uuid", "read_uuid()"),
+    iobuf=("iobuf", None, "read_fragmented_nullable_bytes()", None,
+           "read_fragmented_nullable_flex_bytes()"),
+    fetch_record_set=("batch_reader", None, "read_nullable_batch_reader()",
+                      None, "read_nullable_flex_batch_reader()"),
 )
+
+# Declare some fields as sensitive. Utmost care should be taken to ensure the
+# contents of these fields are never made available over unsecure channels
+# (sent over an unencrypted connection, printed in logs, etc.).
+sensitive_map = {
+    "SaslAuthenticateRequestData": {
+        "AuthBytes": True,
+    },
+    "SaslAuthenticateResponseData": {
+        "AuthBytes": True,
+    },
+}
 
 # apply a rename to a struct. this is useful when there is a type name conflict
 # between two request types. since we generate types in a flat namespace this
@@ -325,7 +414,34 @@ struct_renames = {
     ("IncrementalAlterConfigsResponseData", "Responses"):
         ("AlterConfigsResourceResponse", "IncrementalAlterConfigsResourceResponse"),
 }
+
+# extra header per type name
+extra_headers = {
+    "std::optional": dict(
+        header = ("<optional>",),
+        source = "utils/to_string.h"
+    ),
+    "std::vector": dict(
+        header = "<vector>",
+    ),
+    "kafka::produce_request_record_data": dict(
+        header = "kafka/protocol/kafka_batch_adapter.h",
+    ),
+    "kafka::batch_reader": dict(
+        header = "kafka/protocol/batch_reader.h",
+    ),
+    "model::timestamp": dict(
+        header = "model/timestamp.h",
+    ),
+    "std::chrono::milliseconds": dict(
+        source = "utils/to_string.h",
+    ),
+}
 # yapf: enable
+
+# These types, when they appear as the member type of an array, will use
+# a vector implementation which resists fragmentation.
+enable_fragmentation_resistance = {'metadata_response_partition'}
 
 
 def make_context_field(path):
@@ -411,11 +527,44 @@ STRUCT_TYPES = [
     "CreatePartitionsTopic",
     "CreatePartitionsTopicResult",
     "CreatePartitionsAssignment",
+    "OffsetDeleteRequestTopic",
+    "OffsetDeleteRequestPartition",
+    "OffsetDeleteResponseTopic",
+    "OffsetDeleteResponsePartition",
     "OffsetForLeaderTopic",
     "OffsetForLeaderPartition",
     "OffsetForLeaderTopicResult",
     "EpochEndOffset",
+    "SupportedFeatureKey",
+    "FinalizedFeatureKey",
+    "DeleteTopicState",
+    "ReassignableTopic",
+    "ReassignablePartition",
+    "ReassignableTopicResponse",
+    "ReassignablePartitionResponse",
+    "ListPartitionReassignmentsTopics",
+    "OngoingTopicReassignment",
+    "OngoingPartitionReassignment",
+    "TopicRequest",
+    "TopicResponse",
+    "PartitionResponse",
+    "ProducerState",
+    "DescribeTransactionState",
+    "TopicData",
+    "ListTransactionState",
 ]
+
+# a list of struct types which are ineligible to have default-generated
+# `operator==()`, because one or more of its member variables are not
+# comparable
+WITHOUT_DEFAULT_EQUALITY_OPERATOR = {
+    'kafka::batch_reader', 'kafka::produce_request_record_data'
+}
+
+# The following is a list of tag types which contain fields where their
+# respective types are not prefixed with []. The generator special cases these
+# as ArrayTypes
+TAGGED_WITH_FIELDS = []
 
 SCALAR_TYPES = list(basic_type_map.keys())
 ENTITY_TYPES = list(entity_type_map.keys())
@@ -454,7 +603,13 @@ class VersionRange:
             max = int(match.group("max"))
             return min, max
 
-    def guard(self):
+    guard_modes = enum.Enum('guard_modes', 'GUARD, NO_GUARD, NO_SOURCE')
+
+    @property
+    def guard_enum(self):
+        return VersionRange.guard_modes
+
+    def _guard(self):
         """
         Generate the C++ bounds check.
         """
@@ -467,7 +622,29 @@ class VersionRange:
             if self.max != None:
                 cond.append(f"version <= api_version({self.max})")
             cond = " && ".join(cond)
-        return cond
+
+        return (self.guard_enum.NO_GUARD,
+                None) if cond == "" else (self.guard_enum.GUARD, cond)
+
+    def guard(self, flex, first_flex):
+        """
+        Optimize generated code by either omitting a guard or source itself
+        """
+        if first_flex < 0:
+            return self._guard()
+        elif not flex:
+            if self.min >= first_flex:
+                return self.guard_enum.NO_SOURCE, None
+        else:
+            if self.max == None:
+                if self.min <= first_flex:
+                    return self.guard_enum.NO_GUARD, None
+            elif self.max < first_flex:
+                return self.guard_enum.NO_SOURCE, None
+            elif self.max == first_flex:
+                return self.guard_enum.NO_GUARD, None
+
+        return self._guard()
 
     def __repr__(self):
         max = "+inf)" if self.max is None else f"{self.max}]"
@@ -510,6 +687,9 @@ class FieldType:
         if type_name in SCALAR_TYPES:
             t = ScalarType(type_name)
         else:
+            # Its possible for tagged types to contain fields where the type is not
+            # prefixed with [], these types are listed in the TAGGED_WITH_FIELDS map
+            is_array = is_array or (type_name in TAGGED_WITH_FIELDS)
             assert is_array
             path = path + (field["name"], )
             type_name = apply_struct_renames(path, type_name)
@@ -533,11 +713,25 @@ class ScalarType(FieldType):
     def __init__(self, name):
         super().__init__(name)
 
+    @property
+    def potentially_flexible_type(self):
+        """Evaluates to true if the scalar type would be parsed as flex
+        if the version is high enough"""
+        return self.name == "string" or self.name == "bytes" or self.name == "iobuf"
+
 
 class StructType(FieldType):
     def __init__(self, name, fields, path=()):
         super().__init__(snake_case(name))
-        self.fields = [Field.create(f, path) for f in fields]
+        self.fields = []
+        self.tags = []
+        for f in fields:
+            new_field = Field.create(f, path)
+            if new_field.is_tag:
+                self.tags.append(new_field)
+            else:
+                self.fields.append(new_field)
+        self.tags.sort(key=lambda x: x._tag)
         self.context_field = make_context_field(path)
 
     @property
@@ -554,7 +748,8 @@ class StructType(FieldType):
         Return all struct types reachable from this struct.
         """
         res = []
-        for field in self.fields:
+        all_fields = self.fields + self.tags
+        for field in all_fields:
             t = field.type()
             if isinstance(t, ArrayType):
                 t = t.value_type()  # unwrap value type
@@ -562,6 +757,46 @@ class StructType(FieldType):
                 res += t.structs()
                 res.append(t)
         return res
+
+    def headers(self, which):
+        """
+        calculate extra headers needed to support this struct
+        """
+        whiches = set(("header", "source"))
+        assert which in whiches
+
+        def type_iterator(fields):
+            for field in fields:
+                yield from field.type_name_parts()
+                t = field.type()
+                if isinstance(t, ArrayType):
+                    t = t.value_type()  # unwrap value type
+                if isinstance(t, StructType):
+                    yield from type_iterator(t.fields)
+
+        types = set(type_iterator(self.fields))
+
+        def maybe_strings(s):
+            if isinstance(s, str):
+                yield s
+            else:
+                assert isinstance(s, tuple)
+                yield from s
+
+        def type_headers(t):
+            h = extra_headers.get(t, None)
+            if h is None:
+                return
+            assert isinstance(h, dict)
+            assert set(h.keys()) <= whiches
+            h = h.get(which, ())
+            yield from maybe_strings(h)
+
+        return set(h for t in types for h in type_headers(t))
+
+    @property
+    def is_default_comparable(self):
+        return all(field.is_default_comparable for field in self.fields)
 
 
 class ArrayType(FieldType):
@@ -572,6 +807,11 @@ class ArrayType(FieldType):
 
     def value_type(self):
         return self._value_type
+
+    @property
+    def potentially_flexible_type(self):
+        assert isinstance(self._value_type, ScalarType)
+        return self._value_type.potentially_flexible_type
 
 
 class Field:
@@ -586,6 +826,10 @@ class Field:
         self._default_value = self._field.get("default", "")
         if self._default_value == "null":
             self._default_value = ""
+        self._tag = self._field.get("tag", None)
+        self._tagged_versions = self._field.get("taggedVersions", None)
+        if self._tagged_versions is not None:
+            self._tagged_versions = VersionRange(self._tagged_versions)
         assert len(self._path)
 
     @staticmethod
@@ -596,11 +840,17 @@ class Field:
     def type(self):
         return self._type
 
+    def tag(self):
+        return self._tag
+
     def nullable(self):
         return self._nullable_versions is not None
 
     def versions(self):
         return self._versions
+
+    def tagged_versions(self):
+        return self._tagged_versions
 
     def default_value(self):
         return self._default_value
@@ -678,14 +928,15 @@ class Field:
 
         raise Exception(f"No decoder for {(tn, fn)}")
 
-    @property
-    def decoder(self):
+    def decoder(self, flex):
         """
         There are two cases:
 
             1a. plain native: read_int32()
             1b. nullable native: read_nullable_string()
             1c. named types: named_type(read_int32())
+            1d. flexible types: read_flex_string()
+            1e. flexible nullable native: read_nullable_flex_string()
 
             2a. optional named types:
                 auto tmp = read_nullable_string()
@@ -697,8 +948,19 @@ class Field:
         if self.is_array:
             # array fields never contain nullable types. so if this is an array
             # field then choose the non-nullable decoder for its element type.
+            if self.potentially_flexible_type and flex:
+                assert plain_decoder[3]
+                return plain_decoder[3], named_type
             assert plain_decoder[1]
             return plain_decoder[1], named_type
+        if self.potentially_flexible_type:
+            if flex is True:
+                if self.nullable():
+                    assert plain_decoder[4]
+                    return plain_decoder[4], named_type
+                else:
+                    assert plain_decoder[3]
+                    return plain_decoder[3], named_type
         if self.nullable():
             assert plain_decoder[2]
             return plain_decoder[2], named_type
@@ -706,19 +968,60 @@ class Field:
         return plain_decoder[1], named_type
 
     @property
+    def is_sensitive(self):
+        d = sensitive_map
+        for p in self._path:
+            d = d.get(p, None)
+            if d is None:
+                break
+        if type(d) is dict:
+            # We got to the end of this field's path and `sensitive_map` has
+            # sensitive decendents defined. This field is an ancestor of a
+            # sensitive field, but it itself isn't sensitive.
+            return False
+        assert d is None or d is True, \
+            "expected field '{}' to be missing or True; field path: {}, remaining path: {}" \
+            .format(self._field["name"], self._path, d)
+        return d
+
+    @property
+    def is_tag(self):
+        return self._tag is not None
+
+    @property
     def is_array(self):
         return isinstance(self._type, ArrayType)
+
+    @property
+    def potentially_flexible_type(self):
+        return self._type.potentially_flexible_type
 
     @property
     def type_name(self):
         name, default_value = self._redpanda_type()
         if isinstance(self._type, ArrayType):
             assert default_value is None  # not supported
-            name = f"std::vector<{name}>"
+            if name in enable_fragmentation_resistance:
+                name = f'large_fragment_vector<{name}>'
+            else:
+                name = f'std::vector<{name}>'
         if self.nullable():
             assert default_value is None  # not supported
             return f"std::optional<{name}>", None
         return name, default_value
+
+    def type_name_parts(self):
+        """
+        yield normalized types required by this field
+        """
+        name, default_value = self._redpanda_type()
+        yield name
+        if isinstance(self._type, ArrayType):
+            assert default_value is None  # not supported
+            yield "std::vector"
+        if self.nullable():
+            assert default_value is None  # not supported
+            yield "std::optional"
 
     @property
     def value_type(self):
@@ -729,23 +1032,28 @@ class Field:
     def name(self):
         return snake_case(self._field["name"])
 
+    @property
+    def is_default_comparable(self):
+        type_name, _ = self._redpanda_type()
+        return type_name not in WITHOUT_DEFAULT_EQUALITY_OPERATOR
+
 
 HEADER_TEMPLATE = """
 #pragma once
-#include "kafka/types.h"
+#include "kafka/protocol/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "kafka/protocol/batch_reader.h"
 #include "kafka/protocol/errors.h"
-#include "model/timestamp.h"
 #include "seastarx.h"
+#include "utils/fragmented_vector.h"
 
-#include <seastar/core/sstring.hh>
-
-#include <chrono>
-#include <cstdint>
-#include <optional>
-#include <vector>
+{%- for header in struct.headers("header") %}
+{%- if header.startswith("<") %}
+#include {{ header }}
+{%- else %}
+#include "{{ header }}"
+{%- endif %}
+{%- endfor %}
 
 {% macro render_struct(struct) %}
 {{ render_struct_comment(struct) }}
@@ -758,18 +1066,37 @@ struct {{ struct.name }} {
     {{ info[0] }} {{ field.name }}{ {{- field.default_value() -}} };
     {%- endif %}
 {%- endfor %}
-{%- if struct.context_field %}
 
+{%- if struct.tags|length > 0 %}
+
+    // Tagged fields
+{%- for tag in struct.tags %}
+    {%- set info = tag.type_name %}
+    {%- if info[1] != None %}
+    {{ info[0] }} {{ tag.name }}{{'{'}}{{info[1]}}{{'}'}};
+    {%- else %}
+    {{ info[0] }} {{ tag.name }}{ {{- tag.default_value() -}} };
+    {%- endif %}
+{%- endfor %}
+{%- endif %}
+    tagged_fields unknown_tags;
+
+{%- if struct.context_field %}
     // extra context not part of kafka protocol.
     // added by redpanda. see generator.py:make_context_field.
     {{ struct.context_field[0] }} {{ struct.context_field[1] -}};
+{%- endif %}
+{%- if struct.is_default_comparable %}
+    friend bool operator==(const {{ struct.name }}&, const {{ struct.name }}&) = default;
 {%- endif %}
 {% endmacro %}
 
 namespace kafka {
 
-class request_reader;
-class response_writer;
+namespace protocol {
+class decoder;
+class encoder;
+}
 class response;
 
 {% for struct in struct.structs() %}
@@ -780,42 +1107,104 @@ class response;
 {% endfor %}
 
 {{ render_struct(struct) }}
-    void encode(response_writer&, api_version);
+    void encode(protocol::encoder&, api_version);
 {%- if op_type == "request" %}
-    void decode(request_reader&, api_version);
+    void decode(protocol::decoder&, api_version);
 {%- else %}
     void decode(iobuf, api_version);
 {%- endif %}
 
     friend std::ostream& operator<<(std::ostream&, const {{ struct.name }}&);
+{%- if first_flex > 0 %}
+private:
+    void encode_flex(protocol::encoder&, api_version);
+    void encode_standard(protocol::encoder&, api_version);
+{%- if op_type == "request" %}
+    void decode_flex(protocol::decoder&, api_version);
+    void decode_standard(protocol::decoder&, api_version);
+{%- else %}
+    void decode_flex(iobuf, api_version);
+    void decode_standard(iobuf, api_version);
+{%- endif %}
+{%- endif %}
 };
 
+{%- if op_type == "request" %}
+
+struct {{ request_name }}_request;
+struct {{ request_name }}_response;
+
+struct {{ request_name }}_api final {
+    using request_type = {{ request_name }}_request;
+    using response_type = {{ request_name }}_response;
+
+    static constexpr const char* name = "{{ request_name }}";
+    static constexpr api_key key = api_key({{ api_key }});
+    static constexpr api_version min_flexible = {% if first_flex == -1 %}never_flexible{% else %}api_version({{ first_flex }}){% endif %};
+};
+{%- endif %}
 }
 """
 
-SOURCE_TEMPLATE = """
+COMBINED_SOURCE_TEMPLATE = """
+{%- for header in schema_headers %}
 #include "kafka/protocol/schemata/{{ header }}"
+{%- endfor %}
 
-#include "cluster/types.h"
-#include "kafka/protocol/response_writer.h"
-#include "kafka/protocol/request_reader.h"
+#include "kafka/protocol/wire.h"
 
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 
-{% macro version_guard(field) %}
-{%- set cond = field.versions().guard() %}
-{%- if cond %}
+{%- for header in extra_headers %}
+{%- if header.startswith("<") %}
+#include {{ header }}
+{%- else %}
+#include "{{ header }}"
+{%- endif %}
+{%- endfor %}
+
+{%- for name, source in sources %}
+/*
+ * begin: {{ name }}
+ */
+{{ source }}
+{%- endfor %}
+"""
+
+SOURCE_TEMPLATE = """
+{% macro version_guard(field, flex) %}
+{%- set guard_enum = field.versions().guard_enum %}
+{%- set e, cond = field.versions().guard(flex, first_flex) %}
+{%- if e == guard_enum.NO_GUARD %}
+{{- caller() }}
+{%- elif e == guard_enum.NO_SOURCE %}
+{%- elif e == guard_enum.GUARD %}
 if ({{ cond }}) {
 {{- caller() | indent }}
 }
 {%- else %}
-{{- caller() }}
+{{ fail("Unexpected enumeration encountered, type: VersionRange.guard_modes") }}
 {%- endif %}
 {%- endmacro %}
 
-{% macro field_encoder(field, obj) %}
+{% macro tag_version_guard(tag) %}
+{%- set guard_enum = tag.versions().guard_enum %}
+{%- set e, cond = tag.tagged_versions()._guard() %}
+{%- if e == guard_enum.GUARD %}
+if ({{ cond }}) {
+{{- caller() | indent }}
+}
+{%- elif e == guard_enum.NO_GUARD %}
+{{- caller() }}
+{%- else %}
+{{ fail("Unexpected condition reached NO_SOURCE, in tag_version_guard()") }}
+{%- endif %}
+{% endmacro %}
+
+{% macro field_encoder(field, methods, obj, writer = "writer") %}
+{%- set flex = methods|length > 1 %}
 {%- if obj %}
 {%- set fname = obj + "." + field.name %}
 {%- else %}
@@ -823,22 +1212,36 @@ if ({{ cond }}) {
 {%- endif %}
 {%- if field.is_array %}
 {%- if field.nullable() %}
-writer.write_nullable_array({{ fname }}, [version]({{ field.value_type }}& v, response_writer& writer) {
+{%- if flex %}
+{{ writer }}.write_nullable_flex_array({{ fname }}, [version]({{ field.value_type }}& v, protocol::encoder& writer) {
 {%- else %}
-writer.write_array({{ fname }}, [version]({{ field.value_type }}& v, response_writer& writer) {
+{{ writer }}.write_nullable_array({{ fname }}, [version]({{ field.value_type }}& v, protocol::encoder& writer) {
 {%- endif %}
-{%- if field.type().value_type().is_struct %}
-{{- struct_serde(field.type().value_type(), field_encoder, "v") | indent }}
 {%- else %}
-    writer.write(v);
+{%- if flex %}
+{{ writer }}.write_flex_array({{ fname }}, [version]({{ field.value_type }}& v, protocol::encoder& writer) {
+{%- else %}
+{{ writer }}.write_array({{ fname }}, [version]({{ field.value_type }}& v, protocol::encoder& writer) {
+{%- endif %}
+{%- endif %}
+    (void)version;
+{%- if field.type().value_type().is_struct %}
+{{- struct_serde(field.type().value_type(), methods, "v") | indent }}
+{%- elif flex and field.type().value_type().potentially_flexible_type %}
+    {{ writer }}.write_flex(v);
+{%- else %}
+    {{ writer }}.write(v);
 {%- endif %}
 });
+{%- elif flex and field.type().potentially_flexible_type %}
+{{ writer }}.write_flex({{ fname }});
 {%- else %}
-writer.write({{ fname }});
+{{ writer }}.write({{ fname }});
 {%- endif %}
 {%- endmacro %}
 
-{% macro field_decoder(field, obj) %}
+{% macro field_decoder(field, methods, obj) %}
+{%- set flex = methods|length > 1 %}
 {%- if obj %}
 {%- set fname = obj + "." + field.name %}
 {%- else %}
@@ -846,33 +1249,34 @@ writer.write({{ fname }});
 {%- endif %}
 {%- if field.is_array %}
 {%- if field.nullable() %}
-{{ fname }} = reader.read_nullable_array([version](request_reader& reader) {
+{%- if flex %}
+{{ fname }} = reader.read_nullable_flex_array([version](protocol::decoder& reader) {
 {%- else %}
-{{ fname }} = reader.read_array([version](request_reader& reader) {
+{{ fname }} = reader.read_nullable_array([version](protocol::decoder& reader) {
 {%- endif %}
+{%- else %}
+{%- if flex %}
+{{ fname }} = reader.read_flex_array([version](protocol::decoder& reader) {
+{%- else %}
+{{ fname }} = reader.read_array([version](protocol::decoder& reader) {
+{%- endif %}
+{%- endif %}
+    (void)version;
 {%- if field.type().value_type().is_struct %}
     {{ field.type().value_type().name }} v;
-{{- struct_serde(field.type().value_type(), field_decoder, "v") | indent }}
+{{- struct_serde(field.type().value_type(), methods, "v") | indent }}
     return v;
 {%- else %}
-{%- set decoder, named_type = field.decoder %}
+{%- set decoder, named_type = field.decoder(flex) %}
 {%- if named_type == None %}
     return reader.{{ decoder }};
-{%- elif field.nullable() %}
-    {
-        auto tmp = reader.{{ decoder }};
-        if (tmp) {
-            return {{ named_type }}(std::move(*tmp));
-        }
-        return std::nullopt;
-    }
 {%- else %}
     return {{ named_type }}(reader.{{ decoder }});
 {%- endif %}
 {%- endif %}
 });
 {%- else %}
-{%- set decoder, named_type = field.decoder %}
+{%- set decoder, named_type = field.decoder(flex) %}
 {%- if named_type == None %}
 {{ fname }} = reader.{{ decoder }};
 {%- elif field.nullable() %}
@@ -892,50 +1296,260 @@ writer.write({{ fname }});
 {%- endif %}
 {%- endmacro %}
 
-{% macro struct_serde(struct, field_serde, obj = "") %}
-{%- for field in struct.fields %}
-{%- call version_guard(field) %}
-{{- field_serde(field, obj) }}
+{% macro tag_decoder_impl(tag_definitions, obj = "") %}
+/// Tags decoding section
+auto num_tags = reader.read_unsigned_varint();
+while(num_tags-- > 0) {
+    auto tag = reader.read_unsigned_varint();
+    auto sz = reader.read_unsigned_varint(); // size
+    switch(tag){
+{%- for tdef in tag_definitions %}
+    case {{ tdef.tag() }}:
+{{- field_decoder(tdef, (field_decoder, tag_decoder), obj) | indent | indent }}
+        break;
+{%- endfor %}
+    default:
+{%- set tf = "unknown_tags" %}
+{%- if obj != "" %}
+{%- set tf = obj + '.unknown_tags' %}
+{%- endif %}
+        reader.consume_unknown_tag({{ tf }}, tag, sz);
+    }
+}
+{%- endmacro %}
+
+{% macro tag_decoder(tag_definitions, obj = "") %}
+{%- if tag_definitions|length == 0 %}
+{%- set tf = "unknown_tags" %}
+{%- if obj != "" %}
+{%- set tf = obj + '.unknown_tags' %}
+{%- endif %}
+{{ tf }} = reader.read_tags();
+{%- else %}
+{
+{{- tag_decoder_impl(tag_definitions, obj) | indent }}
+}
+{%- endif %}
+{%- endmacro %}
+
+{% macro conditional_tag_encode(tdef, vec) %}
+{%- if tdef.nullable() %}
+if ({{ tdef.name }}) {
+    {{ vec }}.push_back({{ tdef.tag() }});
+}
+{%- elif tdef.is_array %}
+if (!{{ tdef.name }}.empty()) {
+    {{ vec }}.push_back({{ tdef.tag() }});
+}
+{%- elif tdef.default_value() != "" %}
+if ({{ tdef.name }} != {{ tdef.default_value() }}) {
+    {{ vec }}.push_back({{ tdef.tag() }});
+}
+{%- else %}
+{{ vec }}.push_back({{ tdef.tag() }});
+{%- endif %}
+{%- endmacro %}
+
+{% macro tag_encoder_impl(tag_definitions, obj = "") %}
+/// Tags encoding section
+std::vector<uint32_t> to_encode;
+{%- for tdef in tag_definitions -%}
+{%- call tag_version_guard(tdef) %}
+{{- conditional_tag_encode(tdef, "to_encode") }}
 {%- endcall %}
 {%- endfor %}
+{%- set tf = "unknown_tags" %}
+{%- if obj != "" %}
+{%- set tf = obj + '.unknown_tags' %}
+{%- endif %}
+tagged_fields::type tags_to_encode{std::move({{ tf }})};
+for(uint32_t tag : to_encode) {
+    iobuf b;
+    protocol::encoder rw(b);
+    switch(tag){
+{%- for tdef in tag_definitions %}
+    case {{ tdef.tag() }}:
+{{- field_encoder(tdef, (field_encoder, tag_encoder), obj, "rw") | indent | indent }}
+        break;
+{%- endfor %}
+    default:
+        __builtin_unreachable();
+    }
+    tags_to_encode.emplace(tag_id(tag), iobuf_to_bytes(b));
+}
+writer.write_tags(tagged_fields(std::move(tags_to_encode)));
+{%- endmacro %}
+
+{% macro tag_encoder(tag_definitions, obj = "") %}
+{%- if tag_definitions|length == 0 %}
+{%- set tf = "unknown_tags" %}
+{%- if obj != "" %}
+{%- set tf = obj + '.unknown_tags' %}
+{%- endif %}
+writer.write_tags(std::move({{ tf }}));
+{%- else %}
+{
+{{- tag_encoder_impl(tag_definitions, obj) | indent }}
+}
+{%- endif %}
+{%- endmacro %}
+
+{% set encoder = (field_encoder,) %}
+{% set decoder = (field_decoder,) %}
+{% set flex_encoder = (field_encoder, tag_encoder) %}
+{% set flex_decoder = (field_decoder, tag_decoder) %}
+
+{% macro struct_serde(struct, serde_methods, obj = "") %}
+{%- set flex = serde_methods|length > 1 %}
+{%- for field in struct.fields %}
+{%- call version_guard(field, flex) %}
+{{- serde_methods[0](field, serde_methods, obj) }}
+{%- endcall %}
+{%- endfor %}
+{%- if flex %}
+{{- serde_methods[1](struct.tags, obj) }}
+{%- endif %}
 {%- endmacro %}
 
 namespace kafka {
 
 {%- if struct.fields %}
-void {{ struct.name }}::encode(response_writer& writer, [[maybe_unused]] api_version version) {
-{{- struct_serde(struct, field_encoder) | indent }}
+{%- if first_flex > 0 %}
+void {{ struct.name }}::encode(protocol::encoder& writer, api_version version) {
+    if (version >= api_version({{ first_flex }})) {
+        encode_flex(writer, version);
+    } else {
+        encode_standard(writer, version);
+    }
 }
 
-{%- if op_type == "request" %}
-void {{ struct.name }}::decode(request_reader& reader, [[maybe_unused]] api_version version) {
-{{- struct_serde(struct, field_decoder) | indent }}
+void {{ struct.name }}::encode_flex(protocol::encoder& writer, [[maybe_unused]] api_version version) {
+{{- struct_serde(struct, flex_encoder) | indent }}
+}
+
+void {{ struct.name }}::encode_standard([[maybe_unused]] protocol::encoder& writer, [[maybe_unused]] api_version version) {
+{{- struct_serde(struct, encoder) | indent }}
+}
+
+{%- elif first_flex < 0 %}
+void {{ struct.name }}::encode(protocol::encoder& writer, [[maybe_unused]] api_version version) {
+{{- struct_serde(struct, encoder) | indent }}
 }
 {%- else %}
-void {{ struct.name }}::decode(iobuf buf, [[maybe_unused]] api_version version) {
-    request_reader reader(std::move(buf));
+void {{ struct.name }}::encode(protocol::encoder& writer, [[maybe_unused]] api_version version) {
+{{- struct_serde(struct, flex_encoder) | indent }}
+}
+{%- endif %}
 
-{{- struct_serde(struct, field_decoder) | indent }}
+
+{%- if op_type == "request" %}
+{%- if first_flex > 0 %}
+void {{ struct.name }}::decode(protocol::decoder& reader, api_version version) {
+    if (version >= api_version({{ first_flex }})) {
+        decode_flex(reader, version);
+    } else {
+        decode_standard(reader, version);
+    }
+}
+void {{ struct.name }}::decode_flex(protocol::decoder& reader, [[maybe_unused]] api_version version) {
+{{- struct_serde(struct, flex_decoder) | indent }}
+}
+
+void {{ struct.name }}::decode_standard([[maybe_unused]] protocol::decoder& reader, [[maybe_unused]] api_version version) {
+{{- struct_serde(struct, decoder) | indent }}
+}
+{%- elif first_flex < 0 %}
+void {{ struct.name }}::decode(protocol::decoder& reader, [[maybe_unused]] api_version version) {
+{{- struct_serde(struct, decoder) | indent }}
+}
+{% else %}
+void {{ struct.name }}::decode(protocol::decoder& reader, [[maybe_unused]] api_version version) {
+{{- struct_serde(struct, flex_decoder) | indent }}
 }
 {%- endif %}
 {%- else %}
-{%- if op_type == "request" %}
-void {{ struct.name }}::encode(response_writer&, api_version) {}
-void {{ struct.name }}::decode(request_reader&, api_version) {}
+
+{%- if first_flex > 0 %}
+void {{ struct.name }}::decode(iobuf buf, api_version version) {
+    if (version >= api_version({{ first_flex }})) {
+        decode_flex(std::move(buf), version);
+    } else {
+        decode_standard(std::move(buf), version);
+    }
+}
+void {{ struct.name }}::decode_flex(iobuf buf, [[maybe_unused]] api_version version) {
+    protocol::decoder reader(std::move(buf));
+
+{{- struct_serde(struct, flex_decoder) | indent }}
+}
+void {{ struct.name }}::decode_standard(iobuf buf, [[maybe_unused]] api_version version) {
+    protocol::decoder reader(std::move(buf));
+
+{{- struct_serde(struct, decoder) | indent }}
+}
+
+{%- elif first_flex < 0 %}
+void {{ struct.name }}::decode(iobuf buf, [[maybe_unused]] api_version version) {
+    protocol::decoder reader(std::move(buf));
+
+{{- struct_serde(struct, decoder) | indent }}
+}
 {%- else %}
-void {{ struct.name }}::encode(response_writer&, api_version&) {}
+void {{ struct.name }}::decode(iobuf buf, [[maybe_unused]] api_version version) {
+    protocol::decoder reader(std::move(buf));
+
+{{- struct_serde(struct, flex_decoder) | indent }}
+}
+{%- endif %}
+
+
+{%- endif %}
+{%- else %}
+{%- if op_type == "request" %}
+{%- if first_flex > 0 %}
+void {{ struct.name }}::encode(protocol::encoder& writer, api_version version) {
+    if (version >= api_version({{ first_flex }})) {
+        writer.write_tags(std::move(unknown_tags));
+    }
+}
+void {{ struct.name }}::decode(protocol::decoder& reader, api_version version) {
+    if (version >= api_version({{ first_flex }})) {
+        unknown_tags = reader.read_tags();
+    }
+}
+{%- else %}
+void {{ struct.name }}::encode(protocol::encoder&, api_version) {}
+void {{ struct.name }}::decode(protocol::decoder&, api_version) {}
+{%- endif %}
+{%- else %}
+{%- if first_flex > 0 %}
+void {{ struct.name }}::encode(protocol::encoder& writer, api_version version) {
+    if (version >= api_version({{ first_flex }})) {
+        write.write_tags(std::move(unknown_tags));
+    }
+}
+void {{ struct.name }}::decode(iobuf buf, api_version version) {
+    if (version >= api_version({{ first_flex }})) {
+        protocol::decoder reader(std::move(buf));
+        unknown_tags = reader.read_tags();
+    }
+}
+{%- else %}
+void {{ struct.name }}::encode(protocol::encoder&, api_version) {}
 void {{ struct.name }}::decode(iobuf, api_version) {}
+{%- endif %}
 {%- endif %}
 {%- endif %}
 
 {% set structs = struct.structs() + [struct] %}
 {% for struct in structs %}
 {%- if struct.fields %}
-std::ostream& operator<<(std::ostream& o, const {{ struct.name }}& v) {
+std::ostream& operator<<(std::ostream& o, [[maybe_unused]] const {{ struct.name }}& v) {
     fmt::print(o,
       "{{'{{' + struct.format + '}}'}}",
       {%- for field in struct.fields %}
-      v.{{ field.name }}{% if not loop.last %},{% endif %}
+      {%- if field.is_sensitive %}"****"{% else %}v.{{ field.name }}{% endif %}{% if not loop.last %},{% endif %}
+
       {%- endfor %}
     );
     return o;
@@ -962,7 +1576,8 @@ std::ostream& operator<<(std::ostream& o, const {{ struct.name }}&) {
 ALLOWED_SCALAR_TYPES = list(set(SCALAR_TYPES) - set(["iobuf"]))
 ALLOWED_TYPES = \
     ALLOWED_SCALAR_TYPES + \
-    [f"[]{t}" for t in ALLOWED_SCALAR_TYPES + STRUCT_TYPES]
+    [f"[]{t}" for t in ALLOWED_SCALAR_TYPES +
+        STRUCT_TYPES] + TAGGED_WITH_FIELDS
 
 # yapf: disable
 SCHEMA = {
@@ -1044,6 +1659,7 @@ SCHEMA = {
             ],
         },
         "fields": {"$ref": "#/definitions/fields"},
+        "listeners": {"type": "array", "optional": True}
     },
     "required": [
         "apiKey",
@@ -1083,13 +1699,25 @@ def render_struct_comment(struct):
     return f"/*\n{comment} */"
 
 
-if __name__ == "__main__":
-    assert len(sys.argv) == 3
-    outdir = pathlib.Path(sys.argv[1])
-    schema_path = pathlib.Path(sys.argv[2])
-    src = (outdir / schema_path.name).with_suffix(".cc")
-    hdr = (outdir / schema_path.name).with_suffix(".h")
+def parse_flexible_versions(flex_version):
+    # A first_flex value of 0 will produce code that is optimized to do no flex
+    # version branching, since all versions since inception were always flexible
+    #
+    # A first_flex value of -1 indicates the value of flexibleVersions was set to 'none'.
+    # These requests will always be interpreted as non-flex and produce no conditional to
+    # branch and parse a flex request.
+    #
+    # All other types of requests will produce code that checks for the flex version once
+    # (at the beginning of encode/decode) and will not add redundent checks i.e. check
+    # if its ok to serialize something at version 7 if it already branched due to flex and
+    # that flex version is already greater than 7.
+    if flex_version == "none":
+        return -1
+    r = VersionRange(flex_version)
+    return r.min
 
+
+def codegen(schema_path):
     # remove comments from the json file. comments are a non-standard json
     # extension that is not supported by the python json parser.
     schema = io.StringIO()
@@ -1112,15 +1740,74 @@ if __name__ == "__main__":
     # request or response
     op_type = msg["type"]
 
-    with open(hdr, 'w') as f:
-        f.write(
-            jinja2.Template(HEADER_TEMPLATE).render(
-                struct=struct,
-                render_struct_comment=render_struct_comment,
-                op_type=op_type))
+    # request id
+    api_key = msg["apiKey"]
 
-    with open(src, 'w') as f:
-        f.write(
-            jinja2.Template(SOURCE_TEMPLATE).render(struct=struct,
-                                                    header=hdr.name,
-                                                    op_type=op_type))
+    def parse_name(name):
+        name = name.removesuffix("Request")
+        name = name.removesuffix("Response")
+        name = snake_case(name)
+        # Special case to sidestep an otherwise large rename in the source
+        return "list_offsets" if name == "list_offset" else name
+
+    request_name = parse_name(msg["name"])
+
+    # either 'none' or 'VersionRange'
+    first_flex = parse_flexible_versions(msg["flexibleVersions"])
+
+    def fail(msg):
+        assert False, msg
+
+    hdr = jinja2.Template(HEADER_TEMPLATE).render(
+        struct=struct,
+        render_struct_comment=render_struct_comment,
+        op_type=op_type,
+        fail=fail,
+        api_key=api_key,
+        request_name=request_name,
+        first_flex=first_flex)
+
+    src = jinja2.Template(SOURCE_TEMPLATE).render(struct=struct,
+                                                  op_type=op_type,
+                                                  fail=fail,
+                                                  first_flex=first_flex)
+
+    return hdr, src, struct.headers("source")
+
+
+if __name__ == "__main__":
+    schemata = []
+    headers = []
+    source = None
+
+    for arg in sys.argv[1:]:
+        path = pathlib.Path(arg)
+        if path.suffix == ".json":
+            schemata.append(path)
+        elif path.suffix == ".h":
+            headers.append(path)
+        elif path.suffix == ".cc":
+            assert source is None
+            source = path
+        else:
+            assert False, f"unknown arg {arg}"
+
+    assert len(schemata) == len(headers)
+    assert source is not None
+
+    sources = []
+    extra_schema_headers = set()
+    for schema, hdr_path in zip(schemata, headers):
+        hdr, src, extra = codegen(schema)
+        sources.append((schema.name, src))
+        extra_schema_headers.update(extra)
+        with open(hdr_path, 'w') as f:
+            f.write(hdr)
+
+    src = jinja2.Template(COMBINED_SOURCE_TEMPLATE).render(
+        schema_headers=map(lambda p: p.name, headers),
+        extra_headers=extra_schema_headers,
+        sources=sources)
+
+    with open(source, 'w') as f:
+        f.write(src)

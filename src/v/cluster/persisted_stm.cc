@@ -9,11 +9,17 @@
 
 #include "cluster/persisted_stm.h"
 
+#include "bytes/iostream.h"
 #include "cluster/logger.h"
+#include "raft/consensus.h"
 #include "raft/errc.h"
+#include "raft/offset_monitor.h"
 #include "raft/types.h"
+#include "ssx/sformat.h"
 #include "storage/record_batch_builder.h"
+#include "storage/snapshot.h"
 
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 
@@ -29,9 +35,10 @@ persisted_stm::persisted_stm(
       std::filesystem::path(c->log_config().work_directory()),
       snapshot_mgr_name,
       ss::default_priority_class())
-  , _log(logger) {}
+  , _log(logger, ssx::sformat("[{} ({})]", _c->ntp(), name())) {}
 
 ss::future<> persisted_stm::remove_persistent_state() {
+    _snapshot_size = 0;
     co_await _snapshot_mgr.remove_snapshot();
     co_await _snapshot_mgr.remove_partial_snapshots();
 }
@@ -49,12 +56,14 @@ ss::future<std::optional<stm_snapshot>> persisted_stm::load_snapshot() {
     auto version = reflection::adl<int8_t>{}.from(meta_parser);
     vassert(
       version == snapshot_version || version == snapshot_version_v0,
-      "Unsupported persisted_stm snapshot_version {}",
+      "[{} ({})] Unsupported persisted_stm snapshot_version {}",
+      _c->ntp(),
+      name(),
       version);
 
     if (version == snapshot_version_v0) {
         vlog(
-          clusterlog.warn,
+          _log.warn,
           "Skipping snapshot {} due to old format",
           _snapshot_mgr.snapshot_path());
 
@@ -72,6 +81,8 @@ ss::future<std::optional<stm_snapshot>> persisted_stm::load_snapshot() {
       meta_parser);
     snapshot.data = co_await read_iobuf_exactly(
       reader.input(), snapshot.header.snapshot_size);
+
+    _snapshot_size = co_await reader.get_snapshot_size();
     co_await reader.close();
     co_await _snapshot_mgr.remove_partial_snapshots();
 
@@ -86,7 +97,8 @@ ss::future<> persisted_stm::wait_for_snapshot_hydrated() {
     return f;
 }
 
-ss::future<> persisted_stm::persist_snapshot(stm_snapshot&& snapshot) {
+ss::future<> persisted_stm::persist_snapshot(
+  storage::simple_snapshot_manager& snapshot_mgr, stm_snapshot&& snapshot) {
     iobuf data_size_buf;
 
     int8_t version = snapshot_version;
@@ -96,14 +108,14 @@ ss::future<> persisted_stm::persist_snapshot(stm_snapshot&& snapshot) {
     reflection::serialize(
       data_size_buf, version, offset, data_version, data_size);
 
-    return _snapshot_mgr.start_snapshot().then(
-      [this,
+    return snapshot_mgr.start_snapshot().then(
+      [&snapshot_mgr,
        snapshot = std::move(snapshot),
        data_size_buf = std::move(data_size_buf)](
         storage::snapshot_writer writer) mutable {
           return ss::do_with(
             std::move(writer),
-            [this,
+            [&snapshot_mgr,
              snapshot = std::move(snapshot),
              data_size_buf = std::move(data_size_buf)](
               storage::snapshot_writer& writer) mutable {
@@ -113,11 +125,18 @@ ss::future<> persisted_stm::persist_snapshot(stm_snapshot&& snapshot) {
                         std::move(snapshot.data), writer.output());
                   })
                   .finally([&writer] { return writer.close(); })
-                  .then([this, &writer] {
-                      return _snapshot_mgr.finish_snapshot(writer);
+                  .then([&snapshot_mgr, &writer] {
+                      return snapshot_mgr.finish_snapshot(writer);
                   });
             });
       });
+}
+
+ss::future<> persisted_stm::persist_snapshot(stm_snapshot&& snapshot) {
+    return persist_snapshot(_snapshot_mgr, std::move(snapshot)).then([this] {
+        return _snapshot_mgr.get_snapshot_size().then(
+          [this](uint64_t size) { _snapshot_size = size; });
+    });
 }
 
 ss::future<> persisted_stm::do_make_snapshot() {
@@ -139,6 +158,8 @@ ss::future<> persisted_stm::make_snapshot() {
     });
 }
 
+uint64_t persisted_stm::get_snapshot_size() const { return _snapshot_size; }
+
 ss::future<>
 persisted_stm::ensure_snapshot_exists(model::offset target_offset) {
     return _op_lock.with([this, target_offset]() {
@@ -152,8 +173,11 @@ persisted_stm::ensure_snapshot_exists(model::offset target_offset) {
               .then([this, target_offset]() {
                   vassert(
                     target_offset <= _insync_offset,
-                    "after we waited for target_offset ({}) _insync_offset "
+                    "[{} ({})]  after we waited for target_offset ({}) "
+                    "_insync_offset "
                     "({}) should have matched it or bypassed",
+                    _c->ntp(),
+                    name(),
                     target_offset,
                     _insync_offset);
                   return do_make_snapshot();
@@ -164,6 +188,11 @@ persisted_stm::ensure_snapshot_exists(model::offset target_offset) {
 
 model::offset persisted_stm::max_collectible_offset() {
     return model::offset::max();
+}
+
+ss::future<fragmented_vector<model::tx_range>>
+persisted_stm::aborted_tx_ranges(model::offset, model::offset) {
+    return ss::make_ready_future<fragmented_vector<model::tx_range>>();
 }
 
 ss::future<> persisted_stm::wait_offset_committed(
@@ -188,15 +217,22 @@ ss::future<bool> persisted_stm::do_sync(
     if (offset > committed) {
         try {
             co_await wait_offset_committed(timeout, offset, term);
+        } catch (const ss::broken_condition_variable&) {
+            co_return false;
+        } catch (const ss::gate_closed_exception&) {
+            co_return false;
+        } catch (const ss::abort_requested_exception&) {
+            co_return false;
+        } catch (const ss::condition_variable_timed_out&) {
+            co_return false;
         } catch (...) {
             vlog(
-              clusterlog.error,
-              "sync error: wait_offset_committed failed with {}; offsets: "
-              "dirty={}, committed={}; ntp={}",
+              _log.error,
+              "sync error: wait_offset_committed failed with {}; "
+              "offsets: dirty={}, committed={}",
               std::current_exception(),
               offset,
-              committed,
-              ntp);
+              committed);
             co_return false;
         }
     } else {
@@ -206,15 +242,30 @@ ss::future<bool> persisted_stm::do_sync(
     if (_c->term() == term) {
         try {
             co_await wait(offset, model::timeout_clock::now() + timeout);
+        } catch (const ss::broken_condition_variable&) {
+            co_return false;
+        } catch (const ss::gate_closed_exception&) {
+            co_return false;
+        } catch (const ss::abort_requested_exception&) {
+            co_return false;
+        } catch (const ss::condition_variable_timed_out&) {
+            co_return false;
+        } catch (const ss::timed_out_error&) {
+            vlog(
+              _log.warn,
+              "sync timeout: waiting for offset={}; committed "
+              "offset={}",
+              offset,
+              committed);
+            co_return false;
         } catch (...) {
             vlog(
-              clusterlog.error,
+              _log.error,
               "sync error: waiting for offset={} failed with {}; committed "
-              "offset={}; ntp={}",
+              "offset={};",
               offset,
               std::current_exception(),
-              committed,
-              ntp);
+              committed);
             co_return false;
         }
         if (_c->term() == term) {
@@ -274,17 +325,26 @@ ss::future<bool> persisted_stm::sync(model::timeout_clock::duration timeout) {
 }
 
 ss::future<bool> persisted_stm::wait_no_throw(
-  model::offset offset, model::timeout_clock::duration timeout) {
-    auto deadline = model::timeout_clock::now() + timeout;
-    return wait(offset, deadline)
+  model::offset offset,
+  model::timeout_clock::time_point deadline,
+  std::optional<std::reference_wrapper<ss::abort_source>> as) {
+    return wait(offset, deadline, as)
       .then([] { return true; })
-      .handle_exception([offset, ntp = _c->ntp()](std::exception_ptr e) {
+      .handle_exception_type([](const ss::abort_requested_exception&) {
+          // Shutting down
+          return false;
+      })
+      .handle_exception_type(
+        [this, offset, ntp = _c->ntp()](const ss::timed_out_error&) {
+            vlog(_log.warn, "timed out while waiting for offset: {}", offset);
+            return false;
+        })
+      .handle_exception([this, offset, ntp = _c->ntp()](std::exception_ptr e) {
           vlog(
-            clusterlog.error,
-            "An error {} happened during waiting for offset: {}, ntp: {}",
+            _log.error,
+            "An error {} happened during waiting for offset: {}",
             e,
-            offset,
-            ntp);
+            offset);
           return false;
       });
 }
@@ -296,7 +356,9 @@ ss::future<> persisted_stm::start() {
     } catch (...) {
         vassert(
           false,
-          "Can't load snapshot from '{}'. Got error: {}",
+          "[[{}] ({})]Can't load snapshot from '{}'. Got error: {}",
+          _c->ntp(),
+          name(),
           _snapshot_mgr.snapshot_path(),
           std::current_exception());
     }
@@ -304,9 +366,14 @@ ss::future<> persisted_stm::start() {
     if (maybe_snapshot) {
         stm_snapshot& snapshot = *maybe_snapshot;
 
-        auto next_offset = raft::details::next_offset(snapshot.header.offset);
+        auto next_offset = model::next_offset(snapshot.header.offset);
         if (next_offset >= _c->start_offset()) {
+            vlog(
+              _log.debug,
+              "start with applied snapshot, set_next {}",
+              next_offset);
             co_await apply_snapshot(snapshot.header, std::move(snapshot.data));
+            set_next(next_offset);
         } else {
             // This can happen on an out-of-date replica that re-joins the group
             // after other replicas have already evicted logs to some offset
@@ -314,16 +381,24 @@ ss::future<> persisted_stm::start() {
             // continue. The stm will later detect this situation and deal with
             // it in the apply fiber by calling handle_eviction.
             vlog(
-              clusterlog.warn,
+              _log.warn,
               "Skipping snapshot {} since it's out of sync with the log",
               _snapshot_mgr.snapshot_path());
+            vlog(
+              _log.debug,
+              "start with non-applied snapshot, set_next {}",
+              next_offset);
+            _insync_offset = model::prev_offset(next_offset);
+            set_next(next_offset);
         }
-        set_next(next_offset);
 
         _resolved_when_snapshot_hydrated.set_value();
     } else {
         auto offset = _c->start_offset();
+        vlog(_log.debug, "start without snapshot, maybe set_next {}", offset);
+
         if (offset >= model::offset(0)) {
+            _insync_offset = model::prev_offset(offset);
             set_next(offset);
         }
         _resolved_when_snapshot_hydrated.set_value();

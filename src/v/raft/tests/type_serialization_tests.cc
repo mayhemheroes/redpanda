@@ -8,17 +8,20 @@
 // by the Apache License, Version 2.0
 
 #include "compression/stream_zstd.h"
+#include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
+#include "model/tests/random_batch.h"
+#include "model/tests/randoms.h"
 #include "model/timeout_clock.h"
 #include "raft/consensus_utils.h"
 #include "raft/group_configuration.h"
 #include "raft/types.h"
 #include "random/generators.h"
 #include "reflection/adl.h"
+#include "serde/serde.h"
 #include "storage/record_batch_builder.h"
-#include "storage/tests/utils/random_batch.h"
 #include "test_utils/randoms.h"
 #include "test_utils/rpc.h"
 
@@ -29,6 +32,7 @@
 #include <boost/test/tools/old/interface.hpp>
 #include <boost/test/unit_test_log.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <vector>
 
@@ -59,8 +63,7 @@ struct checking_consumer {
 };
 
 SEASTAR_THREAD_TEST_CASE(append_entries_requests) {
-    auto batches = storage::test::make_random_batches(
-      model::offset(1), 3, false);
+    auto batches = model::test::make_random_batches(model::offset(1), 3, false);
 
     for (auto& b : batches) {
         b.set_term(model::term_id(123));
@@ -83,11 +86,16 @@ SEASTAR_THREAD_TEST_CASE(append_entries_requests) {
       std::move(readers.back()));
 
     readers.pop_back();
-    auto d = async_serialize_roundtrip_rpc(std::move(req)).get0();
+    const auto target_node_id = req.target_node_id;
+
+    iobuf buf;
+    serde::write_async(buf, std::move(req)).get();
+    iobuf_parser p(std::move(buf));
+    auto d = serde::read_async<raft::append_entries_request>(p).get();
 
     BOOST_REQUIRE_EQUAL(
       d.node_id, raft::vnode(model::node_id(1), model::revision_id(10)));
-    BOOST_REQUIRE_EQUAL(d.target_node_id, req.target_node_id);
+    BOOST_REQUIRE_EQUAL(d.target_node_id, target_node_id);
     BOOST_REQUIRE_EQUAL(d.meta.group, meta.group);
     BOOST_REQUIRE_EQUAL(d.meta.commit_index, meta.commit_index);
     BOOST_REQUIRE_EQUAL(d.meta.term, meta.term);
@@ -98,7 +106,7 @@ SEASTAR_THREAD_TEST_CASE(append_entries_requests) {
     auto batches_result = model::consume_reader_to_memory(
                             std::move(readers.back()), model::no_timeout)
                             .get0();
-    d.batches
+    d.batches()
       .consume(checking_consumer(std::move(batches_result)), model::no_timeout)
       .get0();
 }
@@ -133,17 +141,11 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_request_roundtrip) {
         req.heartbeats[i].target_node_id = raft::vnode(
           model::node_id(0), model::revision_id(i));
     }
+
     iobuf buf;
-    reflection::async_adl<raft::heartbeat_request>{}
-      .to(buf, std::move(req))
-      .get();
-    BOOST_TEST_MESSAGE("Pre compression. Buffer size: " << buf);
-    compression::stream_zstd codec;
-    buf = codec.compress(std::move(buf));
-    BOOST_TEST_MESSAGE("Post compression. Buffer size: " << buf);
-    auto parser = iobuf_parser(codec.uncompress(std::move(buf)));
-    auto res
-      = reflection::async_adl<raft::heartbeat_request>{}.from(parser).get0();
+    serde::write_async(buf, std::move(req)).get();
+    auto res = serde::from_iobuf<raft::heartbeat_request>(std::move(buf));
+
     for (int64_t i = 0; i < one_k; ++i) {
         BOOST_REQUIRE_EQUAL(res.heartbeats[i].meta.group, raft::group_id(i));
         BOOST_REQUIRE_EQUAL(
@@ -180,17 +182,10 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_request_roundtrip_with_negative) {
         req.heartbeats[i].meta.prev_log_term = model::term_id(-i - 100);
         req.heartbeats[i].meta.last_visible_index = model::offset(-i - 100);
     }
+
     iobuf buf;
-    reflection::async_adl<raft::heartbeat_request>{}
-      .to(buf, std::move(req))
-      .get();
-    BOOST_TEST_MESSAGE("Pre compression. Buffer size: " << buf);
-    compression::stream_zstd codec;
-    buf = codec.compress(std::move(buf));
-    BOOST_TEST_MESSAGE("Post compression. Buffer size: " << buf);
-    auto parser = iobuf_parser(codec.uncompress(std::move(buf)));
-    auto res
-      = reflection::async_adl<raft::heartbeat_request>{}.from(parser).get0();
+    serde::write_async(buf, std::move(req)).get();
+    auto res = serde::from_iobuf<raft::heartbeat_request>(std::move(buf));
     for (auto& hb : res.heartbeats) {
         BOOST_REQUIRE_EQUAL(hb.meta.commit_index, model::offset{});
         BOOST_REQUIRE_EQUAL(hb.meta.term, model::term_id{-1});
@@ -232,17 +227,8 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_roundtrip) {
     for (const auto& m : reply.meta) {
         expected.emplace(m.group, m);
     }
-    iobuf buf;
-    reflection::async_adl<raft::heartbeat_reply>{}
-      .to(buf, std::move(reply))
-      .get();
-    BOOST_TEST_MESSAGE("Pre compression. Buffer size: " << buf);
-    compression::stream_zstd codec;
-    buf = codec.compress(std::move(buf));
-    BOOST_TEST_MESSAGE("Post compression. Buffer size: " << buf);
-    auto parser = iobuf_parser(codec.uncompress(std::move(buf)));
-    auto result
-      = reflection::async_adl<raft::heartbeat_reply>{}.from(parser).get0();
+    auto buf = serde::to_iobuf(reply);
+    auto result = serde::from_iobuf<raft::heartbeat_reply>(std::move(buf));
 
     for (size_t i = 0; i < result.meta.size(); ++i) {
         auto gr = result.meta[i].group;
@@ -280,14 +266,8 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_negatives) {
       .last_term_base_offset = model::offset(-1),
       .result = raft::append_entries_reply::status::success});
 
-    iobuf buf;
-    reflection::async_adl<raft::heartbeat_reply>{}
-      .to(buf, std::move(reply))
-      .get();
-
-    auto parser = iobuf_parser(std::move(buf));
-    auto result
-      = reflection::async_adl<raft::heartbeat_reply>{}.from(parser).get0();
+    auto buf = serde::to_iobuf(reply);
+    auto result = serde::from_iobuf<raft::heartbeat_reply>(std::move(buf));
     BOOST_REQUIRE_EQUAL(result.meta[0].last_flushed_log_index, model::offset{});
     BOOST_REQUIRE_EQUAL(result.meta[0].last_dirty_log_index, model::offset{});
     BOOST_REQUIRE_EQUAL(result.meta[0].last_term_base_offset, model::offset{});
@@ -297,17 +277,200 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_negatives) {
       result.meta[0].target_node_id.revision(), model::revision_id{});
 }
 
+SEASTAR_THREAD_TEST_CASE(heartbeat_response_with_failures) {
+    raft::heartbeat_reply reply;
+    // first reply is a failure
+    reply.meta.push_back(raft::append_entries_reply{
+      .target_node_id = raft::vnode(model::node_id{}, model::revision_id{}),
+      .node_id = raft::vnode(model::node_id(1), model::revision_id(1)),
+      .group = raft::group_id(1),
+      .term = model::term_id(random_generators::get_int(0, 1000)),
+      .last_flushed_log_index = model::offset{},
+      .last_dirty_log_index = model::offset{},
+      .last_term_base_offset = model::offset{},
+      .result = raft::append_entries_reply::status::timeout});
+
+    /**
+     * Two other replies are successful
+     */
+    reply.meta.push_back(raft::append_entries_reply{
+      .target_node_id = raft::vnode(model::node_id(0), model::revision_id{1}),
+      .node_id = raft::vnode(model::node_id(1), model::revision_id(1)),
+      .group = raft::group_id(2),
+      .term = model::term_id(1),
+      .last_flushed_log_index = model::offset(100),
+      .last_dirty_log_index = model::offset(101),
+      .last_term_base_offset = model::offset(102),
+      .result = raft::append_entries_reply::status::success});
+
+    reply.meta.push_back(raft::append_entries_reply{
+      .target_node_id = raft::vnode(model::node_id(0), model::revision_id{1}),
+      .node_id = raft::vnode(model::node_id(1), model::revision_id(1)),
+      .group = raft::group_id(3),
+      .term = model::term_id(5),
+      .last_flushed_log_index = model::offset(200),
+      .last_dirty_log_index = model::offset(201),
+      .last_term_base_offset = model::offset(202),
+      .result = raft::append_entries_reply::status::success});
+
+    auto buf = serde::to_iobuf(reply);
+
+    auto result = serde::from_iobuf<raft::heartbeat_reply>(std::move(buf));
+    for (auto i = 0; i < reply.meta.size(); ++i) {
+        BOOST_REQUIRE_EQUAL(reply.meta[i].group, result.meta[i].group);
+        BOOST_REQUIRE_EQUAL(
+          reply.meta[i].last_flushed_log_index,
+          result.meta[i].last_flushed_log_index);
+        BOOST_REQUIRE_EQUAL(
+          reply.meta[i].last_dirty_log_index,
+          result.meta[i].last_dirty_log_index);
+        BOOST_REQUIRE_EQUAL(reply.meta[i].term, result.meta[i].term);
+        BOOST_REQUIRE_EQUAL(reply.meta[i].result, result.meta[i].result);
+        BOOST_REQUIRE_EQUAL(
+          reply.meta[i].last_term_base_offset,
+          result.meta[i].last_term_base_offset);
+        BOOST_REQUIRE_EQUAL(reply.meta[i].node_id, result.meta[i].node_id);
+        if (i != 0) {
+            // we do not require failure node_id to match as it will be replaced
+            // with node id coming from successful response
+            BOOST_REQUIRE_EQUAL(
+              reply.meta[i].target_node_id, result.meta[i].target_node_id);
+        }
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(
+  heartbeat_response_with_failures_and_not_initialized_groups) {
+    raft::heartbeat_reply reply;
+    // first reply is a success but group is empty
+    reply.meta.push_back(raft::append_entries_reply{
+      .target_node_id = raft::vnode(model::node_id{0}, model::revision_id{0}),
+      .node_id = raft::vnode(model::node_id(1), model::revision_id(1)),
+      .group = raft::group_id(1),
+      .term = model::term_id(1),
+      .last_flushed_log_index = model::offset{},
+      .last_dirty_log_index = model::offset{},
+      .last_term_base_offset = model::offset{},
+      .result = raft::append_entries_reply::status::success});
+
+    /**
+     * Two other replies are failures
+     */
+    reply.meta.push_back(raft::append_entries_reply{
+      .target_node_id = raft::vnode(model::node_id{}, model::revision_id{}),
+      .node_id = raft::vnode(model::node_id(1), model::revision_id(1)),
+      .group = raft::group_id(2),
+      .term = model::term_id(1),
+      .last_flushed_log_index = model::offset{},
+      .last_dirty_log_index = model::offset{},
+      .last_term_base_offset = model::offset{},
+      .result = raft::append_entries_reply::status::group_unavailable});
+
+    reply.meta.push_back(raft::append_entries_reply{
+      .target_node_id = raft::vnode(model::node_id{}, model::revision_id{}),
+      .node_id = raft::vnode(model::node_id(1), model::revision_id(1)),
+      .group = raft::group_id(3),
+      .term = model::term_id(5),
+      .last_flushed_log_index = model::offset{},
+      .last_dirty_log_index = model::offset{},
+      .last_term_base_offset = model::offset{},
+      .result = raft::append_entries_reply::status::group_unavailable});
+
+    auto buf = serde::to_iobuf(reply);
+
+    auto result = serde::from_iobuf<raft::heartbeat_reply>(std::move(buf));
+    for (auto i = 0; i < reply.meta.size(); ++i) {
+        BOOST_REQUIRE_EQUAL(reply.meta[i].group, result.meta[i].group);
+        BOOST_REQUIRE_EQUAL(
+          reply.meta[i].last_flushed_log_index,
+          result.meta[i].last_flushed_log_index);
+        BOOST_REQUIRE_EQUAL(
+          reply.meta[i].last_dirty_log_index,
+          result.meta[i].last_dirty_log_index);
+        BOOST_REQUIRE_EQUAL(reply.meta[i].term, result.meta[i].term);
+        BOOST_REQUIRE_EQUAL(reply.meta[i].result, result.meta[i].result);
+        BOOST_REQUIRE_EQUAL(
+          reply.meta[i].last_term_base_offset,
+          result.meta[i].last_term_base_offset);
+        BOOST_REQUIRE_EQUAL(reply.meta[i].node_id, result.meta[i].node_id);
+        // all replies should have node id set
+        BOOST_REQUIRE_EQUAL(
+          reply.meta[0].target_node_id.id(),
+          result.meta[i].target_node_id.id());
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(heartbeat_response_with_only_failures) {
+    raft::heartbeat_reply reply;
+    // first reply is a success but group is empty
+    reply.meta.push_back(raft::append_entries_reply{
+      .target_node_id = raft::vnode(model::node_id{}, model::revision_id{}),
+      .node_id = raft::vnode(model::node_id(1), model::revision_id(1)),
+      .group = raft::group_id(1),
+      .term = model::term_id(1),
+      .last_flushed_log_index = model::offset{},
+      .last_dirty_log_index = model::offset{},
+      .last_term_base_offset = model::offset{},
+      .result = raft::append_entries_reply::status::group_unavailable});
+
+    /**
+     * Two other replies are failures
+     */
+    reply.meta.push_back(raft::append_entries_reply{
+      .target_node_id = raft::vnode(model::node_id{}, model::revision_id{}),
+      .node_id = raft::vnode(model::node_id(1), model::revision_id(1)),
+      .group = raft::group_id(2),
+      .term = model::term_id(1),
+      .last_flushed_log_index = model::offset{},
+      .last_dirty_log_index = model::offset{},
+      .last_term_base_offset = model::offset{},
+      .result = raft::append_entries_reply::status::group_unavailable});
+
+    reply.meta.push_back(raft::append_entries_reply{
+      .target_node_id = raft::vnode(model::node_id{}, model::revision_id{}),
+      .node_id = raft::vnode(model::node_id(1), model::revision_id(1)),
+      .group = raft::group_id(3),
+      .term = model::term_id(5),
+      .last_flushed_log_index = model::offset{},
+      .last_dirty_log_index = model::offset{},
+      .last_term_base_offset = model::offset{},
+      .result = raft::append_entries_reply::status::group_unavailable});
+
+    auto buf = serde::to_iobuf(reply);
+
+    auto result = serde::from_iobuf<raft::heartbeat_reply>(std::move(buf));
+    for (auto i = 0; i < reply.meta.size(); ++i) {
+        BOOST_REQUIRE_EQUAL(reply.meta[i].group, result.meta[i].group);
+        BOOST_REQUIRE_EQUAL(
+          reply.meta[i].last_flushed_log_index,
+          result.meta[i].last_flushed_log_index);
+        BOOST_REQUIRE_EQUAL(
+          reply.meta[i].last_dirty_log_index,
+          result.meta[i].last_dirty_log_index);
+        BOOST_REQUIRE_EQUAL(reply.meta[i].term, result.meta[i].term);
+        BOOST_REQUIRE_EQUAL(reply.meta[i].result, result.meta[i].result);
+        BOOST_REQUIRE_EQUAL(
+          reply.meta[i].last_term_base_offset,
+          result.meta[i].last_term_base_offset);
+        BOOST_REQUIRE_EQUAL(reply.meta[i].node_id, result.meta[i].node_id);
+        // all replies should have node id set
+        BOOST_REQUIRE_EQUAL(
+          reply.meta[i].target_node_id, result.meta[i].target_node_id);
+    }
+}
+
 SEASTAR_THREAD_TEST_CASE(snapshot_metadata_roundtrip) {
-    auto n1 = tests::random_broker(0, 100);
-    auto n2 = tests::random_broker(0, 100);
-    auto n3 = tests::random_broker(0, 100);
+    auto n1 = model::random_broker(0, 100);
+    auto n2 = model::random_broker(0, 100);
+    auto n3 = model::random_broker(0, 100);
     std::vector<model::broker> nodes{n1, n2, n3};
     raft::group_nodes current{
       .voters
       = {raft::vnode(n1.id(), model::revision_id(1)), raft::vnode(n3.id(), model::revision_id(3))},
       .learners = {raft::vnode(n2.id(), model::revision_id(1))}};
 
-    raft::group_configuration cfg(nodes, current, model::revision_id(0));
+    raft::group_configuration cfg(
+      nodes, current, model::revision_id(0), std::nullopt);
 
     auto ct = ss::lowres_clock::now();
     raft::offset_translator_delta delta{
@@ -319,26 +482,29 @@ SEASTAR_THREAD_TEST_CASE(snapshot_metadata_roundtrip) {
       .cluster_time = ct,
       .log_start_delta = delta};
 
-    auto d = serialize_roundtrip_rpc(std::move(metadata));
+    auto d = serialize_roundtrip_adl(std::move(metadata));
 
     BOOST_REQUIRE_EQUAL(d.last_included_index, model::offset(123));
     BOOST_REQUIRE_EQUAL(d.last_included_term, model::term_id(32));
-    BOOST_REQUIRE(d.cluster_time == ct);
-    BOOST_REQUIRE_EQUAL(d.latest_configuration, cfg);
+    BOOST_REQUIRE(
+      std::chrono::time_point_cast<std::chrono::milliseconds>(d.cluster_time)
+      == std::chrono::time_point_cast<std::chrono::milliseconds>(ct));
+    BOOST_REQUIRE_EQUAL(d.latest_configuration.all_nodes(), cfg.all_nodes());
     BOOST_REQUIRE_EQUAL(d.log_start_delta, delta);
 }
 
 SEASTAR_THREAD_TEST_CASE(snapshot_metadata_backward_compatibility) {
-    auto n1 = tests::random_broker(0, 100);
-    auto n2 = tests::random_broker(0, 100);
-    auto n3 = tests::random_broker(0, 100);
+    auto n1 = model::random_broker(0, 100);
+    auto n2 = model::random_broker(0, 100);
+    auto n3 = model::random_broker(0, 100);
     std::vector<model::broker> nodes{n1, n2, n3};
     raft::group_nodes current{
       .voters
       = {raft::vnode(n1.id(), model::revision_id(1)), raft::vnode(n3.id(), model::revision_id(3))},
       .learners = {raft::vnode(n2.id(), model::revision_id(1))}};
 
-    raft::group_configuration cfg(nodes, current, model::revision_id(0));
+    raft::group_configuration cfg(
+      nodes, current, model::revision_id(0), std::nullopt);
     auto c = cfg;
     auto ct = ss::lowres_clock::now();
     // serialize using old format (no version included)
@@ -348,7 +514,8 @@ SEASTAR_THREAD_TEST_CASE(snapshot_metadata_backward_compatibility) {
       model::offset(123),
       model::term_id(32),
       std::move(cfg),
-      ct.time_since_epoch());
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        ct.time_since_epoch()));
 
     iobuf_parser parser(std::move(serialize_buf));
 
@@ -358,7 +525,10 @@ SEASTAR_THREAD_TEST_CASE(snapshot_metadata_backward_compatibility) {
 
     BOOST_REQUIRE_EQUAL(metadata.last_included_index, model::offset(123));
     BOOST_REQUIRE_EQUAL(metadata.last_included_term, model::term_id(32));
-    BOOST_REQUIRE(metadata.cluster_time == ct);
+    BOOST_REQUIRE(
+      std::chrono::time_point_cast<std::chrono::milliseconds>(
+        metadata.cluster_time)
+      == std::chrono::time_point_cast<std::chrono::milliseconds>(ct));
     BOOST_REQUIRE_EQUAL(metadata.latest_configuration, c);
     BOOST_REQUIRE_EQUAL(
       metadata.log_start_delta, raft::offset_translator_delta{});

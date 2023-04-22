@@ -14,9 +14,11 @@
 #include "cluster/topic_table.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
+#include "model/namespace.h"
 #include "utils/expiring_promise.h"
 
 #include <seastar/core/future-util.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 
 #include <optional>
 
@@ -27,6 +29,8 @@ partition_leaders_table::partition_leaders_table(
   : _topic_table(topic_table) {}
 
 ss::future<> partition_leaders_table::stop() {
+    vlog(clusterlog.info, "Stopping Partition Leaders Table...");
+
     while (!_leader_promises.empty()) {
         auto it = _leader_promises.begin();
         for (auto& promise : it->second) {
@@ -105,6 +109,27 @@ void partition_leaders_table::update_partition_leader(
   std::optional<model::node_id> leader_id) {
     auto key = leader_key_view{
       model::topic_namespace_view(ntp), ntp.tp.partition};
+
+    const auto is_controller = ntp == model::controller_ntp;
+    /**
+     * Use revision to differentiate updates for the topic that was
+     * deleted from topics table from the one which are processed before the
+     * topic is known to node local topic table.
+     * Controller is a special case as it is not present in topic table.
+     *
+     */
+    const auto topic_removed
+      = revision_id <= _topic_table.local().last_applied_revision()
+        && !_topic_table.local().contains(model::topic_namespace_view(ntp));
+
+    if (topic_removed && !is_controller) {
+        vlog(
+          clusterlog.trace,
+          "can't update leadership of the removed topic {}",
+          ntp);
+        return;
+    }
+
     auto it = _leaders.find(key);
     if (it == _leaders.end()) {
         auto [new_it, _] = _leaders.emplace(
@@ -116,23 +141,54 @@ void partition_leaders_table::update_partition_leader(
             .partition_revision = revision_id});
         it = new_it;
     } else {
-        // Currently we have to check if revision id is valid since not all the
-        // code paths devlivers revision information
+        /**
+         * Controller is a special case as it revision never but it
+         * configuration revision does. We always update controller
+         * leadership with revision 0 not to lose any of the updates.
+         *
+         * TODO: introduce a feature that will change the behavior for all
+         * the partitions and it will use ntp_config revision instead of a
+         * revision coming from raft.
+         */
+
+        // Currently we have to check if revision id is valid since not all
+        // the code paths devlivers revision information
         //
-        // TODO: always check revision after we will add revision to metadata
-        // dissemination requests
+        // TODO: always check revision after we will add revision to
+        // metadata dissemination requests
         const bool revision_id_valid = revision_id >= model::revision_id{0};
-        // skip update for partition with previous revision
-        if (revision_id_valid && revision_id < it->second.partition_revision) {
-            return;
-        }
-        // reset the term for new ntp revision
-        if (revision_id_valid && revision_id > it->second.partition_revision) {
-            it->second.update_term = model::term_id{};
+        if (!is_controller) {
+            // skip update for partition with previous revision
+            if (
+              revision_id_valid
+              && revision_id < it->second.partition_revision) {
+                vlog(
+                  clusterlog.trace,
+                  "skip update for partition {} with previous revision {} "
+                  "current "
+                  "revision {}",
+                  ntp,
+                  revision_id,
+                  it->second.partition_revision);
+                return;
+            }
+            // reset the term for new ntp revision
+            if (
+              revision_id_valid
+              && revision_id > it->second.partition_revision) {
+                it->second.update_term = model::term_id{};
+            }
         }
 
         // existing partition
         if (it->second.update_term > term) {
+            vlog(
+              clusterlog.trace,
+              "skip update for partition {} with previous term {} current term "
+              "{}",
+              ntp,
+              term,
+              it->second.update_term);
             // Do nothing if update term is older
             return;
         }
@@ -168,6 +224,37 @@ void partition_leaders_table::update_partition_leader(
             promise.second->set_value(*leader_id);
         }
     }
+
+    // Ensure leadership has changed before notifying watchers
+    if (
+      !it->second.previous_leader
+      || leader_id.value() != it->second.previous_leader.value()) {
+        _watchers.notify(ntp, ntp, term, leader_id);
+    }
+}
+
+ss::future<> partition_leaders_table::update_with_estimates() {
+    for (const auto& [ns_tp, topic] :
+         _topic_table.local().all_topics_metadata()) {
+        if (!topic.is_topic_replicable()) {
+            // skip non-replicable topics
+            continue;
+        }
+
+        for (const auto& part : topic.metadata.get_assignments()) {
+            if (!_leaders.contains(leader_key_view{ns_tp, part.id})) {
+                model::ntp ntp{ns_tp.ns, ns_tp.tp, part.id};
+                vassert(
+                  !part.replicas.empty(),
+                  "set of replicas for ntp {} can't be empty",
+                  ntp);
+                update_partition_leader(
+                  ntp, model::term_id{1}, part.replicas.begin()->node_id);
+            }
+
+            co_await ss::coroutine::maybe_yield();
+        }
+    }
 }
 
 ss::future<model::node_id> partition_leaders_table::wait_for_leader(
@@ -198,6 +285,27 @@ ss::future<model::node_id> partition_leaders_table::wait_for_leader(
       });
 }
 
+void partition_leaders_table::remove_leader(
+  const model::ntp& ntp, model::revision_id revision) {
+    auto it = _leaders.find(
+      leader_key_view{model::topic_namespace_view(ntp), ntp.tp.partition});
+    // ignore updates with old revision
+    if (it != _leaders.end() && it->second.partition_revision <= revision) {
+        vlog(
+          clusterlog.trace,
+          "removing {} with revision {} matched by revision {}",
+          ntp,
+          it->second.partition_revision,
+          revision);
+        _leaders.erase(it);
+    }
+}
+
+void partition_leaders_table::reset() {
+    vlog(clusterlog.trace, "resetting leaders");
+    _leaders.clear();
+}
+
 partition_leaders_table::leaders_info_t
 partition_leaders_table::get_leaders() const {
     leaders_info_t ans;
@@ -215,6 +323,28 @@ partition_leaders_table::get_leaders() const {
         ans.push_back(std::move(info));
     }
     return ans;
+}
+
+notification_id_type
+partition_leaders_table::register_leadership_change_notification(
+  leader_change_cb_t cb) {
+    return _watchers.register_notify(std::move(cb));
+}
+
+notification_id_type
+partition_leaders_table::register_leadership_change_notification(
+  const model::ntp& ntp, leader_change_cb_t cb) {
+    return _watchers.register_notify(ntp, std::move(cb));
+}
+
+void partition_leaders_table::unregister_leadership_change_notification(
+  notification_id_type id) {
+    return _watchers.unregister_notify(id);
+}
+
+void partition_leaders_table::unregister_leadership_change_notification(
+  const model::ntp& ntp, notification_id_type id) {
+    return _watchers.unregister_notify(ntp, id);
 }
 
 } // namespace cluster

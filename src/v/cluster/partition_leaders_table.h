@@ -12,10 +12,10 @@
 #pragma once
 
 #include "cluster/fwd.h"
+#include "cluster/ntp_callbacks.h"
 #include "cluster/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "utils/concepts-enabled.h"
 #include "utils/expiring_promise.h"
 
 #include <seastar/core/sharded.hh>
@@ -61,31 +61,24 @@ public:
       ss::lowres_clock::time_point,
       std::optional<std::reference_wrapper<ss::abort_source>>);
 
-    // clang-format off
     template<typename Func>
-    CONCEPT(requires requires(
-      Func f, 
-      model::topic_namespace_view tp_ns, 
-      model::partition_id pid, 
-      std::optional<model::node_id> leader, 
+    requires requires(
+      Func f,
+      model::topic_namespace_view tp_ns,
+      model::partition_id pid,
+      std::optional<model::node_id> leader,
       model::term_id term) {
-            { f(tp_ns, pid, leader, term) } -> std::same_as<void>;
-    })
-    // clang-format on
+        { f(tp_ns, pid, leader, term) } -> std::same_as<void>;
+    }
     void for_each_leader(Func&& f) const {
         for (auto& [k, v] : _leaders) {
             f(k.tp_ns, k.pid, v.current_leader, v.update_term);
         }
     }
 
-    void remove_leader(const model::ntp& ntp, model::revision_id revision) {
-        auto it = _leaders.find(
-          leader_key_view{model::topic_namespace_view(ntp), ntp.tp.partition});
-        // ignore updates with old revision
-        if (it != _leaders.end() && it->second.partition_revision <= revision) {
-            _leaders.erase(it);
-        }
-    }
+    void remove_leader(const model::ntp&, model::revision_id);
+
+    void reset();
 
     void update_partition_leader(
       const model::ntp&, model::term_id, std::optional<model::node_id>);
@@ -96,7 +89,11 @@ public:
       model::term_id,
       std::optional<model::node_id>);
 
-    void reset() { _leaders.clear(); }
+    // Intended to be called when we apply the topic snapshot: add leader
+    // guesses for partitions that are present in the topic table but we have
+    // not leader information for (i.e. all as-yet unseen partitions).  Assumes
+    // that topic_table doesn't change during the call.
+    ss::future<> update_with_estimates();
 
     struct leader_info_t {
         model::topic_namespace tp_ns;
@@ -112,6 +109,22 @@ public:
     using leaders_info_t = std::vector<leader_info_t>;
 
     leaders_info_t get_leaders() const;
+
+    using leader_change_cb_t = ss::noncopyable_function<void(
+      model::ntp, model::term_id, std::optional<model::node_id>)>;
+
+    // Register a callback for all leadership changes
+    notification_id_type
+      register_leadership_change_notification(leader_change_cb_t);
+
+    // Register a callback for a change in leadership for a specific ntp.
+    notification_id_type register_leadership_change_notification(
+      const model::ntp&, leader_change_cb_t);
+
+    void unregister_leadership_change_notification(notification_id_type);
+
+    void unregister_leadership_change_notification(
+      const model::ntp&, notification_id_type);
 
 private:
     // optimized to reduce number of ntp copies
@@ -206,6 +219,8 @@ private:
     promises_t _leader_promises;
 
     ss::sharded<topic_table>& _topic_table;
+
+    ntp_callbacks<leader_change_cb_t> _watchers;
 };
 
 } // namespace cluster
