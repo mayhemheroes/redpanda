@@ -56,4 +56,3 @@ jobs:
           mayhem-token: ${{ secrets.MAYHEM_TOKEN }}
           args: --image ${{ steps.meta.outputs.tags }}
 
-          sarif_file: sarif
