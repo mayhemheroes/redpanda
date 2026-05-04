@@ -17,7 +17,7 @@ WORKDIR /redpanda
 WORKDIR /redpanda/src/go/rpk
 ENV GONOSUMDB=*
 ENV GOFLAGS=-mod=mod
-RUN go mod download
+RUN sed -i "/safchain\/ethtool/d" go.sum && go mod download
 RUN ./build.sh
 
 FROM fedora:34 
